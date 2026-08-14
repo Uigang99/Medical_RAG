@@ -1,0 +1,95 @@
+# Large local data, vector indexes, generated traces, and experiment outputs.
+/datasets/
+/databases/
+/results/
+/cache/
+/logs/
+
+# Python artifacts.
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local environment files.
+.venv/
+.venv_*/
+venv/
+.env
+.env.*
+
+# Model/checkpoint and array artifacts if created outside the ignored roots.
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.npy
+*.npz
+*.arrow
+
+# Run-time and editor artifacts.
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# This repository intentionally publishes only the active research pipeline.
+# Historical one-off scripts remain available in the local workspace but are
+# not tracked. Add a negated entry here when a script becomes part of the
+# reproducible pipeline.
+/configs/
+/scripts/*
+!/scripts/analyze_rag2_hidden_vs_terra_semantic.py
+!/scripts/analyze_rag2_label_threshold_policies.py
+!/scripts/analyze_rag2_preanswer_hidden_labels.py
+!/scripts/audit_rag2_document_traces.py
+!/scripts/audit_rag2_no_rag_quality_selection.py
+!/scripts/build_mcq_unified.py
+!/scripts/build_medcpt_vector_db.py
+!/scripts/build_rag2_codex_semantic_filter_inputs.py
+!/scripts/build_rag2_filter_candidates.py
+!/scripts/build_rag2_filter_training_splits.py
+!/scripts/build_rag2_hidden_filter_inputs.py
+!/scripts/build_rag2_medcpt_vector_db.py
+!/scripts/build_rag2_pmc_unified.py
+!/scripts/build_rag2_pubmed26_unified.py
+!/scripts/compare_rag2_codex_semantic_label_runs.py
+!/scripts/download_mcq_raw.py
+!/scripts/download_rag2_pmc_raw.py
+!/scripts/evaluate_rag2_filter_model.py
+!/scripts/export_rag2_codex_label_audit_sample.py
+!/scripts/extract_rag2_preanswer_hidden_full.py
+!/scripts/extract_rag2_preanswer_hidden_multilayer_full.py
+!/scripts/extract_rag2_preanswer_hidden_pilot.py
+!/scripts/flatten_medcpt_vector_db.py
+!/scripts/generate_rag2_document_traces.py
+!/scripts/generate_rag2_no_rag_rationales.py
+!/scripts/label_rag2_candidates_with_codex.py
+!/scripts/materialize_rag2_preanswer_hidden_labels.py
+!/scripts/monitor_rag2_codex_labeling.py
+!/scripts/monitor_rag2_codex_semantic_labels.py
+!/scripts/precompute_rag2_rationale_embeddings.py
+!/scripts/prepare_rag2_cpg_textbooks_paper128.py
+!/scripts/prepare_rag2_rationale_candidates.py
+!/scripts/reparse_rag2_paper_exact_answers.py
+!/scripts/run_rag2_codex_labeling_pilot.py
+!/scripts/run_rag2_mcq_eval.py
+!/scripts/run_rag2_paper_exact_terra_semantic_filter_topk_sweep.sh
+!/scripts/run_rag2_paper_exact_train_no_rag_generation.sh
+!/scripts/run_rag2_terminal_all_mcq_topk_sweep.sh
+!/scripts/run_rag2_train_quality_selected_candidates_top32.sh
+!/scripts/run_rag2_vs_hidden_terminal_medqa_topk_sweep.sh
+!/scripts/split_mcq_unified_by_dataset.py
+!/scripts/subsample_rag2_filter_inputs_to_reference_counts.py
+!/scripts/train_rag2_filter_model_paper.py
+!/scripts/train_rag2_hidden_feature_filter.py
+
+/tests/*
+!/tests/test_rag2_codex_labeling_resilience.py
+!/tests/test_rag2_mcq.py
