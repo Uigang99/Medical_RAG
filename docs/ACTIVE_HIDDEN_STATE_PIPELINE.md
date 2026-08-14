@@ -77,6 +77,9 @@ novel method.
 - `datasets/benchmark/mcq`
 - `.../candidates/quality_selected_source_balanced40_rerank32_v1`
 - `.../preanswer_hidden_gold_direction_full_top8_v1`
+- `.../preanswer_hidden_multilayer_all_scalar_selected_vector_top8_v1`
+  (1,418,784 MedMCQA question-document pairs; scalar projections for all 32
+  layer positions and full hidden vectors for layers 16, 24, 28, and final)
 - `.../preanswer_hidden_labels_full_top8_tau0_v1`
 - `.../filter_training_inputs_hidden_utility_top8_tau0_v1`
 - `.../filter_training_inputs_top10_independent_ppl_v2_corrected_nodoc`
@@ -88,23 +91,24 @@ The 44GB independent-PPL document traces should be retained only if immediate
 RAG2 label regeneration/auditing is important; the compact finalized training
 inputs and trained baseline models are sufficient for ordinary comparisons.
 
-## Measured cleanup candidates (2026-08-14)
+## Storage cleanup performed (2026-08-14)
 
-No files were deleted during this audit.
+The retired window-, sentence-, and token-attribution experiments were removed:
 
-| Candidate group | Approx. space | Disposition |
-|---|---:|---|
-| Old window/sentence/attribution model families | 536GB | Remove after confirming those experiments are closed |
-| Old window/sentence/attribution datasets | 208GB | Remove |
-| Multilayer hidden probe, pilot, old answer-format and Qwen data | 146GB | Remove after retaining compact summaries if desired |
-| Hugging Face dataset caches | 68GB | Safe to rebuild; remove first |
-| Historical result generations outside the terminal-v1 experiment | about 40GB | Keep summary tables, remove bulky generations |
-| Old run caches, query embeddings, and superseded vector DBs | about 15GB | Remove; retain RAG_Square and terminal-v1 cache |
-| Raw/unified corpus sources after completed DB build | up to 404GB | Optional; removes local rebuild capability |
+- trained filter and hierarchical document-model outputs;
+- candidate windows/sentences, generated traces, labels, training inputs,
+  token attributions, and hierarchical feature sequences;
+- associated MCQ generation results and run/Hugging Face caches.
 
-The first four groups alone can recover roughly 958GB. Removing historical
-results and superseded run caches raises the practical recovery to about 1TB
-without touching the active RAG_Square vector database.
+The corpus download directory `datasets/corpus/mcq/raw` was also removed after
+verifying that all four RAG_Square indexes are complete and that every sharded
+metadata record retains the chunk `text` required for retrieval, reranking, and
+LLM augmentation. The unified chunked corpora were retained, so only the
+original downloaded archives/XML were discarded.
+
+The cleanup increased free filesystem space from 65GB to 671GB (about 606GB
+recovered). The 76GB multilayer hidden-state dataset was explicitly retained;
+it contains all-layer scalar scores and selected full vectors for four layers.
 
 ## Checkpoint pruning
 
