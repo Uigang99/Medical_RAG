@@ -313,6 +313,15 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help="Batch size for no-gold h0/hD extraction with the target Llama.",
     )
+    parser.add_argument(
+        "--hidden-filter-question-batch-size",
+        type=int,
+        default=32,
+        help=(
+            "Number of questions committed per resumable text+hidden filter-score batch. "
+            "Completed batches are retained when --filter-cache-only is interrupted."
+        ),
+    )
     parser.add_argument("--hidden-feature-max-input-tokens", type=int, default=2048)
     parser.add_argument(
         "--hidden-feature-dtype",
@@ -2829,6 +2838,7 @@ def filter_cache_settings(args: argparse.Namespace, candidate_dir: Path) -> dict
                 "state_model": _path_cache_identity(args.llm_model_path),
                 "hidden_layer": args.hidden_feature_layer,
                 "hidden_batch_size": args.hidden_feature_batch_size,
+                "question_commit_batch_size": args.hidden_filter_question_batch_size,
                 "hidden_max_input_tokens": args.hidden_feature_max_input_tokens,
                 "hidden_dtype": args.hidden_feature_dtype,
                 "hidden_attn_implementation": args.hidden_feature_attn_implementation,
@@ -2885,6 +2895,244 @@ def _apply_cached_filter_rows(
     return True
 
 
+def _cached_filter_row_matches(
+    sample: BenchmarkSample,
+    docs: list[RetrievedDocument],
+    row: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(row, dict) or str(row.get("key") or "") != sample_key(sample):
+        return False
+    decisions = list(row.get("filter_decisions") or [])
+    if len(decisions) != len(docs):
+        return False
+    return all(
+        str(decision.get("db_id") or "") == doc.db_id
+        and int(decision.get("local_id", -1)) == doc.local_id
+        for doc, decision in zip(docs, decisions)
+    )
+
+
+def _apply_cached_filter_row(
+    docs: list[RetrievedDocument],
+    row: dict[str, Any],
+) -> None:
+    for doc, decision in zip(docs, row["filter_decisions"]):
+        doc.filter_prediction = decision.get("filter_prediction")
+        doc.filter_score = decision.get("filter_score")
+        doc.filter_prob_helpful = decision.get("filter_prob_helpful")
+        doc.filter_rank = decision.get("filter_rank")
+        window_filter = decision.get("window_filter")
+        if isinstance(window_filter, dict):
+            doc.metadata["window_filter"] = window_filter
+        hidden_filter = decision.get("preanswer_text_hidden_filter")
+        if isinstance(hidden_filter, dict):
+            doc.metadata["preanswer_text_hidden_filter"] = hidden_filter
+
+
+def _rank_scored_documents(docs: list[RetrievedDocument]) -> None:
+    helpful_rank = 0
+    for doc in docs:
+        if doc.filter_prediction == "helpful":
+            helpful_rank += 1
+            doc.filter_rank = helpful_rank
+        else:
+            doc.filter_rank = None
+
+
+def _filter_score_row(
+    sample: BenchmarkSample,
+    docs: list[RetrievedDocument],
+) -> dict[str, Any]:
+    route = "medqa" if sample.dataset == "medqa" else "medmcqa"
+    return {
+        "key": sample_key(sample),
+        "dataset": sample.dataset,
+        "sample_id": sample.id,
+        "row_idx": sample.row_idx,
+        "filter_model_route": route,
+        "filter_decisions": [
+            {
+                "db_id": doc.db_id,
+                "local_id": doc.local_id,
+                "rerank_rank": doc.rerank_rank,
+                "filter_prediction": doc.filter_prediction,
+                "filter_score": doc.filter_score,
+                "filter_prob_helpful": doc.filter_prob_helpful,
+                "filter_rank": doc.filter_rank,
+                "window_filter": doc.metadata.get("window_filter"),
+                "preanswer_text_hidden_filter": doc.metadata.get(
+                    "preanswer_text_hidden_filter"
+                ),
+            }
+            for doc in docs
+        ],
+    }
+
+
+def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    write_jsonl(temporary, rows)
+    temporary.replace(path)
+
+
+def _resume_preanswer_hidden_filter_scores(
+    args: argparse.Namespace,
+    samples: list[BenchmarkSample],
+    reranked_docs: list[list[RetrievedDocument]],
+    cache_dir: Path,
+    settings: dict[str, Any],
+    fingerprint: str,
+) -> list[list[RetrievedDocument]]:
+    """Score text+hidden pairs in durable question batches.
+
+    The target Llama and route-specific filter stay resident for all missing
+    batches in one route.  After every question batch, complete decisions are
+    flushed and fsynced.  A later invocation validates document identities and
+    resumes only the missing questions.
+    """
+
+    output_path = cache_dir / "filter_scores.jsonl"
+    progress_path = cache_dir / "in_progress.json"
+    cached_rows: dict[str, dict[str, Any]] = {}
+    if not args.rebuild_filter_cache and output_path.exists() and progress_path.exists():
+        try:
+            progress_state = json.loads(progress_path.read_text(encoding="utf-8"))
+            if progress_state.get("settings_fingerprint") == fingerprint:
+                cached_rows = load_candidate_rows(output_path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            logging.warning("Ignoring invalid resumable hidden-filter cache: %s", output_path)
+
+    valid_rows: dict[str, dict[str, Any]] = {}
+    for sample, docs in zip(samples, reranked_docs):
+        row = cached_rows.get(sample_key(sample))
+        if _cached_filter_row_matches(sample, docs, row):
+            assert row is not None
+            _apply_cached_filter_row(docs, row)
+            valid_rows[sample_key(sample)] = row
+
+    # Canonicalise a possibly interrupted trailing JSONL line before appending.
+    _write_jsonl_atomic(
+        output_path,
+        [valid_rows[sample_key(sample)] for sample in samples if sample_key(sample) in valid_rows],
+    )
+    write_json(
+        progress_path,
+        {
+            "type": "rag2_mcq_eval_filter_scores_in_progress",
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "settings_fingerprint": fingerprint,
+            "settings": settings,
+            "rows_total": len(samples),
+            "rows_completed": len(valid_rows),
+            "documents_completed": sum(
+                len(docs)
+                for sample, docs in zip(samples, reranked_docs)
+                if sample_key(sample) in valid_rows
+            ),
+            "output_path": str(output_path),
+        },
+    )
+
+    routes = _filter_routes()
+    model_paths = {
+        "medmcqa": args.medmcqa_filter_model_path,
+        "medqa": args.medqa_filter_model_path,
+    }
+    completed_documents = sum(
+        len(docs)
+        for sample, docs in zip(samples, reranked_docs)
+        if sample_key(sample) in valid_rows
+    )
+    progress = StageProgress(
+        total=sum(len(docs) for docs in reranked_docs),
+        desc="FilteringPreAnswerTextHidden",
+        enabled=True,
+    )
+    if completed_documents:
+        progress.update(completed_documents)
+
+    try:
+        with output_path.open("a", encoding="utf-8", buffering=16 * 1024 * 1024) as handle:
+            for route in ("medqa", "medmcqa"):
+                indices = [
+                    index
+                    for index, sample in enumerate(samples)
+                    if routes[sample.dataset] == route and sample_key(sample) not in valid_rows
+                ]
+                if not indices:
+                    continue
+                logging.info(
+                    "Resumable pre-answer text+hidden route=%s datasets=%s missing_questions=%s "
+                    "missing_documents=%s checkpoint=%s state_model=%s layer=%s threshold=%.6f",
+                    route,
+                    sorted({samples[index].dataset for index in indices}),
+                    len(indices),
+                    sum(len(reranked_docs[index]) for index in indices),
+                    model_paths[route],
+                    args.llm_model_path,
+                    args.hidden_feature_layer,
+                    args.hidden_filter_helpful_threshold,
+                )
+                filterer = TextHiddenRag2Filter(
+                    checkpoint_path=model_paths[route],
+                    backbone_path=args.hidden_filter_backbone_path,
+                    state_model_path=args.llm_model_path,
+                    layer=args.hidden_feature_layer,
+                    hidden_batch_size=args.hidden_feature_batch_size,
+                    filter_batch_size=args.filter_batch_size,
+                    max_hidden_input_tokens=args.hidden_feature_max_input_tokens,
+                    max_filter_input_length=args.filter_max_input_length,
+                    max_doc_chars=args.filter_max_doc_chars,
+                    helpful_threshold=args.hidden_filter_helpful_threshold,
+                    device=args.filter_device,
+                    bf16=args.filter_bf16,
+                    hidden_dtype=args.hidden_feature_dtype,
+                    hidden_attn_implementation=args.hidden_feature_attn_implementation,
+                )
+                try:
+                    for start in range(0, len(indices), args.hidden_filter_question_batch_size):
+                        batch_indices = indices[start : start + args.hidden_filter_question_batch_size]
+                        filterer.score_documents(
+                            [samples[index] for index in batch_indices],
+                            [reranked_docs[index] for index in batch_indices],
+                            progress_callback=progress.update,
+                        )
+                        for index in batch_indices:
+                            _rank_scored_documents(reranked_docs[index])
+                            row = _filter_score_row(samples[index], reranked_docs[index])
+                            valid_rows[sample_key(samples[index])] = row
+                            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        write_json(
+                            progress_path,
+                            {
+                                "type": "rag2_mcq_eval_filter_scores_in_progress",
+                                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                "settings_fingerprint": fingerprint,
+                                "settings": settings,
+                                "rows_total": len(samples),
+                                "rows_completed": len(valid_rows),
+                                "documents_completed": sum(
+                                    len(row["filter_decisions"]) for row in valid_rows.values()
+                                ),
+                                "output_path": str(output_path),
+                            },
+                        )
+                finally:
+                    filterer.close()
+    finally:
+        progress.close()
+
+    if len(valid_rows) != len(samples):
+        raise RuntimeError(
+            f"Hidden-filter cache incomplete: rows={len(valid_rows)}/{len(samples)} path={output_path}"
+        )
+    # Stable sample order makes the completed artifact easy to audit.
+    _write_jsonl_atomic(output_path, [valid_rows[sample_key(sample)] for sample in samples])
+    return reranked_docs
+
+
 def ensure_filter_scores(
     args: argparse.Namespace,
     samples: list[BenchmarkSample],
@@ -2918,35 +3166,18 @@ def ensure_filter_scores(
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             logging.warning("Ignoring invalid filter-score cache: %s", output_path)
 
-    scored_docs = score_filter_documents(args, samples, reranked_docs)
-    rows: list[dict[str, Any]] = []
-    for sample, docs in zip(samples, scored_docs):
-        route = "medqa" if sample.dataset == "medqa" else "medmcqa"
-        rows.append(
-            {
-                "key": sample_key(sample),
-                "dataset": sample.dataset,
-                "sample_id": sample.id,
-                "row_idx": sample.row_idx,
-                "filter_model_route": route,
-                "filter_decisions": [
-                    {
-                        "db_id": doc.db_id,
-                        "local_id": doc.local_id,
-                        "rerank_rank": doc.rerank_rank,
-                        "filter_prediction": doc.filter_prediction,
-                        "filter_score": doc.filter_score,
-                        "filter_prob_helpful": doc.filter_prob_helpful,
-                        "filter_rank": doc.filter_rank,
-                        "window_filter": doc.metadata.get("window_filter"),
-                        "preanswer_text_hidden_filter": doc.metadata.get(
-                            "preanswer_text_hidden_filter"
-                        ),
-                    }
-                    for doc in docs
-                ],
-            }
+    if args.filter_evidence_unit == "preanswer_text_hidden":
+        scored_docs = _resume_preanswer_hidden_filter_scores(
+            args,
+            samples,
+            reranked_docs,
+            cache_dir,
+            settings,
+            fingerprint,
         )
+    else:
+        scored_docs = score_filter_documents(args, samples, reranked_docs)
+    rows = [_filter_score_row(sample, docs) for sample, docs in zip(samples, scored_docs)]
     write_jsonl(output_path, rows)
     write_json(
         manifest_path,
@@ -3116,6 +3347,8 @@ def validate_paths(args: argparse.Namespace) -> None:
         raise ValueError("--document-transformer-batch-size must be positive.")
     if args.hidden_feature_batch_size <= 0:
         raise ValueError("--hidden-feature-batch-size must be positive.")
+    if args.hidden_filter_question_batch_size <= 0:
+        raise ValueError("--hidden-filter-question-batch-size must be positive.")
     if args.hidden_feature_max_input_tokens <= 0:
         raise ValueError("--hidden-feature-max-input-tokens must be positive.")
     if not 0.0 <= args.hidden_filter_helpful_threshold <= 1.0:
