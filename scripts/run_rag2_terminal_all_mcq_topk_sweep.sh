@@ -14,8 +14,8 @@ PROJECT="/home/user/Uiheon/Medical_RAG"
 EVALUATOR="$PROJECT/scripts/run_rag2_mcq_eval.py"
 
 LLAMA_MODEL="/home/user/Uiheon/models/Llama-3-8B-Instruct"
-MEDMCQA_FILTER="${MEDMCQA_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medmcqa/medmcqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101200/checkpoint-38775}"
-MEDQA_FILTER="${MEDQA_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medqa/medqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101728/checkpoint-8356}"
+MEDMCQA_FILTER="${MEDMCQA_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medmcqa/medmcqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101200/final_model}"
+MEDQA_FILTER="${MEDQA_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medqa/medqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101728/final_model}"
 
 EXPERIMENT_ROOT="$PROJECT/databases/run_cache/rag2_llama3_paper_exact_terminal_v1"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-$EXPERIMENT_ROOT/no_rag_rationales}"

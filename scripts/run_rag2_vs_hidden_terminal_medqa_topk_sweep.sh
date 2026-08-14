@@ -14,7 +14,7 @@ EVALUATOR="$PROJECT/scripts/run_rag2_mcq_eval.py"
 
 LLAMA_MODEL="/home/user/Uiheon/models/Llama-3-8B-Instruct"
 FLAN_BACKBONE="/home/user/Uiheon/models/Flan-T5-large"
-RAG2_FILTER="${RAG2_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medqa/medqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101728/checkpoint-8356}"
+RAG2_FILTER="${RAG2_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medqa/medqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101728/final_model}"
 HIDDEN_FILTER="${HIDDEN_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-HiddenUtilityTau0/medqa/medqa_tau0_text_hidden_epoch5/20260813_132853/final_model}"
 
 EXPERIMENT_ROOT="$PROJECT/databases/run_cache/rag2_llama3_paper_exact_terminal_v1"
