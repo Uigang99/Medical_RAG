@@ -83,6 +83,7 @@ venv/
 !/scripts/run_rag2_paper_exact_terra_semantic_filter_topk_sweep.sh
 !/scripts/run_rag2_paper_exact_train_no_rag_generation.sh
 !/scripts/run_rag2_terminal_all_mcq_topk_sweep.sh
+!/scripts/run_rag2_terminal_all_mcq_unfiltered_topk_sweep.sh
 !/scripts/run_rag2_train_quality_selected_candidates_top32.sh
 !/scripts/run_rag2_vs_hidden_terminal_medqa_topk_sweep.sh
 !/scripts/split_mcq_unified_by_dataset.py
