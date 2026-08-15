@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -24,18 +25,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from medrag.core import BenchmarkSample, PromptRequest, RetrievedDocument
+from medrag.core import BenchmarkSample, GenerationOutput, PromptRequest, RetrievedDocument
 from medrag.evaluation import evaluate_prediction
 from medrag.generation.transformers_generator import VLLMChatGenerator
 from medrag.progress import StageProgress
 from medrag.rag2_mcq import (
     PAPER_EXACT_TERMINAL_DOCUMENT_PROMPT_VERSION,
     PAPER_EXACT_TERMINAL_PROMPT_VERSION,
+    append_paper_exact_terminal_answer,
     build_paper_exact_terminal_documents_messages,
     build_paper_exact_terminal_no_rag_messages,
     normalized_options,
-    paper_exact_terminal_regex,
     parse_mcq_output_for_prompt_profile,
+    parse_paper_exact_mcq_output,
 )
 from medrag.rag2_oracle import (
     canonicalize_rag2_labels,
@@ -316,7 +318,6 @@ def prompt_request(
         sample_id=sample.id,
         case_id=case_id,
         messages=messages,
-        metadata={"structured_regex": paper_exact_terminal_regex(normalized_options(sample.raw))},
     )
 
 
@@ -369,6 +370,104 @@ def parse_generation(sample: BenchmarkSample, text: str) -> tuple[str, list[str]
     return parsed.final_answer, parsed.parse_errors
 
 
+def extract_constrained_option(text: str, sample: BenchmarkSample) -> str | None:
+    valid = set(sample.options or {})
+    for match in re.finditer(r"\b([A-Z])\b", str(text or "").upper()):
+        if match.group(1) in valid:
+            return match.group(1)
+    return None
+
+
+def repair_terminal_generations(
+    generator: VLLMChatGenerator,
+    samples: list[BenchmarkSample],
+    generations: list[GenerationOutput],
+) -> list[tuple[GenerationOutput, str, str]]:
+    """Guarantee one canonical terminal answer without changing reasoning.
+
+    Constraining an arbitrary 768-token rationale with one regex can enter a
+    valid-but-nonterminating loop in XGrammar.  Generate the rationale freely,
+    canonicalize an answer already present in it, and only when no answer is
+    recoverable ask the same model for one constrained A/B/C/D continuation.
+    """
+
+    if len(samples) != len(generations):
+        raise RuntimeError(
+            f"Terminal repair input mismatch: samples={len(samples)} generations={len(generations)}"
+        )
+
+    repaired: list[tuple[GenerationOutput, str, str] | None] = [None] * len(generations)
+    unresolved: list[int] = []
+    for index, (sample, generation) in enumerate(zip(samples, generations)):
+        options = normalized_options(sample.raw)
+        strict = parse_mcq_output_for_prompt_profile(
+            generation.text, options, "paper_exact_terminal"
+        )
+        if strict.final_answer and not strict.parse_errors:
+            repaired[index] = (generation, strict.final_answer, "exact_primary")
+            continue
+        recovered = parse_paper_exact_mcq_output(generation.text, options)
+        if recovered.final_answer is not None:
+            canonical = append_paper_exact_terminal_answer(
+                generation.text, options, recovered.final_answer
+            )
+            repaired[index] = (
+                GenerationOutput(
+                    text=canonical,
+                    prompt=generation.prompt,
+                    raw_text=generation.text,
+                    finish_reason=generation.finish_reason,
+                    stop_reason=generation.stop_reason,
+                ),
+                recovered.final_answer,
+                "canonicalized_primary_answer",
+            )
+            continue
+        unresolved.append(index)
+
+    if unresolved:
+        logging.info(
+            "Constrained one-token terminal fallback for %s/%s oracle answer(s).",
+            len(unresolved),
+            len(generations),
+        )
+        prefixes = [
+            f"{generations[index].prompt}{generations[index].text.rstrip()}\nTherefore, the answer is ("
+            for index in unresolved
+        ]
+        choices = generator.generate_allowed_single_token_continuations(prefixes)
+        if len(choices) != len(unresolved):
+            raise RuntimeError(
+                f"Terminal fallback output mismatch: expected={len(unresolved)} got={len(choices)}"
+            )
+        for index, choice in zip(unresolved, choices):
+            sample = samples[index]
+            selected = extract_constrained_option(choice.text, sample)
+            if selected is None:
+                raise RuntimeError(
+                    f"Constrained terminal fallback returned no option for {sample.id}: {choice.text!r}"
+                )
+            primary = generations[index]
+            canonical = append_paper_exact_terminal_answer(
+                primary.text, normalized_options(sample.raw), selected
+            )
+            repaired[index] = (
+                GenerationOutput(
+                    text=canonical,
+                    prompt=primary.prompt,
+                    raw_text=primary.text,
+                    finish_reason=primary.finish_reason,
+                    stop_reason=primary.stop_reason,
+                ),
+                selected,
+                "constrained_one_token_fallback",
+            )
+
+    if any(value is None for value in repaired):
+        raise RuntimeError("Internal error: missing repaired terminal generation")
+    return [value for value in repaired if value is not None]
+
+
 def generate_no_rag(
     args: argparse.Namespace,
     generator: VLLMChatGenerator,
@@ -385,9 +484,10 @@ def generate_no_rag(
             for start in range(0, len(pending), args.generation_batch_size):
                 batch = pending[start : start + args.generation_batch_size]
                 requests = [prompt_request(sample, [], case_id="no_rag", max_doc_chars=args.max_doc_chars) for sample in batch]
-                generations = generator.generate_batch(requests)
-                for sample, generation in zip(batch, generations):
-                    prediction, errors = parse_generation(sample, generation.text)
+                primary_generations = generator.generate_batch(requests)
+                generations = repair_terminal_generations(generator, batch, primary_generations)
+                for sample, (generation, prediction, repair_source) in zip(batch, generations):
+                    _, errors = parse_generation(sample, generation.text)
                     row = {
                         "sample_id": sample.id,
                         "dataset": sample.dataset,
@@ -396,6 +496,9 @@ def generate_no_rag(
                         "prediction": prediction,
                         "correct": bool(evaluate_prediction(sample, prediction)["correct"]),
                         "raw_prediction": generation.text,
+                        "terminal_primary_generation": generation.raw_text,
+                        "terminal_repair_source": repair_source,
+                        "generation_attempts": 1 + int(repair_source == "constrained_one_token_fallback"),
                         "parse_errors": errors,
                         "prompt_version": PAPER_EXACT_TERMINAL_PROMPT_VERSION,
                     }
@@ -491,9 +594,16 @@ def generate_oracle_conditions(
                         output.write(json.dumps(row, ensure_ascii=False) + "\n")
                         completed[result_key(row)] = row
 
-                    generations = generator.generate_batch(requests) if requests else []
-                    for (sample, prefix, context), generation in zip(generated, generations):
-                        prediction, errors = parse_generation(sample, generation.text)
+                    primary_generations = generator.generate_batch(requests) if requests else []
+                    generations = repair_terminal_generations(
+                        generator,
+                        [sample for sample, _, _ in generated],
+                        primary_generations,
+                    )
+                    for (sample, prefix, context), (generation, prediction, repair_source) in zip(
+                        generated, generations
+                    ):
+                        _, errors = parse_generation(sample, generation.text)
                         row = {
                             "policy": policy,
                             "hidden_threshold": threshold,
@@ -505,6 +615,11 @@ def generate_oracle_conditions(
                             "prediction": prediction,
                             "correct": bool(evaluate_prediction(sample, prediction)["correct"]),
                             "raw_prediction": generation.text,
+                            "terminal_primary_generation": generation.raw_text,
+                            "terminal_repair_source": repair_source,
+                            "generation_attempts": 1 + int(
+                                repair_source == "constrained_one_token_fallback"
+                            ),
                             "parse_errors": errors,
                             "rerank_prefix_doc_ids": [document.stable_id for document in prefix],
                             "context_doc_ids": [document.stable_id for document in context],
