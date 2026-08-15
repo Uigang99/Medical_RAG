@@ -63,6 +63,7 @@ venv/
 !/scripts/download_mcq_raw.py
 !/scripts/download_rag2_pmc_raw.py
 !/scripts/evaluate_rag2_filter_model.py
+!/scripts/evaluate_rag2_oracle_label_topk_sweep.py
 !/scripts/export_rag2_codex_label_audit_sample.py
 !/scripts/extract_rag2_preanswer_hidden_full.py
 !/scripts/extract_rag2_preanswer_hidden_multilayer_full.py
@@ -80,6 +81,7 @@ venv/
 !/scripts/reparse_rag2_paper_exact_answers.py
 !/scripts/run_rag2_codex_labeling_pilot.py
 !/scripts/run_rag2_mcq_eval.py
+!/scripts/run_rag2_oracle_label_topk_4994.sh
 !/scripts/run_rag2_paper_exact_terra_semantic_filter_topk_sweep.sh
 !/scripts/run_rag2_paper_exact_train_no_rag_generation.sh
 !/scripts/run_rag2_terminal_all_mcq_topk_sweep.sh
@@ -95,3 +97,4 @@ venv/
 /tests/*
 !/tests/test_rag2_codex_labeling_resilience.py
 !/tests/test_rag2_mcq.py
+!/tests/test_rag2_oracle.py
