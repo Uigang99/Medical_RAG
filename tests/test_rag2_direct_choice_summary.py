@@ -25,7 +25,7 @@ class DirectChoiceSummaryTests(unittest.TestCase):
         self.assertFalse(uses_free_terminal_generation(direct))
         self.assertTrue(uses_free_terminal_generation(rationale))
 
-    def test_direct_choice_request_uses_exact_hidden_label_prompt_without_regex(self) -> None:
+    def test_direct_choice_request_uses_exact_hidden_label_prompt_and_token_grammar(self) -> None:
         raw = {
             "question": "Which vitamin is mainly obtained from animal products?",
             "options": {"A": "B12", "B": "C", "C": "B7", "D": "K"},
@@ -50,7 +50,7 @@ class DirectChoiceSummaryTests(unittest.TestCase):
             document_packing="fixed_chars",
         )
         request = prompt_request(args, sample, [], "no_rag", 0)
-        self.assertNotIn("structured_regex", request.metadata)
+        self.assertEqual(request.metadata["structured_regex"], r" (A|B|C|D)")
         self.assertIn("Do not provide an explanation", request.messages[0]["content"])
         self.assertIn("Context:\nNone", request.messages[0]["content"])
 

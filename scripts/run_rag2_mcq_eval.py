@@ -1798,8 +1798,17 @@ def prompt_request(
         choice_only=choice_only,
     )
     metadata: dict[str, Any] = {"document_packing": packing}
-    if uses_free_terminal_generation(args) and not choice_only:
-        metadata["structured_regex"] = paper_exact_terminal_regex(normalized_options(sample.raw))
+    if not choice_only:
+        if args.answer_decision_mode == "constrained_choice":
+            # Hidden-state label extraction scores the four leading-space
+            # choice tokens immediately after ``Final answer:``.  This
+            # one-token grammar exposes that exact same decision space while
+            # avoiding the current vLLM allowed_token_ids remapping bug.
+            metadata["structured_regex"] = r" (A|B|C|D)"
+        elif uses_free_terminal_generation(args):
+            metadata["structured_regex"] = paper_exact_terminal_regex(
+                normalized_options(sample.raw)
+            )
     return PromptRequest(sample_id=sample.id, case_id=case_id, messages=messages, metadata=metadata)
 
 
@@ -1819,15 +1828,7 @@ def uses_free_terminal_generation(args: argparse.Namespace) -> bool:
 
 def build_generator(args: argparse.Namespace) -> VLLMChatGenerator:
     assistant_prefill = None
-    allowed_token_ids = None
     if args.answer_decision_mode == "constrained_choice":
-        tokenizer = prompt_tokenizer(args)
-        allowed_token_ids = []
-        for choice in ("A", "B", "C", "D"):
-            token_ids = tokenizer.encode(" " + choice, add_special_tokens=False)
-            if len(token_ids) != 1:
-                raise RuntimeError(f"Constrained choice {choice!r} is not one token: {token_ids}")
-            allowed_token_ids.append(int(token_ids[0]))
         assistant_prefill = FINAL_ANSWER_PREFILL
     return VLLMChatGenerator(
         model_path=args.llm_model_path,
@@ -1849,7 +1850,6 @@ def build_generator(args: argparse.Namespace) -> VLLMChatGenerator:
         max_num_batched_tokens=args.vllm_max_num_batched_tokens,
         enable_prefix_caching=args.enable_prefix_caching,
         assistant_prefill=assistant_prefill,
-        allowed_token_ids=allowed_token_ids,
     )
 
 
