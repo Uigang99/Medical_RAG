@@ -1798,9 +1798,23 @@ def prompt_request(
         choice_only=choice_only,
     )
     metadata: dict[str, Any] = {"document_packing": packing}
-    if args.prompt_profile == "paper_exact_terminal" and not choice_only:
+    if uses_free_terminal_generation(args) and not choice_only:
         metadata["structured_regex"] = paper_exact_terminal_regex(normalized_options(sample.raw))
     return PromptRequest(sample_id=sample.id, case_id=case_id, messages=messages, metadata=metadata)
+
+
+def uses_free_terminal_generation(args: argparse.Namespace) -> bool:
+    """Whether generation needs the rationale-plus-terminal repair contract.
+
+    Constrained choice already appends ``Final answer:`` and emits exactly one
+    allowed A/B/C/D token.  Applying the paper-terminal grammar or its repair
+    path on top of that would turn a one-pass direct decision into a second,
+    parser-mediated decision.
+    """
+    return (
+        args.answer_decision_mode == "free_generation"
+        and args.prompt_profile == "paper_exact_terminal"
+    )
 
 
 def build_generator(args: argparse.Namespace) -> VLLMChatGenerator:
@@ -1916,7 +1930,7 @@ def generate_rag_answers(
             terminal_repair_sources: list[str | None] = [None] * len(outputs)
             terminal_primary_texts: list[str | None] = [None] * len(outputs)
 
-            if args.prompt_profile == "paper_exact_terminal":
+            if uses_free_terminal_generation(args):
                 needs_choice: list[int] = []
                 for idx, ((_, sample, _), output) in enumerate(zip(pending, outputs)):
                     terminal_primary_texts[idx] = output.text
