@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from argparse import Namespace
 
 from medrag.core import BenchmarkSample, GenerationOutput
 from medrag.rag2_oracle import (
@@ -9,7 +10,13 @@ from medrag.rag2_oracle import (
     hidden_policy_name,
     oracle_document_is_helpful,
 )
-from scripts.evaluate_rag2_oracle_label_topk_sweep import repair_terminal_generations
+from scripts.evaluate_rag2_oracle_label_topk_sweep import (
+    finalize_generations,
+    policies,
+    prompt_request,
+    prompt_versions,
+    repair_terminal_generations,
+)
 
 
 def sample() -> BenchmarkSample:
@@ -51,6 +58,37 @@ class FakeTerminalGenerator:
 
 
 class Rag2OracleTests(unittest.TestCase):
+    def test_direct_choice_uses_hidden_extraction_prompt_and_exact_choice_grammar(self) -> None:
+        args = Namespace(answer_decision_mode="constrained_choice")
+        request = prompt_request(args, sample(), [], case_id="no_rag", max_doc_chars=0)
+        self.assertIn("Do not provide an explanation", request.messages[0]["content"])
+        self.assertIn("Context:\nNone", request.messages[0]["content"])
+        self.assertEqual(request.metadata["structured_regex"], r" (A|B|C|D)")
+        self.assertEqual(
+            prompt_versions(args),
+            {
+                "no_rag": "rag2_fixed_direct_choice_context_v1",
+                "documents": "rag2_fixed_direct_choice_context_v1",
+            },
+        )
+
+    def test_direct_choice_finalization_requires_one_valid_option(self) -> None:
+        args = Namespace(answer_decision_mode="constrained_choice")
+        output = GenerationOutput(text=" A", prompt="PROMPT")
+        finalized = finalize_generations(args, FakeTerminalGenerator(), [sample()], [output])
+        self.assertEqual(finalized[0][1:], ("A", "constrained_choice"))
+        with self.assertRaisesRegex(RuntimeError, "direct-choice generation failed"):
+            finalize_generations(
+                args,
+                FakeTerminalGenerator(),
+                [sample()],
+                [GenerationOutput(text="!", prompt="PROMPT")],
+            )
+
+    def test_policy_selection_can_run_hidden_threshold_without_rag2(self) -> None:
+        args = Namespace(include_rag2=False, hidden_thresholds=[0.4])
+        self.assertEqual(policies(args), [("hidden_tau_0p4", 0.4)])
+
     def test_terminal_repair_canonicalizes_answer_already_in_response(self) -> None:
         generator = FakeTerminalGenerator()
         generation = GenerationOutput(

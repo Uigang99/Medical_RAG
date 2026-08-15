@@ -28,6 +28,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from medrag.core import BenchmarkSample, GenerationOutput, PromptRequest, RetrievedDocument
 from medrag.evaluation import evaluate_prediction
 from medrag.generation.transformers_generator import VLLMChatGenerator
+from medrag.filtering.rag2_preanswer_text_hidden import (
+    FINAL_ANSWER_PREFILL,
+    PREANSWER_PROMPT_VERSION,
+    build_preanswer_user_prompt,
+)
 from medrag.progress import StageProgress
 from medrag.rag2_mcq import (
     PAPER_EXACT_TERMINAL_DOCUMENT_PROMPT_VERSION,
@@ -78,8 +83,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--top-k-values", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--hidden-thresholds", type=float, nargs="+", default=[0.0, 0.2])
+    parser.add_argument("--include-rag2", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--answer-decision-mode",
+        choices=("paper_exact_terminal", "constrained_choice"),
+        default="paper_exact_terminal",
+        help=(
+            "paper_exact_terminal generates a rationale and fixed terminal answer; "
+            "constrained_choice uses the same no-rationale prompt and A/B/C/D decision "
+            "space as hidden-state label extraction."
+        ),
+    )
     parser.add_argument("--llm-model-path", type=Path, default=WORKSPACE_ROOT / "models/Llama-3-8B-Instruct")
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RESULTS_ROOT)
+    parser.add_argument(
+        "--reuse-no-rag-path",
+        type=Path,
+        default=None,
+        help="Reuse a complete no-RAG JSONL generated with the same answer-decision mode.",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--generation-batch-size", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=768)
@@ -263,7 +285,9 @@ def load_artifacts(args: argparse.Namespace) -> tuple[
 
 
 def policies(args: argparse.Namespace) -> list[tuple[str, float | None]]:
-    result: list[tuple[str, float | None]] = [("rag2", None)]
+    result: list[tuple[str, float | None]] = []
+    if args.include_rag2:
+        result.append(("rag2", None))
     seen = set()
     for threshold in args.hidden_thresholds:
         value = float(threshold)
@@ -273,6 +297,8 @@ def policies(args: argparse.Namespace) -> list[tuple[str, float | None]]:
             continue
         seen.add(value)
         result.append((hidden_policy_name(value), value))
+    if not result:
+        raise ValueError("At least one oracle policy must be requested")
     return result
 
 
@@ -297,7 +323,20 @@ def selected_documents(
     ]
 
 
+def prompt_versions(args: argparse.Namespace) -> dict[str, str]:
+    if args.answer_decision_mode == "constrained_choice":
+        return {
+            "no_rag": PREANSWER_PROMPT_VERSION,
+            "documents": PREANSWER_PROMPT_VERSION,
+        }
+    return {
+        "no_rag": PAPER_EXACT_TERMINAL_PROMPT_VERSION,
+        "documents": PAPER_EXACT_TERMINAL_DOCUMENT_PROMPT_VERSION,
+    }
+
+
 def prompt_request(
+    args: argparse.Namespace,
     sample: BenchmarkSample,
     documents: list[RetrievedDocument],
     *,
@@ -305,6 +344,21 @@ def prompt_request(
     max_doc_chars: int,
 ) -> PromptRequest:
     document_rows = [document.to_dict(include_text=True) for document in documents]
+    if args.answer_decision_mode == "constrained_choice":
+        rendered_documents: list[str] = []
+        for row in document_rows:
+            text = " ".join(str(row.get("text") or row.get("title") or "").split())
+            if max_doc_chars > 0 and len(text) > max_doc_chars:
+                text = text[: max_doc_chars - 3].rstrip() + "..."
+            if text:
+                rendered_documents.append(text)
+        context = "\n\n".join(rendered_documents) or None
+        return PromptRequest(
+            sample_id=sample.id,
+            case_id=case_id,
+            messages=[{"role": "user", "content": build_preanswer_user_prompt(sample, context)}],
+            metadata={"structured_regex": r" (A|B|C|D)"},
+        )
     messages = (
         build_paper_exact_terminal_documents_messages(
             sample.raw,
@@ -322,9 +376,10 @@ def prompt_request(
 
 
 def build_generator(args: argparse.Namespace) -> VLLMChatGenerator:
+    direct_choice = args.answer_decision_mode == "constrained_choice"
     return VLLMChatGenerator(
         model_path=args.llm_model_path,
-        max_new_tokens=args.max_new_tokens,
+        max_new_tokens=1 if direct_choice else args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
         stop=["<|im_end|>", "<|eot_id|>"],
@@ -341,6 +396,7 @@ def build_generator(args: argparse.Namespace) -> VLLMChatGenerator:
         max_num_seqs=args.vllm_max_num_seqs,
         max_num_batched_tokens=args.vllm_max_num_batched_tokens,
         enable_prefix_caching=args.enable_prefix_caching,
+        assistant_prefill=FINAL_ANSWER_PREFILL if direct_choice else None,
     )
 
 
@@ -360,7 +416,60 @@ def load_no_rag_rows(path: Path) -> dict[str, dict[str, Any]]:
     return {str(row["sample_id"]): row for row in iter_jsonl(path)}
 
 
-def parse_generation(sample: BenchmarkSample, text: str) -> tuple[str, list[str]]:
+def load_reused_no_rag_rows(
+    args: argparse.Namespace,
+    samples: list[BenchmarkSample],
+    path: Path,
+) -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    rows = load_no_rag_rows(path)
+    expected_ids = {sample.id for sample in samples}
+    actual_ids = set(rows)
+    if actual_ids != expected_ids:
+        raise RuntimeError(
+            f"Reused no-RAG cache does not match cohort: expected={len(expected_ids)} "
+            f"actual={len(actual_ids)} missing={len(expected_ids - actual_ids)} "
+            f"extra={len(actual_ids - expected_ids)} path={path}"
+        )
+    expected_prompt = prompt_versions(args)["no_rag"]
+    invalid_prompt = [
+        sample_id
+        for sample_id, row in rows.items()
+        if str(row.get("prompt_version") or "") != expected_prompt
+    ]
+    if invalid_prompt:
+        raise RuntimeError(
+            f"Reused no-RAG cache has the wrong prompt contract for "
+            f"{len(invalid_prompt)} row(s): expected={expected_prompt} "
+            f"first={invalid_prompt[:3]} path={path}"
+        )
+    invalid_mode = [
+        sample_id
+        for sample_id, row in rows.items()
+        if row.get("answer_decision_mode") not in (None, args.answer_decision_mode)
+    ]
+    if invalid_mode:
+        raise RuntimeError(
+            f"Reused no-RAG cache has the wrong answer-decision mode for "
+            f"{len(invalid_mode)} row(s): first={invalid_mode[:3]} path={path}"
+        )
+    logging.info("Reusing complete no-RAG cache: %s (%s rows)", path, len(rows))
+    return rows
+
+
+def parse_generation(
+    args: argparse.Namespace,
+    sample: BenchmarkSample,
+    text: str,
+) -> tuple[str, list[str]]:
+    if args.answer_decision_mode == "constrained_choice":
+        answer = extract_constrained_option(text, sample)
+        if answer is None:
+            raise RuntimeError(
+                f"Constrained direct-choice generation failed for {sample.id}: {text!r}"
+            )
+        return answer, []
     parsed = parse_mcq_output_for_prompt_profile(text, normalized_options(sample.raw), "paper_exact_terminal")
     if not parsed.final_answer or parsed.parse_errors:
         raise RuntimeError(
@@ -368,6 +477,25 @@ def parse_generation(sample: BenchmarkSample, text: str) -> tuple[str, list[str]
             f"errors={parsed.parse_errors} text={text[-500:]!r}"
         )
     return parsed.final_answer, parsed.parse_errors
+
+
+def finalize_generations(
+    args: argparse.Namespace,
+    generator: VLLMChatGenerator,
+    samples: list[BenchmarkSample],
+    generations: list[GenerationOutput],
+) -> list[tuple[GenerationOutput, str, str]]:
+    if args.answer_decision_mode == "paper_exact_terminal":
+        return repair_terminal_generations(generator, samples, generations)
+    if len(samples) != len(generations):
+        raise RuntimeError(
+            f"Direct-choice output mismatch: samples={len(samples)} generations={len(generations)}"
+        )
+    finalized: list[tuple[GenerationOutput, str, str]] = []
+    for sample, generation in zip(samples, generations):
+        prediction, _ = parse_generation(args, sample, generation.text)
+        finalized.append((generation, prediction, "constrained_choice"))
+    return finalized
 
 
 def extract_constrained_option(text: str, sample: BenchmarkSample) -> str | None:
@@ -483,11 +611,20 @@ def generate_no_rag(
         with path.open(mode, encoding="utf-8", buffering=16 * 1024 * 1024) as output:
             for start in range(0, len(pending), args.generation_batch_size):
                 batch = pending[start : start + args.generation_batch_size]
-                requests = [prompt_request(sample, [], case_id="no_rag", max_doc_chars=args.max_doc_chars) for sample in batch]
+                requests = [
+                    prompt_request(
+                        args,
+                        sample,
+                        [],
+                        case_id="no_rag",
+                        max_doc_chars=args.max_doc_chars,
+                    )
+                    for sample in batch
+                ]
                 primary_generations = generator.generate_batch(requests)
-                generations = repair_terminal_generations(generator, batch, primary_generations)
+                generations = finalize_generations(args, generator, batch, primary_generations)
                 for sample, (generation, prediction, repair_source) in zip(batch, generations):
-                    _, errors = parse_generation(sample, generation.text)
+                    _, errors = parse_generation(args, sample, generation.text)
                     row = {
                         "sample_id": sample.id,
                         "dataset": sample.dataset,
@@ -498,9 +635,12 @@ def generate_no_rag(
                         "raw_prediction": generation.text,
                         "terminal_primary_generation": generation.raw_text,
                         "terminal_repair_source": repair_source,
-                        "generation_attempts": 1 + int(repair_source == "constrained_one_token_fallback"),
+                        "generation_attempts": 1 + int(
+                            repair_source == "constrained_one_token_fallback"
+                        ),
                         "parse_errors": errors,
-                        "prompt_version": PAPER_EXACT_TERMINAL_PROMPT_VERSION,
+                        "prompt_version": prompt_versions(args)["no_rag"],
+                        "answer_decision_mode": args.answer_decision_mode,
                     }
                     output.write(json.dumps(row, ensure_ascii=False) + "\n")
                     completed[sample.id] = row
@@ -523,8 +663,14 @@ def generate_oracle_conditions(
     no_rag_rows: dict[str, dict[str, Any]],
     output_path: Path,
 ) -> dict[tuple[str, int, str], dict[str, Any]]:
-    completed = load_result_rows(output_path) if args.resume else {}
     conditions = [(policy, threshold, top_k) for policy, threshold in policies(args) for top_k in args.top_k_values]
+    expected_keys = {
+        (policy, top_k, sample.id)
+        for policy, _, top_k in conditions
+        for sample in samples
+    }
+    loaded = load_result_rows(output_path) if args.resume else {}
+    completed = {key: row for key, row in loaded.items() if key in expected_keys}
     total = len(samples) * len(conditions)
     done = sum((policy, top_k, sample.id) in completed for policy, _, top_k in conditions for sample in samples)
     progress = StageProgress(total=total, desc="OracleLabelSweep", enabled=True)
@@ -576,12 +722,14 @@ def generate_oracle_conditions(
                                     "context_doc_ids": [],
                                     "context_document_count": 0,
                                     "zero_context_fallback": True,
-                                    "prompt_version": PAPER_EXACT_TERMINAL_PROMPT_VERSION,
+                                    "prompt_version": prompt_versions(args)["no_rag"],
+                                    "answer_decision_mode": args.answer_decision_mode,
                                 }
                             )
                             continue
                         requests.append(
                             prompt_request(
+                                args,
                                 sample,
                                 context,
                                 case_id=f"{policy}_top{top_k}",
@@ -595,7 +743,8 @@ def generate_oracle_conditions(
                         completed[result_key(row)] = row
 
                     primary_generations = generator.generate_batch(requests) if requests else []
-                    generations = repair_terminal_generations(
+                    generations = finalize_generations(
+                        args,
                         generator,
                         [sample for sample, _, _ in generated],
                         primary_generations,
@@ -603,7 +752,7 @@ def generate_oracle_conditions(
                     for (sample, prefix, context), (generation, prediction, repair_source) in zip(
                         generated, generations
                     ):
-                        _, errors = parse_generation(sample, generation.text)
+                        _, errors = parse_generation(args, sample, generation.text)
                         row = {
                             "policy": policy,
                             "hidden_threshold": threshold,
@@ -625,7 +774,8 @@ def generate_oracle_conditions(
                             "context_doc_ids": [document.stable_id for document in context],
                             "context_document_count": len(context),
                             "zero_context_fallback": False,
-                            "prompt_version": PAPER_EXACT_TERMINAL_DOCUMENT_PROMPT_VERSION,
+                            "prompt_version": prompt_versions(args)["documents"],
+                            "answer_decision_mode": args.answer_decision_mode,
                         }
                         output.write(json.dumps(row, ensure_ascii=False) + "\n")
                         completed[result_key(row)] = row
@@ -695,15 +845,21 @@ def summarize(
                     dataset: metric(values, no_rag) for dataset, values in sorted(by_dataset.items())
                 },
             }
-    return {"baseline": baseline, "conditions": conditions}
+    return {
+        "answer_decision_mode": args.answer_decision_mode,
+        "prompt_versions": prompt_versions(args),
+        "baseline": baseline,
+        "conditions": conditions,
+    }
 
 
 def write_pretty_summary(path: Path, summary: dict[str, Any]) -> None:
     baseline = summary["baseline"]
+    answer_mode = str(summary["answer_decision_mode"])
     lines = [
         "RAG2 vs Hidden-State Gold-Label Oracle Top-k Sweep",
         "",
-        "Common final answer protocol: paper_exact_terminal",
+        f"Common final answer protocol: {answer_mode}",
         "",
         "| Policy | Top-k | Dataset | Questions | Correct | Accuracy | Avg docs | Zero docs | Gains | Losses | Net |",
         "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -743,6 +899,7 @@ def main() -> None:
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     if not args.top_k_values or any(value not in {1, 2, 4, 8} for value in args.top_k_values):
         raise ValueError("--top-k-values must be selected from 1 2 4 8")
+    requested_policies = policies(args)
     if not args.llm_model_path.exists() and not args.dry_run:
         raise FileNotFoundError(args.llm_model_path)
 
@@ -750,19 +907,22 @@ def main() -> None:
     if len({sample.id for sample in samples}) != len(samples):
         raise RuntimeError("Duplicate questions in selected oracle cohort")
     args.run_dir.mkdir(parents=True, exist_ok=True)
+    no_rag_cache_path = args.reuse_no_rag_path or (args.run_dir / "no_rag_results.jsonl")
     manifest = {
-        "version": "rag2_gold_label_oracle_topk_v1",
+        "version": "rag2_gold_label_oracle_topk_v2",
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "datasets": args.datasets,
         "question_limits": {"medmcqa": args.medmcqa_question_limit, "medqa": args.medqa_question_limit},
         "sample_seed": args.sample_seed,
         "selected_sample_ids": [sample.id for sample in samples],
         "top_k_values": sorted(set(args.top_k_values)),
-        "policies": [{"name": name, "hidden_threshold": threshold} for name, threshold in policies(args)],
-        "prompt_versions": {
-            "no_rag": PAPER_EXACT_TERMINAL_PROMPT_VERSION,
-            "documents": PAPER_EXACT_TERMINAL_DOCUMENT_PROMPT_VERSION,
-        },
+        "policies": [
+            {"name": name, "hidden_threshold": threshold}
+            for name, threshold in requested_policies
+        ],
+        "answer_decision_mode": args.answer_decision_mode,
+        "prompt_versions": prompt_versions(args),
+        "no_rag_cache_path": str(no_rag_cache_path.resolve()),
         "candidate_root": str(args.candidate_root.resolve()),
         "rag2_label_root": str(args.rag2_label_root.resolve()),
         "hidden_label_root": str(args.hidden_label_root.resolve()),
@@ -773,8 +933,8 @@ def main() -> None:
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         comparable_keys = [
             "version", "datasets", "question_limits", "sample_seed", "selected_sample_ids",
-            "top_k_values", "policies", "prompt_versions", "candidate_root", "rag2_label_root",
-            "hidden_label_root",
+            "top_k_values", "policies", "answer_decision_mode", "prompt_versions",
+            "no_rag_cache_path", "candidate_root", "rag2_label_root", "hidden_label_root",
         ]
         if any(existing.get(key) != manifest.get(key) for key in comparable_keys):
             raise RuntimeError(f"Existing run manifest is incompatible with requested run: {manifest_path}")
@@ -785,7 +945,7 @@ def main() -> None:
         "Oracle cohort ready: questions=%s pairs=%s policies=%s top_k=%s",
         len(samples),
         audit["total_pairs"],
-        [name for name, _ in policies(args)],
+        [name for name, _ in requested_policies],
         sorted(set(args.top_k_values)),
     )
     for dataset, values in audit["datasets"].items():
@@ -804,7 +964,15 @@ def main() -> None:
 
     generator = build_generator(args)
     try:
-        no_rag = generate_no_rag(args, generator, samples, args.run_dir / "no_rag_results.jsonl")
+        if args.reuse_no_rag_path is not None:
+            no_rag = load_reused_no_rag_rows(args, samples, args.reuse_no_rag_path)
+        else:
+            no_rag = generate_no_rag(
+                args,
+                generator,
+                samples,
+                args.run_dir / "no_rag_results.jsonl",
+            )
         rows = generate_oracle_conditions(
             args,
             generator,
