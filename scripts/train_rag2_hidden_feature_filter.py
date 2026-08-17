@@ -63,6 +63,7 @@ from medrag.filtering.rag2_official import LABEL_NAMES, LABEL_TOKENS, add_label_
 
 TRAINER_VERSION = "rag2_hidden_feature_filter_ablation_v1"
 INPUT_MODES = ("text_only", "hidden_only", "text_hidden")
+LABEL_MODES = ("symmetric_neutral", "positive_vs_rest")
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +72,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-mode", choices=INPUT_MODES, required=True)
     parser.add_argument("--split-root", type=Path, required=True)
     parser.add_argument("--hidden-feature-root", type=Path, default=None)
+    parser.add_argument("--expected-label-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--expected-label-mode",
+        choices=LABEL_MODES,
+        default="symmetric_neutral",
+    )
     parser.add_argument(
         "--model-name-or-path",
         type=Path,
@@ -137,8 +144,23 @@ def load_split_manifest(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"Unsupported hidden split manifest: {path}")
     if value.get("dataset") != args.dataset:
         raise RuntimeError("Split manifest dataset mismatch")
-    if float(value.get("threshold")) != 0.0:
-        raise RuntimeError("This comparison is explicitly restricted to the tau=0 baseline")
+    actual_threshold = float(value.get("threshold"))
+    if not math.isclose(
+        actual_threshold,
+        float(args.expected_label_threshold),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise RuntimeError(
+            f"Split label threshold mismatch: expected {args.expected_label_threshold}, "
+            f"found {actual_threshold}"
+        )
+    actual_label_mode = str(value.get("label_mode") or "symmetric_neutral")
+    if actual_label_mode != args.expected_label_mode:
+        raise RuntimeError(
+            f"Split label mode mismatch: expected {args.expected_label_mode}, "
+            f"found {actual_label_mode}"
+        )
     forbidden = set((value.get("model_input_contract") or {}).get("forbidden_as_model_inputs") or [])
     if not {"gold-derived c", "projection score"}.issubset(forbidden):
         raise RuntimeError("Split manifest does not declare the gold leakage exclusions")
@@ -672,6 +694,10 @@ def main() -> None:
         "model_name_or_path": str(args.model_name_or_path.resolve()),
         "split_root": str(args.split_root.resolve()),
         "hidden_feature_root": str(hidden_root),
+        "label_contract": {
+            "threshold": args.expected_label_threshold,
+            "mode": args.expected_label_mode,
+        },
         "hidden_input": {
             "included": ["h0", "delta_h=hD-h0"] if args.input_mode != "text_only" else [],
             "excluded": ["c", "projection_score", "gold_answer", "answer_transition"],
@@ -703,6 +729,8 @@ def main() -> None:
         {
             "trainer_version": TRAINER_VERSION,
             "input_mode": args.input_mode,
+            "label_threshold": args.expected_label_threshold,
+            "label_mode": args.expected_label_mode,
             "hidden_size": feature_store.hidden_size if feature_store is not None else None,
             "hidden_inputs": ["h0", "delta_h"] if feature_store is not None else [],
             "forbidden_inputs": ["c", "projection_score", "gold_answer", "answer_transition"],

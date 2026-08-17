@@ -42,6 +42,7 @@ from medrag.filtering.rag2_official import build_official_filter_input, format_o
 
 
 MATERIALIZATION_VERSION = "rag2_hidden_utility_filter_inputs_v1"
+LABEL_MODES = ("symmetric_neutral", "positive_vs_rest")
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--expected-primary-layer", default="layer_28")
     parser.add_argument("--expected-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--expected-label-mode",
+        choices=LABEL_MODES,
+        default="symmetric_neutral",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -129,17 +135,30 @@ def validate_contract(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("Hidden label primary layer mismatch")
     if float(labels.get("neutral_threshold")) != float(args.expected_threshold):
         raise RuntimeError("Hidden label threshold mismatch")
+    actual_label_mode = str(labels.get("label_mode") or "symmetric_neutral")
+    if actual_label_mode != args.expected_label_mode:
+        raise RuntimeError(
+            f"Hidden label mode mismatch: expected {args.expected_label_mode}, "
+            f"found {actual_label_mode}"
+        )
     if int(labels.get("rows") or 0) != int(feature.get("total_pairs") or 0):
         raise RuntimeError("Hidden label/feature pair totals differ")
     return {"feature_manifest": feature, "label_summary": labels}
 
 
-def output_row(pair: dict[str, Any], label: dict[str, Any], split: str) -> dict[str, Any]:
+def output_row(
+    pair: dict[str, Any],
+    label: dict[str, Any],
+    split: str,
+    *,
+    threshold: float,
+    label_mode: str,
+) -> dict[str, Any]:
     document = pair["document"]
     hidden_label = str(label["hidden_label"])
     if hidden_label not in {"Helpful", "Not Helpful"}:
         raise RuntimeError(
-            "This binary ablation requires tau=0 labels without Neutral rows; "
+            "This binary ablation requires labels containing only Helpful/Not Helpful; "
             f"got {hidden_label!r} for {pair['pair_id']}"
         )
     target = "helpful" if hidden_label == "Helpful" else "not helpful"
@@ -160,7 +179,9 @@ def output_row(pair: dict[str, Any], label: dict[str, Any], split: str) -> dict[
         ),
         "target": target,
         "label": hidden_label,
-        "label_origin": "layer28_hidden_projection_sign_tau0",
+        "label_origin": (
+            f"layer28_hidden_projection_{label_mode}_tau{threshold:g}"
+        ),
         # Audit-only values. The collator never exposes these fields to the model.
         "hidden_projection_score_audit_only": float(label["projection_score"]),
         "answer_transition_audit_only": str(label["answer_transition"]),
@@ -227,7 +248,13 @@ def run(args: argparse.Namespace) -> None:
                 split = split_map.get(sample_id)
                 if split is None:
                     raise RuntimeError(f"Question missing from reference split: {sample_id}")
-                row = output_row(pair, label, split)
+                row = output_row(
+                    pair,
+                    label,
+                    split,
+                    threshold=args.expected_threshold,
+                    label_mode=args.expected_label_mode,
+                )
                 handles[split].write(json.dumps(row, ensure_ascii=False) + "\n")
                 seen_questions.add(sample_id)
                 counters[split]["rows"] += 1
@@ -282,6 +309,7 @@ def run(args: argparse.Namespace) -> None:
         "reference_split_root": str(args.reference_split_root.resolve()),
         "primary_layer": args.expected_primary_layer,
         "threshold": args.expected_threshold,
+        "label_mode": args.expected_label_mode,
         "label_rule": {
             "helpful": f"projection_score > {args.expected_threshold}",
             "not_helpful": f"projection_score <= {args.expected_threshold}",

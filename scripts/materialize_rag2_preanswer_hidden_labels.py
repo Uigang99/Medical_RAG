@@ -13,7 +13,8 @@ from typing import Any
 from tqdm.auto import tqdm
 
 
-LABEL_VERSION = "rag2_preanswer_hidden_projection_label_v1"
+LABEL_VERSION = "rag2_preanswer_hidden_projection_label_v2"
+LABEL_MODES = ("symmetric_neutral", "positive_vs_rest")
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +25,16 @@ def parse_args() -> argparse.Namespace:
         "--primary-layer", choices=["layer_16", "layer_24", "layer_28", "final"], default="layer_28"
     )
     parser.add_argument("--neutral-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--label-mode",
+        choices=LABEL_MODES,
+        default="symmetric_neutral",
+        help=(
+            "symmetric_neutral keeps the original Helpful/Neutral/Not Helpful rule; "
+            "positive_vs_rest makes a binary target: score > threshold is Helpful "
+            "and every other score is Not Helpful."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -34,7 +45,11 @@ def atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-def classify(score: float, threshold: float) -> str:
+def classify(score: float, threshold: float, label_mode: str = "symmetric_neutral") -> str:
+    if label_mode == "positive_vs_rest":
+        return "Helpful" if score > threshold else "Not Helpful"
+    if label_mode != "symmetric_neutral":
+        raise ValueError(f"Unsupported label mode: {label_mode}")
     if score > threshold:
         return "Helpful"
     if score < -threshold:
@@ -67,7 +82,7 @@ def run(args: argparse.Namespace) -> None:
             progress.update(len(line.encode("utf-8")))
             row = json.loads(line)
             score = float(row["utility_projection_by_layer"][args.primary_layer])
-            label = classify(score, args.neutral_threshold)
+            label = classify(score, args.neutral_threshold, args.label_mode)
             document = row["document"]
             output = {
                 "label_version": LABEL_VERSION,
@@ -80,6 +95,7 @@ def run(args: argparse.Namespace) -> None:
                 "primary_layer": args.primary_layer,
                 "projection_score": score,
                 "neutral_threshold": args.neutral_threshold,
+                "label_mode": args.label_mode,
                 "hidden_label": label,
                 "use_for_binary_training": label in {"Helpful", "Not Helpful"},
                 "gold_answer": row["gold_answer"],
@@ -95,17 +111,25 @@ def run(args: argparse.Namespace) -> None:
         destination.flush()
         os.fsync(destination.fileno())
     os.replace(temporary, output_path)
+    if args.label_mode == "positive_vs_rest":
+        label_rule = {
+            "Helpful": f"score > {args.neutral_threshold}",
+            "Not Helpful": f"score <= {args.neutral_threshold}",
+        }
+    else:
+        label_rule = {
+            "Helpful": f"score > {args.neutral_threshold}",
+            "Not Helpful": f"score < {-args.neutral_threshold}",
+            "Neutral": f"abs(score) <= {args.neutral_threshold}",
+        }
     summary = {
         "label_version": LABEL_VERSION,
         "input_dir": str(args.input_dir.resolve()),
         "output_path": str(output_path.resolve()),
         "primary_layer": args.primary_layer,
         "neutral_threshold": args.neutral_threshold,
-        "label_rule": {
-            "Helpful": f"score > {args.neutral_threshold}",
-            "Not Helpful": f"score < {-args.neutral_threshold}",
-            "Neutral": f"abs(score) <= {args.neutral_threshold}",
-        },
+        "label_mode": args.label_mode,
+        "label_rule": label_rule,
         "rows": sum(counts.values()),
         "labels": dict(counts),
         "by_dataset": {dataset: dict(values) for dataset, values in by_dataset.items()},
