@@ -81,6 +81,7 @@ venv/
 !/scripts/reparse_rag2_paper_exact_answers.py
 !/scripts/run_rag2_codex_labeling_pilot.py
 !/scripts/run_rag2_direct_choice_all_mcq_topk_sweep.sh
+!/scripts/run_rag2_hidden_tau0p4_all_mcq_answer_modes.sh
 !/scripts/run_rag2_mcq_eval.py
 !/scripts/run_rag2_oracle_label_topk_4994.sh
 !/scripts/run_rag2_paper_exact_terra_semantic_filter_topk_sweep.sh
@@ -93,6 +94,7 @@ venv/
 !/scripts/split_mcq_unified_by_dataset.py
 !/scripts/subsample_rag2_filter_inputs_to_reference_counts.py
 !/scripts/summarize_rag2_direct_choice_all_mcq.py
+!/scripts/summarize_rag2_hidden_tau0p4_answer_modes.py
 !/scripts/train_rag2_filter_model_paper.py
 !/scripts/train_rag2_hidden_feature_filter.py
 
