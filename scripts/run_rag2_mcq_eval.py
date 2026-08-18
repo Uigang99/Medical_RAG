@@ -17,6 +17,9 @@ from typing import Any
 
 import numpy as np
 import torch
+from safetensors import safe_open
+from safetensors.torch import load_file as load_safetensors
+from safetensors.torch import save_file as save_safetensors
 from transformers import AutoModel, AutoTokenizer
 
 
@@ -38,8 +41,10 @@ from medrag.filtering.rag2_hierarchical import HierarchicalRag2DocumentFilter
 from medrag.filtering.rag2_preanswer_text_hidden import (
     FINAL_ANSWER_PREFILL,
     PREANSWER_PROMPT_VERSION,
+    PreAnswerLayerExtractor,
     TextHiddenRag2Filter,
     build_preanswer_user_prompt,
+    preanswer_evidence,
 )
 from medrag.filtering.rag2_windowing import sentence_context_windows, windowing_contract
 from medrag.generation.transformers_generator import VLLMChatGenerator
@@ -2872,6 +2877,333 @@ def filter_score_cache_dir(args: argparse.Namespace, candidate_dir: Path) -> tup
     return candidate_dir / "filter_scores" / fingerprint[:16], settings, fingerprint
 
 
+PREANSWER_HIDDEN_FEATURE_CACHE_VERSION = "rag2_preanswer_hidden_states_v1"
+
+
+def preanswer_hidden_feature_cache_settings(
+    args: argparse.Namespace,
+    candidate_dir: Path,
+) -> dict[str, Any]:
+    """Return only inputs that can change h0/hD, never filter-model settings."""
+
+    candidate_path = candidate_dir / "candidates.jsonl"
+    candidate_stat = candidate_path.stat()
+    state_model = args.llm_model_path.resolve()
+    state_model_identity = _path_cache_identity(state_model)
+    if state_model.is_dir():
+        state_model_identity["weight_shards"] = [
+            {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "mtime_ns": path.stat().st_mtime_ns,
+            }
+            for path in sorted(state_model.glob("*.safetensors"))
+        ]
+    return {
+        "version": PREANSWER_HIDDEN_FEATURE_CACHE_VERSION,
+        "candidate_cache_dir": str(candidate_dir.resolve()),
+        "candidate_file": {
+            "size": candidate_stat.st_size,
+            "mtime_ns": candidate_stat.st_mtime_ns,
+        },
+        "state_model": state_model_identity,
+        "prompt_version": PREANSWER_PROMPT_VERSION,
+        "hidden_layer": args.hidden_feature_layer,
+        "hidden_max_input_tokens": args.hidden_feature_max_input_tokens,
+        "hidden_dtype": args.hidden_feature_dtype,
+        "hidden_attn_implementation": args.hidden_feature_attn_implementation,
+        "max_doc_chars": args.filter_max_doc_chars,
+        # Sharding does not change values, but fixing it in the contract makes
+        # interrupted-run validation and deterministic shard names trivial.
+        "question_shard_size": args.hidden_filter_question_batch_size,
+        "routes": {"medqa": "medqa", "medmcqa_and_mmlu": "medmcqa"},
+        "stored_tensors": ["h0", "hD", "document_offsets"],
+        "forbidden_inputs": ["gold_answer", "c", "projection_score", "answer_transition"],
+    }
+
+
+def preanswer_hidden_feature_cache_dir(
+    args: argparse.Namespace,
+    candidate_dir: Path,
+) -> tuple[Path, dict[str, Any], str]:
+    settings = preanswer_hidden_feature_cache_settings(args, candidate_dir)
+    fingerprint = hashlib.sha256(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()
+    return candidate_dir / "preanswer_hidden_features" / fingerprint[:16], settings, fingerprint
+
+
+def _preanswer_feature_batch_specs(
+    args: argparse.Namespace,
+    samples: list[BenchmarkSample],
+    reranked_docs: list[list[RetrievedDocument]],
+) -> list[dict[str, Any]]:
+    routes = _filter_routes()
+    specs: list[dict[str, Any]] = []
+    shard_size = max(1, int(args.hidden_filter_question_batch_size))
+    for route in ("medqa", "medmcqa"):
+        route_indices = [
+            index for index, sample in enumerate(samples) if routes[sample.dataset] == route
+        ]
+        for start in range(0, len(route_indices), shard_size):
+            indices = route_indices[start : start + shard_size]
+            specs.append(
+                {
+                    "name": f"{route}_{start:07d}",
+                    "route": route,
+                    "indices": indices,
+                    "questions": len(indices),
+                    "documents": sum(len(reranked_docs[index]) for index in indices),
+                }
+            )
+    return specs
+
+
+def _preanswer_feature_expected_metadata(
+    spec: dict[str, Any],
+    samples: list[BenchmarkSample],
+    reranked_docs: list[list[RetrievedDocument]],
+    fingerprint: str,
+) -> dict[str, Any]:
+    indices = list(spec["indices"])
+    return {
+        "type": "rag2_mcq_eval_preanswer_hidden_feature_shard",
+        "version": PREANSWER_HIDDEN_FEATURE_CACHE_VERSION,
+        "settings_fingerprint": fingerprint,
+        "name": spec["name"],
+        "route": spec["route"],
+        "sample_indices": indices,
+        "sample_keys": [sample_key(samples[index]) for index in indices],
+        "document_keys": [
+            [[document.db_id, document.local_id] for document in reranked_docs[index]]
+            for index in indices
+        ],
+        "questions": int(spec["questions"]),
+        "documents": int(spec["documents"]),
+    }
+
+
+def _preanswer_feature_shard_paths(cache_dir: Path, name: str) -> tuple[Path, Path]:
+    return cache_dir / "shards" / f"{name}.safetensors", cache_dir / "shards" / f"{name}.json"
+
+
+def _valid_preanswer_feature_shard(
+    cache_dir: Path,
+    expected: dict[str, Any],
+    hidden_size: int | None = None,
+) -> bool:
+    tensor_path, metadata_path = _preanswer_feature_shard_paths(cache_dir, expected["name"])
+    if not tensor_path.is_file() or not metadata_path.is_file():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        for key in (
+            "type",
+            "version",
+            "settings_fingerprint",
+            "name",
+            "route",
+            "sample_indices",
+            "sample_keys",
+            "document_keys",
+            "questions",
+            "documents",
+        ):
+            if metadata.get(key) != expected.get(key):
+                return False
+        with safe_open(str(tensor_path), framework="pt", device="cpu") as handle:
+            if set(handle.keys()) != {"document_offsets", "h0", "hD"}:
+                return False
+            h0_shape = tuple(handle.get_slice("h0").get_shape())
+            hD_shape = tuple(handle.get_slice("hD").get_shape())
+            offsets_shape = tuple(handle.get_slice("document_offsets").get_shape())
+        if h0_shape[0] != expected["questions"] or hD_shape[0] != expected["documents"]:
+            return False
+        if offsets_shape != (expected["questions"] + 1,):
+            return False
+        if len(h0_shape) != 2 or len(hD_shape) != 2 or h0_shape[1] != hD_shape[1]:
+            return False
+        return hidden_size is None or h0_shape[1] == hidden_size
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def _write_preanswer_feature_shard(
+    cache_dir: Path,
+    expected: dict[str, Any],
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    tensor_path, metadata_path = _preanswer_feature_shard_paths(cache_dir, expected["name"])
+    tensor_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_tensor = tensor_path.with_name(f".{tensor_path.stem}.tmp.safetensors")
+    temporary_metadata = metadata_path.with_name(f".{metadata_path.name}.tmp")
+    save_safetensors(
+        {key: value.detach().cpu().contiguous() for key, value in tensors.items()},
+        str(temporary_tensor),
+    )
+    temporary_tensor.replace(tensor_path)
+    write_json(
+        temporary_metadata,
+        {
+            **expected,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "tensor_path": str(tensor_path),
+            "h0_shape": list(tensors["h0"].shape),
+            "hD_shape": list(tensors["hD"].shape),
+            "storage_dtype": str(tensors["h0"].dtype).replace("torch.", ""),
+        },
+    )
+    temporary_metadata.replace(metadata_path)
+
+
+def _load_preanswer_feature_shard(
+    cache_dir: Path,
+    expected: dict[str, Any],
+    hidden_size: int | None = None,
+) -> dict[str, torch.Tensor]:
+    if not _valid_preanswer_feature_shard(cache_dir, expected, hidden_size=hidden_size):
+        raise RuntimeError(f"Invalid pre-answer hidden feature shard: {expected['name']}")
+    tensor_path, _ = _preanswer_feature_shard_paths(cache_dir, expected["name"])
+    tensors = load_safetensors(str(tensor_path), device="cpu")
+    offsets = tensors["document_offsets"].to(dtype=torch.int64).tolist()
+    expected_counts = [len(documents) for documents in expected["document_keys"]]
+    if offsets != [0, *list(np.cumsum(expected_counts, dtype=np.int64))]:
+        raise RuntimeError(f"Invalid document offsets in pre-answer shard: {expected['name']}")
+    return tensors
+
+
+def ensure_preanswer_hidden_feature_cache(
+    args: argparse.Namespace,
+    samples: list[BenchmarkSample],
+    reranked_docs: list[list[RetrievedDocument]],
+    candidate_dir: Path,
+) -> tuple[Path, list[dict[str, Any]], str]:
+    """Materialize h0/hD once, independently of any trained filter checkpoint."""
+
+    cache_dir, settings, fingerprint = preanswer_hidden_feature_cache_dir(args, candidate_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    specs = _preanswer_feature_batch_specs(args, samples, reranked_docs)
+    expected_rows = [
+        _preanswer_feature_expected_metadata(spec, samples, reranked_docs, fingerprint)
+        for spec in specs
+    ]
+    manifest_path = cache_dir / "manifest.json"
+    valid = [
+        _valid_preanswer_feature_shard(cache_dir, expected) for expected in expected_rows
+    ]
+    if all(valid):
+        write_json(
+            manifest_path,
+            {
+                "type": "rag2_mcq_eval_preanswer_hidden_features",
+                "version": PREANSWER_HIDDEN_FEATURE_CACHE_VERSION,
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "settings_fingerprint": fingerprint,
+                "settings": settings,
+                "questions": len(samples),
+                "documents": sum(len(documents) for documents in reranked_docs),
+                "shards": len(specs),
+            },
+        )
+        logging.info(
+            "Reusing pre-answer hidden feature cache: questions=%s documents=%s shards=%s path=%s",
+            len(samples),
+            sum(len(documents) for documents in reranked_docs),
+            len(specs),
+            cache_dir,
+        )
+        return cache_dir, expected_rows, fingerprint
+
+    storage_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[args.hidden_feature_dtype]
+    progress = StageProgress(
+        total=sum(len(documents) for documents in reranked_docs),
+        desc="CachingPreAnswerHidden",
+        enabled=True,
+    )
+    for is_valid, expected in zip(valid, expected_rows):
+        if is_valid:
+            progress.update(int(expected["documents"]))
+
+    logging.info(
+        "Building model-independent pre-answer hidden cache: missing_shards=%s/%s "
+        "state_model=%s layer=%s storage_dtype=%s path=%s",
+        sum(not value for value in valid),
+        len(valid),
+        args.llm_model_path,
+        args.hidden_feature_layer,
+        args.hidden_feature_dtype,
+        cache_dir,
+    )
+    extractor = PreAnswerLayerExtractor(
+        args.llm_model_path,
+        layer=args.hidden_feature_layer,
+        batch_size=args.hidden_feature_batch_size,
+        max_input_tokens=args.hidden_feature_max_input_tokens,
+        device=args.filter_device,
+        dtype=args.hidden_feature_dtype,
+        attn_implementation=args.hidden_feature_attn_implementation,
+    )
+    try:
+        for spec, expected, is_valid in zip(specs, expected_rows, valid):
+            if is_valid:
+                continue
+            indices = list(spec["indices"])
+            batch_samples = [samples[index] for index in indices]
+            batch_docs = [reranked_docs[index] for index in indices]
+            h0 = extractor.states(batch_samples, [None] * len(batch_samples))
+            flat_samples = [
+                sample
+                for sample, documents in zip(batch_samples, batch_docs)
+                for _ in documents
+            ]
+            flat_evidences = [
+                preanswer_evidence(document, args.filter_max_doc_chars)
+                for documents in batch_docs
+                for document in documents
+            ]
+            hD = extractor.states(flat_samples, flat_evidences)
+            offsets = [0]
+            for documents in batch_docs:
+                offsets.append(offsets[-1] + len(documents))
+            _write_preanswer_feature_shard(
+                cache_dir,
+                expected,
+                {
+                    "h0": h0.to(dtype=storage_dtype),
+                    "hD": hD.to(dtype=storage_dtype),
+                    "document_offsets": torch.tensor(offsets, dtype=torch.int64),
+                },
+            )
+            progress.update(len(flat_samples))
+    finally:
+        extractor.close()
+        progress.close()
+
+    if not all(
+        _valid_preanswer_feature_shard(cache_dir, expected, hidden_size=extractor.hidden_size)
+        for expected in expected_rows
+    ):
+        raise RuntimeError(f"Pre-answer hidden feature cache incomplete: {cache_dir}")
+    write_json(
+        manifest_path,
+        {
+            "type": "rag2_mcq_eval_preanswer_hidden_features",
+            "version": PREANSWER_HIDDEN_FEATURE_CACHE_VERSION,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "settings_fingerprint": fingerprint,
+            "settings": settings,
+            "questions": len(samples),
+            "documents": sum(len(documents) for documents in reranked_docs),
+            "shards": len(specs),
+            "hidden_size": extractor.hidden_size,
+        },
+    )
+    logging.info("Pre-answer hidden feature cache complete: %s", cache_dir)
+    return cache_dir, expected_rows, fingerprint
+
+
 def _apply_cached_filter_rows(
     samples: list[BenchmarkSample],
     reranked_docs: list[list[RetrievedDocument]],
@@ -2993,17 +3325,25 @@ def _resume_preanswer_hidden_filter_scores(
     args: argparse.Namespace,
     samples: list[BenchmarkSample],
     reranked_docs: list[list[RetrievedDocument]],
+    candidate_dir: Path,
     cache_dir: Path,
     settings: dict[str, Any],
     fingerprint: str,
 ) -> list[list[RetrievedDocument]]:
     """Score text+hidden pairs in durable question batches.
 
-    The target Llama and route-specific filter stay resident for all missing
-    batches in one route.  After every question batch, complete decisions are
-    flushed and fsynced.  A later invocation validates document identities and
-    resumes only the missing questions.
+    h0/hD are first materialized in a filter-checkpoint-independent cache.  The
+    route-specific classifier then consumes those tensors.  After every
+    question shard, complete decisions are flushed and fsynced; a later run can
+    therefore reuse both hidden features and all completed classifier rows.
     """
+
+    feature_cache_dir, feature_metadata, _ = ensure_preanswer_hidden_feature_cache(
+        args,
+        samples,
+        reranked_docs,
+        candidate_dir,
+    )
 
     output_path = cache_dir / "filter_scores.jsonl"
     progress_path = cache_dir / "in_progress.json"
@@ -3047,7 +3387,6 @@ def _resume_preanswer_hidden_filter_scores(
         },
     )
 
-    routes = _filter_routes()
     model_paths = {
         "medmcqa": args.medmcqa_filter_model_path,
         "medqa": args.medqa_filter_model_path,
@@ -3069,9 +3408,9 @@ def _resume_preanswer_hidden_filter_scores(
         with output_path.open("a", encoding="utf-8", buffering=16 * 1024 * 1024) as handle:
             for route in ("medqa", "medmcqa"):
                 indices = [
-                    index
-                    for index, sample in enumerate(samples)
-                    if routes[sample.dataset] == route and sample_key(sample) not in valid_rows
+                    index for index, sample in enumerate(samples)
+                    if ("medqa" if sample.dataset == "medqa" else "medmcqa") == route
+                    and sample_key(sample) not in valid_rows
                 ]
                 if not indices:
                     continue
@@ -3102,15 +3441,44 @@ def _resume_preanswer_hidden_filter_scores(
                     bf16=args.filter_bf16,
                     hidden_dtype=args.hidden_feature_dtype,
                     hidden_attn_implementation=args.hidden_feature_attn_implementation,
+                    load_state_extractor=False,
                 )
                 try:
-                    for start in range(0, len(indices), args.hidden_filter_question_batch_size):
-                        batch_indices = indices[start : start + args.hidden_filter_question_batch_size]
-                        filterer.score_documents(
+                    route_shards = [
+                        metadata for metadata in feature_metadata if metadata["route"] == route
+                    ]
+                    for metadata in route_shards:
+                        shard_indices = list(metadata["sample_indices"])
+                        missing_positions = [
+                            position
+                            for position, index in enumerate(shard_indices)
+                            if sample_key(samples[index]) not in valid_rows
+                        ]
+                        if not missing_positions:
+                            continue
+                        tensors = _load_preanswer_feature_shard(
+                            feature_cache_dir,
+                            metadata,
+                            hidden_size=filterer.hidden_size,
+                        )
+                        original_offsets = tensors["document_offsets"].to(torch.int64).tolist()
+                        hD_parts = [
+                            tensors["hD"][original_offsets[position] : original_offsets[position + 1]]
+                            for position in missing_positions
+                        ]
+                        subset_offsets = [0]
+                        for part in hD_parts:
+                            subset_offsets.append(subset_offsets[-1] + int(part.shape[0]))
+                        batch_indices = [shard_indices[position] for position in missing_positions]
+                        filterer.score_documents_from_features(
                             [samples[index] for index in batch_indices],
                             [reranked_docs[index] for index in batch_indices],
+                            tensors["h0"][missing_positions],
+                            torch.cat(hD_parts, dim=0),
+                            torch.tensor(subset_offsets, dtype=torch.int64),
                             progress_callback=progress.update,
                         )
+                        del tensors, hD_parts
                         for index in batch_indices:
                             _rank_scored_documents(reranked_docs[index])
                             row = _filter_score_row(samples[index], reranked_docs[index])
@@ -3185,6 +3553,7 @@ def ensure_filter_scores(
             args,
             samples,
             reranked_docs,
+            candidate_dir,
             cache_dir,
             settings,
             fingerprint,

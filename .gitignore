@@ -103,3 +103,4 @@ venv/
 !/tests/test_rag2_mcq.py
 !/tests/test_rag2_oracle.py
 !/tests/test_rag2_direct_choice_summary.py
+!/tests/test_rag2_preanswer_hidden_cache.py

@@ -31,13 +31,17 @@ def _clean(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
-def _evidence(document: RetrievedDocument, max_doc_chars: int) -> str:
+def preanswer_evidence(document: RetrievedDocument, max_doc_chars: int) -> str:
     value = _clean(document.text or document.title)
     if max_doc_chars > 0 and len(value) > max_doc_chars:
         value = value[: max_doc_chars - 3].rstrip() + "..."
     if not value:
         raise ValueError(f"Empty evidence for document {document.stable_id}")
     return value
+
+
+# Backward-compatible internal alias.
+_evidence = preanswer_evidence
 
 
 def build_preanswer_user_prompt(
@@ -274,6 +278,7 @@ class TextHiddenRag2Filter:
         bf16: bool = True,
         hidden_dtype: str = "bfloat16",
         hidden_attn_implementation: str = "eager",
+        load_state_extractor: bool = True,
     ) -> None:
         self.checkpoint_path = checkpoint_path
         self.device = torch.device(device)
@@ -285,6 +290,7 @@ class TextHiddenRag2Filter:
         if not 0.0 <= self.helpful_threshold <= 1.0:
             raise ValueError("Helpful threshold must be in [0,1]")
         architecture_path = checkpoint_path / "rag2_hidden_filter_architecture.json"
+        architecture: dict[str, Any] = {}
         if architecture_path.exists():
             import json
 
@@ -295,22 +301,36 @@ class TextHiddenRag2Filter:
         if not weight_path.is_file():
             raise FileNotFoundError(weight_path)
 
-        self.state_extractor = PreAnswerLayerExtractor(
-            state_model_path,
-            layer=layer,
-            batch_size=hidden_batch_size,
-            max_input_tokens=max_hidden_input_tokens,
-            device=device,
-            dtype=hidden_dtype,
-            attn_implementation=hidden_attn_implementation,
-        )
+        self.hidden_layer = int(layer)
+        self.hidden_size = int(architecture.get("hidden_size") or 0)
+        self.state_extractor: PreAnswerLayerExtractor | None = None
+        if load_state_extractor:
+            self.state_extractor = PreAnswerLayerExtractor(
+                state_model_path,
+                layer=layer,
+                batch_size=hidden_batch_size,
+                max_input_tokens=max_hidden_input_tokens,
+                device=device,
+                dtype=hidden_dtype,
+                attn_implementation=hidden_attn_implementation,
+            )
+            if self.hidden_size and self.hidden_size != self.state_extractor.hidden_size:
+                raise RuntimeError(
+                    "Hidden-size mismatch between checkpoint and state model: "
+                    f"{self.hidden_size} != {self.state_extractor.hidden_size}"
+                )
+            self.hidden_size = self.state_extractor.hidden_size
+        if self.hidden_size <= 0:
+            raise RuntimeError(
+                "Classifier-only loading requires hidden_size in rag2_hidden_filter_architecture.json"
+            )
         logging.info("Loading text+hidden filter: %s", checkpoint_path)
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(checkpoint_path), use_fast=True, local_files_only=True
         )
         backbone = AutoModelForSeq2SeqLM.from_pretrained(str(backbone_path), local_files_only=True)
         add_label_tokens(self.tokenizer, backbone)
-        self.model = HiddenPrefixSeq2Seq(backbone, hidden_size=self.state_extractor.hidden_size)
+        self.model = HiddenPrefixSeq2Seq(backbone, hidden_size=self.hidden_size)
         state = torch.load(weight_path, map_location="cpu", weights_only=True)
         missing, unexpected = self.model.load_state_dict(state, strict=False)
         if missing or unexpected:
@@ -387,8 +407,66 @@ class TextHiddenRag2Filter:
     ) -> list[list[RetrievedDocument]]:
         if len(samples) != len(candidate_lists):
             raise ValueError("Sample/candidate-list length mismatch")
+        if self.state_extractor is None:
+            raise RuntimeError("score_documents requires load_state_extractor=True")
         # h0 is shared by every document for one question and is computed once.
         h0_all = self.state_extractor.states(samples, [None] * len(samples))
+        flat_samples = [
+            sample
+            for sample, documents in zip(samples, candidate_lists)
+            for _ in documents
+        ]
+        flat_evidences = [
+            _evidence(document, self.max_doc_chars)
+            for documents in candidate_lists
+            for document in documents
+        ]
+        hD_all = self.state_extractor.states(flat_samples, flat_evidences)
+        offsets = [0]
+        for documents in candidate_lists:
+            offsets.append(offsets[-1] + len(documents))
+        return self.score_documents_from_features(
+            samples,
+            candidate_lists,
+            h0_all,
+            hD_all,
+            torch.tensor(offsets, dtype=torch.int64),
+            progress_callback=progress_callback,
+        )
+
+    def score_documents_from_features(
+        self,
+        samples: list[BenchmarkSample],
+        candidate_lists: list[list[RetrievedDocument]],
+        h0_all: torch.Tensor,
+        hD_all: torch.Tensor,
+        document_offsets: torch.Tensor,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> list[list[RetrievedDocument]]:
+        """Score documents from cached, gold-independent pre-answer states."""
+
+        if len(samples) != len(candidate_lists):
+            raise ValueError("Sample/candidate-list length mismatch")
+        expected_documents = sum(len(documents) for documents in candidate_lists)
+        offsets = document_offsets.to(dtype=torch.int64, device="cpu").tolist()
+        if len(offsets) != len(samples) + 1 or offsets[0] != 0:
+            raise ValueError("Invalid cached document offsets")
+        if offsets[-1] != expected_documents or any(
+            offsets[index + 1] - offsets[index] != len(candidate_lists[index])
+            for index in range(len(samples))
+        ):
+            raise ValueError("Cached document offsets do not match candidate lists")
+        if tuple(h0_all.shape) != (len(samples), self.hidden_size):
+            raise ValueError(
+                f"Invalid cached h0 shape: {tuple(h0_all.shape)}; "
+                f"expected {(len(samples), self.hidden_size)}"
+            )
+        if tuple(hD_all.shape) != (expected_documents, self.hidden_size):
+            raise ValueError(
+                f"Invalid cached hD shape: {tuple(hD_all.shape)}; "
+                f"expected {(expected_documents, self.hidden_size)}"
+            )
+
         flat_samples: list[BenchmarkSample] = []
         flat_documents: list[RetrievedDocument] = []
         flat_question_rows: list[int] = []
@@ -407,8 +485,8 @@ class TextHiddenRag2Filter:
             batch_evidences = flat_evidences[start : start + active]
             question_rows = flat_question_rows[start : start + active]
             try:
-                hD = self.state_extractor.states(batch_samples, batch_evidences)
-                h0 = h0_all[question_rows]
+                hD = hD_all[start : start + active].float()
+                h0 = h0_all[question_rows].float()
                 scores = self._score_batch(batch_samples, batch_evidences, h0, hD)
             except torch.OutOfMemoryError:
                 if active <= 1:
@@ -423,7 +501,7 @@ class TextHiddenRag2Filter:
                 document.filter_prob_helpful = float(score["prob_helpful"])
                 document.metadata["preanswer_text_hidden_filter"] = {
                     "prompt_version": PREANSWER_PROMPT_VERSION,
-                    "hidden_layer": self.state_extractor.layer,
+                    "hidden_layer": self.hidden_layer,
                     "hidden_inputs": ["h0", "delta_h=hD-h0"],
                     "forbidden_inputs": ["gold_answer", "c", "projection_score", "answer_transition"],
                     "helpful_threshold": self.helpful_threshold,
@@ -434,7 +512,8 @@ class TextHiddenRag2Filter:
         return candidate_lists
 
     def close(self) -> None:
-        self.state_extractor.close()
+        if self.state_extractor is not None:
+            self.state_extractor.close()
         self.model.to("cpu")
         del self.model
         gc.collect()
