@@ -37,9 +37,15 @@ TOP_K_VALUES = (1, 2, 4, 8, 16, 32)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rationale-no-rag-root", type=Path, required=True)
+    parser.add_argument("--rationale-rag2-results-root", type=Path, required=True)
     parser.add_argument("--rationale-results-root", type=Path, required=True)
     parser.add_argument("--direct-no-rag-root", type=Path, required=True)
+    parser.add_argument("--direct-rag2-results-root", type=Path, required=True)
     parser.add_argument("--direct-results-root", type=Path, required=True)
+    parser.add_argument("--rationale-medmcqa-rag2-filter-model-path", type=Path, required=True)
+    parser.add_argument("--rationale-medqa-rag2-filter-model-path", type=Path, required=True)
+    parser.add_argument("--direct-medmcqa-rag2-filter-model-path", type=Path, required=True)
+    parser.add_argument("--direct-medqa-rag2-filter-model-path", type=Path, required=True)
     parser.add_argument("--medmcqa-filter-model-path", type=Path, required=True)
     parser.add_argument("--medqa-filter-model-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -85,8 +91,19 @@ def load_condition(
         raise RuntimeError(f"Duplicate sample ids in {run_dir}")
 
     protocols = {str(row.get("answer_decision_mode") or "") for row in rows}
-    if protocols != {expected_mode}:
-        raise RuntimeError(f"Expected {expected_mode} rows in {run_dir}, got {protocols}")
+    nonempty_protocols = protocols - {""}
+    run_config_path = run_dir / "run_config.json"
+    run_config = (
+        json.loads(run_config_path.read_text(encoding="utf-8"))
+        if run_config_path.is_file()
+        else {}
+    )
+    configured_mode = str(run_config.get("answer_decision_mode") or "")
+    if nonempty_protocols not in (set(), {expected_mode}) or configured_mode != expected_mode:
+        raise RuntimeError(
+            f"Expected {expected_mode} rows in {run_dir}, "
+            f"got row_protocols={protocols}, configured_mode={configured_mode!r}"
+        )
     parse_failures = sum(bool(row.get("parse_errors")) for row in rows)
     unevaluable = sum(not bool((row.get("evaluation") or {}).get("evaluable")) for row in rows)
     invalid_predictions = sum(
@@ -140,6 +157,7 @@ def validate_filter_run(
     run_dir: Path,
     medmcqa_filter_model_path: Path,
     medqa_filter_model_path: Path,
+    expected_evidence_unit: str,
 ) -> None:
     config_path = run_dir / "run_config.json"
     if not config_path.is_file():
@@ -148,19 +166,22 @@ def validate_filter_run(
     expected = {
         "medmcqa_filter_model_path": str(medmcqa_filter_model_path.resolve()),
         "medqa_filter_model_path": str(medqa_filter_model_path.resolve()),
-        "filter_evidence_unit": "preanswer_text_hidden",
+        "filter_evidence_unit": expected_evidence_unit,
     }
     actual = {key: config.get(key) for key in expected}
     if actual != expected:
-        raise RuntimeError(f"Hidden-filter contract mismatch in {run_dir}: {actual} != {expected}")
+        raise RuntimeError(f"Filter contract mismatch in {run_dir}: {actual} != {expected}")
 
 
 def collect_mode(
     label: str,
     expected_mode: str,
     no_rag_root: Path,
+    rag2_results_root: Path,
     results_root: Path,
     expected_questions: int,
+    medmcqa_rag2_filter_model_path: Path,
+    medqa_rag2_filter_model_path: Path,
     medmcqa_filter_model_path: Path,
     medqa_filter_model_path: Path,
 ) -> dict[str, Any]:
@@ -175,10 +196,29 @@ def collect_mode(
         }
     )
     for top_k in TOP_K_VALUES:
+        rag2_values, rag2_run_dir = load_condition(
+            rag2_results_root / f"filter_rag_top{top_k}", expected_questions, expected_mode
+        )
+        validate_filter_run(
+            rag2_run_dir,
+            medmcqa_rag2_filter_model_path,
+            medqa_rag2_filter_model_path,
+            "document",
+        )
+        output_rows.append(
+            {
+                "filtering": "RAG2",
+                "top_k": top_k,
+                "run_dir": str(rag2_run_dir.resolve()),
+                "metrics": summarize_rows(rag2_values),
+            }
+        )
         values, run_dir = load_condition(
             results_root / f"filter_rag_top{top_k}", expected_questions, expected_mode
         )
-        validate_filter_run(run_dir, medmcqa_filter_model_path, medqa_filter_model_path)
+        validate_filter_run(
+            run_dir, medmcqa_filter_model_path, medqa_filter_model_path, "preanswer_text_hidden"
+        )
         output_rows.append(
             {
                 "filtering": "Hidden State (tau=0.4)",
@@ -191,6 +231,7 @@ def collect_mode(
         "label": label,
         "answer_decision_mode": expected_mode,
         "no_rag_root": str(no_rag_root.resolve()),
+        "rag2_results_root": str(rag2_results_root.resolve()),
         "results_root": str(results_root.resolve()),
         "rows": output_rows,
     }
@@ -218,11 +259,12 @@ def render_mode_table(mode: dict[str, Any]) -> str:
 
 def render_summary(summary: dict[str, Any]) -> str:
     header = [
-        "Hidden-State tau=0.4 all-MCQ Top-k sweep",
+        "RAG2 vs Hidden-State tau=0.4 all-MCQ Top-k sweep",
         "",
         "Cohort: 6,545 questions (MedMCQA 4,183; MedQA 1,273; MMLU 1,089)",
         "Retrieval: stored no-RAG rationale query; source-balanced 8 x 4 = 32; MedCPT rerank Top-32",
-        "Filtering: same tau=0.4 text+hidden decisions for both answer modes; k is the pre-filter rerank prefix",
+        "Comparison: No-RAG vs RAG2 vs Hidden State tau=0.4 under the same final-answer protocol",
+        "Filtering: k is the pre-filter rerank prefix; # doc is the mean number retained after filtering",
         "",
     ]
     return "\n".join(header + [render_mode_table(mode) for mode in summary["modes"]])
@@ -235,8 +277,11 @@ def main() -> None:
             "Rationale + fixed terminal answer",
             "free_generation",
             args.rationale_no_rag_root,
+            args.rationale_rag2_results_root,
             args.rationale_results_root,
             args.expected_questions,
+            args.rationale_medmcqa_rag2_filter_model_path,
+            args.rationale_medqa_rag2_filter_model_path,
             args.medmcqa_filter_model_path,
             args.medqa_filter_model_path,
         ),
@@ -244,8 +289,11 @@ def main() -> None:
             "Direct choice",
             "constrained_choice",
             args.direct_no_rag_root,
+            args.direct_rag2_results_root,
             args.direct_results_root,
             args.expected_questions,
+            args.direct_medmcqa_rag2_filter_model_path,
+            args.direct_medqa_rag2_filter_model_path,
             args.medmcqa_filter_model_path,
             args.medqa_filter_model_path,
         ),
@@ -257,8 +305,24 @@ def main() -> None:
         "expected_questions": args.expected_questions,
         "expected_dataset_counts": EXPECTED_DATASET_COUNTS,
         "filter_models": {
-            "medmcqa_and_mmlu": str(args.medmcqa_filter_model_path.resolve()),
-            "medqa": str(args.medqa_filter_model_path.resolve()),
+            "rag2": {
+                "rationale_answer": {
+                    "medmcqa_and_mmlu": str(
+                        args.rationale_medmcqa_rag2_filter_model_path.resolve()
+                    ),
+                    "medqa": str(args.rationale_medqa_rag2_filter_model_path.resolve()),
+                },
+                "direct_choice": {
+                    "medmcqa_and_mmlu": str(
+                        args.direct_medmcqa_rag2_filter_model_path.resolve()
+                    ),
+                    "medqa": str(args.direct_medqa_rag2_filter_model_path.resolve()),
+                },
+            },
+            "hidden_tau0p4": {
+                "medmcqa_and_mmlu": str(args.medmcqa_filter_model_path.resolve()),
+                "medqa": str(args.medqa_filter_model_path.resolve()),
+            },
         },
         "modes": modes,
     }

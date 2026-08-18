@@ -21,6 +21,10 @@ SUMMARIZER="$PROJECT/scripts/summarize_rag2_hidden_tau0p4_answer_modes.py"
 
 LLAMA_MODEL="/home/user/Uiheon/models/Llama-3-8B-Instruct"
 FLAN_BACKBONE="/home/user/Uiheon/models/Flan-T5-large"
+MEDMCQA_RAG2_FILTER="${MEDMCQA_RAG2_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medmcqa/medmcqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101200/final_model}"
+MEDQA_RAG2_FILTER="${MEDQA_RAG2_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medqa/medqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101728/final_model}"
+RATIONALE_MEDMCQA_RAG2_FILTER="${RATIONALE_MEDMCQA_RAG2_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medmcqa/medmcqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101200/checkpoint-38775}"
+RATIONALE_MEDQA_RAG2_FILTER="${RATIONALE_MEDQA_RAG2_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperExactFreeResponse-CorrectedNoDocLabels/medqa/medqa_top10_paper_exact_corrected_nodoc_epoch5_len768/20260803_101728/checkpoint-8356}"
 MEDMCQA_HIDDEN_FILTER="${MEDMCQA_HIDDEN_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-HiddenUtilityTau0p4/medmcqa/medmcqa_tau0p4_text_hidden_epoch5/20260817_144906/final_model}"
 MEDQA_HIDDEN_FILTER="${MEDQA_HIDDEN_FILTER:-/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-HiddenUtilityTau0p4/medqa/medqa_tau0p4_text_hidden_epoch5/20260818_112610/final_model}"
 
@@ -30,17 +34,24 @@ CACHE_ROOT="${CACHE_ROOT:-$EXPERIMENT_ROOT/all_mcq_source_balanced32_rationale_f
 BASE_RESULTS_ROOT="${BASE_RESULTS_ROOT:-$PROJECT/results/rag2_llama3_hidden_tau0p4_v1/all_mcq_source_balanced32_rerank32}"
 RATIONALE_RESULTS_ROOT="${RATIONALE_RESULTS_ROOT:-$BASE_RESULTS_ROOT/rationale_answer/hidden_state_filter}"
 DIRECT_RESULTS_ROOT="${DIRECT_RESULTS_ROOT:-$BASE_RESULTS_ROOT/direct_choice/hidden_state_filter}"
+DIRECT_REFERENCE_ROOT="${DIRECT_REFERENCE_ROOT:-$PROJECT/results/rag2_llama3_direct_choice_v1/all_mcq_source_balanced32_rerank32}"
 
 # These are the already completed, protocol-matched no-RAG baselines.  They are
 # read only by the final summarizer, so no baseline generation is duplicated.
 RATIONALE_NO_RAG_ROOT="${RATIONALE_NO_RAG_ROOT:-$PROJECT/results/rag2_llama3_paper_exact_terminal_v1/all_mcq_source_balanced32_rerank32/rag2_filter/no_rag}"
-DIRECT_NO_RAG_ROOT="${DIRECT_NO_RAG_ROOT:-$PROJECT/results/rag2_llama3_direct_choice_v1/all_mcq_source_balanced32_rerank32/no_rag_reference/no_rag}"
+RATIONALE_RAG2_RESULTS_ROOT="${RATIONALE_RAG2_RESULTS_ROOT:-$PROJECT/results/rag2_llama3_paper_exact_terminal_v1/all_mcq_source_balanced32_rerank32/rag2_filter}"
+DIRECT_NO_RAG_ROOT="${DIRECT_NO_RAG_ROOT:-$DIRECT_REFERENCE_ROOT/no_rag_reference/no_rag}"
+DIRECT_RAG2_RESULTS_ROOT="${DIRECT_RAG2_RESULTS_ROOT:-$DIRECT_REFERENCE_ROOT/rag2_filter}"
 
 test -x "$PYTHON"
 test -f "$EVALUATOR"
 test -f "$SUMMARIZER"
 test -f "$LLAMA_MODEL/config.json"
 test -f "$FLAN_BACKBONE/model.safetensors"
+test -f "$MEDMCQA_RAG2_FILTER/model.safetensors"
+test -f "$MEDQA_RAG2_FILTER/model.safetensors"
+test -f "$RATIONALE_MEDMCQA_RAG2_FILTER/model.safetensors"
+test -f "$RATIONALE_MEDQA_RAG2_FILTER/model.safetensors"
 test -f "$MEDMCQA_HIDDEN_FILTER/pytorch_model.bin"
 test -f "$MEDMCQA_HIDDEN_FILTER/rag2_hidden_filter_architecture.json"
 test -f "$MEDQA_HIDDEN_FILTER/pytorch_model.bin"
@@ -74,23 +85,6 @@ COMMON_ARGS=(
   --faiss-gpu-device 0
   --faiss-gpu-use-float16
   --faiss-gpu-temp-memory-mb 2048
-  --medmcqa-filter-model-path "$MEDMCQA_HIDDEN_FILTER"
-  --medqa-filter-model-path "$MEDQA_HIDDEN_FILTER"
-  --hidden-filter-backbone-path "$FLAN_BACKBONE"
-  --filter-evidence-unit preanswer_text_hidden
-  --filter-generation-context-unit document
-  --filter-batch-size 64
-  --filter-max-input-length 768
-  --filter-max-doc-chars 0
-  --filter-device cuda:0
-  --filter-bf16
-  --hidden-feature-layer 28
-  --hidden-feature-batch-size 64
-  --hidden-filter-question-batch-size 32
-  --hidden-feature-max-input-tokens 2048
-  --hidden-feature-dtype bfloat16
-  --hidden-feature-attn-implementation eager
-  --hidden-filter-helpful-threshold 0.5
   --max-doc-chars 0
   --document-packing dynamic_token_budget
   --document-token-safety-margin 128
@@ -112,6 +106,42 @@ COMMON_ARGS=(
   --vllm-performance-mode throughput
   --vllm-max-num-batched-tokens 65536
   --cache-root "$CACHE_ROOT"
+)
+
+RAG2_FILTER_ARGS=(
+  --medmcqa-filter-model-path "$MEDMCQA_RAG2_FILTER"
+  --medqa-filter-model-path "$MEDQA_RAG2_FILTER"
+  --filter-evidence-unit document
+  --filter-generation-context-unit document
+  --filter-batch-size 128
+  --filter-max-input-length 768
+  --filter-max-new-tokens 1
+  --filter-max-doc-chars 0
+  --filter-device cuda:0
+  --filter-bf16
+  --filter-scoring-method special_token
+  --filter-input-format official
+  --filter-score-normalization mean
+)
+
+HIDDEN_FILTER_ARGS=(
+  --medmcqa-filter-model-path "$MEDMCQA_HIDDEN_FILTER"
+  --medqa-filter-model-path "$MEDQA_HIDDEN_FILTER"
+  --hidden-filter-backbone-path "$FLAN_BACKBONE"
+  --filter-evidence-unit preanswer_text_hidden
+  --filter-generation-context-unit document
+  --filter-batch-size 64
+  --filter-max-input-length 768
+  --filter-max-doc-chars 0
+  --filter-device cuda:0
+  --filter-bf16
+  --hidden-feature-layer 28
+  --hidden-feature-batch-size 64
+  --hidden-filter-question-batch-size 32
+  --hidden-feature-max-input-tokens 2048
+  --hidden-feature-dtype bfloat16
+  --hidden-feature-attn-implementation eager
+  --hidden-filter-helpful-threshold 0.5
 )
 
 RATIONALE_ARGS=(
@@ -136,23 +166,31 @@ fi
 is_complete() {
   local case_root="$1"
   local expected_mode="$2"
+  local expected_medmcqa_filter="${3:-}"
+  local expected_medqa_filter="${4:-}"
   local run_dir=""
   [[ -d "$case_root" ]] || return 1
   while IFS= read -r run_dir; do
     if [[ -s "$run_dir/results.jsonl" ]] \
       && [[ "$(wc -l < "$run_dir/results.jsonl")" -eq 6545 ]] \
       && grep -q "\"answer_decision_mode\": \"$expected_mode\"" "$run_dir/run_config.json" \
-      && grep -Fq "\"medmcqa_filter_model_path\": \"$MEDMCQA_HIDDEN_FILTER\"" "$run_dir/run_config.json" \
-      && grep -Fq "\"medqa_filter_model_path\": \"$MEDQA_HIDDEN_FILTER\"" "$run_dir/run_config.json" \
       && grep -Eq '^\| overall[[:space:]]+\|[[:space:]]+6545[[:space:]]+\|[[:space:]]+6545[[:space:]]+\|' \
            "$run_dir/summary_table_pretty.txt"; then
+      if [[ -n "$expected_medmcqa_filter" ]] \
+        && ! grep -Fq "\"medmcqa_filter_model_path\": \"$expected_medmcqa_filter\"" "$run_dir/run_config.json"; then
+        continue
+      fi
+      if [[ -n "$expected_medqa_filter" ]] \
+        && ! grep -Fq "\"medqa_filter_model_path\": \"$expected_medqa_filter\"" "$run_dir/run_config.json"; then
+        continue
+      fi
       return 0
     fi
   done < <(find "$case_root" -mindepth 1 -maxdepth 1 -type d | sort -r)
   return 1
 }
 
-run_mode() {
+run_hidden_mode() {
   local mode_name="$1"
   local results_root="$2"
   local expected_mode="$3"
@@ -162,14 +200,68 @@ run_mode() {
 
   for top_k in 1 2 4 8 16 32; do
     if [[ "${DRY_RUN:-0}" != "1" ]] \
-      && is_complete "$results_root/filter_rag_top${top_k}" "$expected_mode"; then
+      && is_complete "$results_root/filter_rag_top${top_k}" "$expected_mode" \
+        "$MEDMCQA_HIDDEN_FILTER" "$MEDQA_HIDDEN_FILTER"; then
       echo "[$mode_name] Top-k $top_k already complete; skipping."
       continue
     fi
-    "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" "${mode_args[@]}" \
+    "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" "${HIDDEN_FILTER_ARGS[@]}" "${mode_args[@]}" \
       --case filter_rag \
       --filter-rerank-top-k "$top_k" \
       --results-root "$results_root" \
+      "${RUN_ARGS[@]}"
+  done
+}
+
+all_hidden_results_complete() {
+  local results_root="$1"
+  local expected_mode="$2"
+  local top_k=""
+  for top_k in 1 2 4 8 16 32; do
+    is_complete "$results_root/filter_rag_top${top_k}" "$expected_mode" \
+      "$MEDMCQA_HIDDEN_FILTER" "$MEDQA_HIDDEN_FILTER" || return 1
+  done
+}
+
+ensure_direct_rag2_comparison() {
+  local top_k=""
+  local missing=0
+
+  if [[ "${DRY_RUN:-0}" == "1" ]] \
+    || ! is_complete "$DIRECT_NO_RAG_ROOT" constrained_choice; then
+    "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" "${DIRECT_ARGS[@]}" \
+      --case no_rag \
+      --results-root "$DIRECT_REFERENCE_ROOT/no_rag_reference" \
+      "${RUN_ARGS[@]}"
+  else
+    echo "[direct_choice] No-RAG already complete; reusing."
+  fi
+
+  for top_k in 1 2 4 8 16 32; do
+    if ! is_complete "$DIRECT_RAG2_RESULTS_ROOT/filter_rag_top${top_k}" constrained_choice \
+      "$MEDMCQA_RAG2_FILTER" "$MEDQA_RAG2_FILTER"; then
+      missing=1
+      break
+    fi
+  done
+  if [[ "$missing" -eq 1 || "${DRY_RUN:-0}" == "1" ]]; then
+    "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" "${RAG2_FILTER_ARGS[@]}" "${DIRECT_ARGS[@]}" \
+      --case filter_rag \
+      --filter-cache-only \
+      --results-root "$DIRECT_RAG2_RESULTS_ROOT" \
+      "${RUN_ARGS[@]}"
+  fi
+  for top_k in 1 2 4 8 16 32; do
+    if [[ "${DRY_RUN:-0}" != "1" ]] \
+      && is_complete "$DIRECT_RAG2_RESULTS_ROOT/filter_rag_top${top_k}" constrained_choice \
+        "$MEDMCQA_RAG2_FILTER" "$MEDQA_RAG2_FILTER"; then
+      echo "[direct_choice/RAG2] Top-k $top_k already complete; reusing."
+      continue
+    fi
+    "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" "${RAG2_FILTER_ARGS[@]}" "${DIRECT_ARGS[@]}" \
+      --case filter_rag \
+      --filter-rerank-top-k "$top_k" \
+      --results-root "$DIRECT_RAG2_RESULTS_ROOT" \
       "${RUN_ARGS[@]}"
   done
 }
@@ -187,26 +279,42 @@ esac
 # fingerprint deliberately excludes the final-answer mode, so both generation
 # protocols below consume these exact same decisions.
 if [[ "${SUMMARY_ONLY:-0}" != "1" ]]; then
-  "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" "${RATIONALE_ARGS[@]}" \
-    --case filter_rag \
-    --filter-cache-only \
-    --results-root "$RATIONALE_RESULTS_ROOT" \
-    "${RUN_ARGS[@]}"
+  if [[ "$ANSWER_MODE" == "both" || "$ANSWER_MODE" == "direct_choice" ]]; then
+    ensure_direct_rag2_comparison
+  fi
+
+  if [[ "${DRY_RUN:-0}" == "1" ]] \
+    || { [[ "$ANSWER_MODE" == "both" || "$ANSWER_MODE" == "rationale" ]] \
+         && ! all_hidden_results_complete "$RATIONALE_RESULTS_ROOT" free_generation; } \
+    || { [[ "$ANSWER_MODE" == "both" || "$ANSWER_MODE" == "direct_choice" ]] \
+         && ! all_hidden_results_complete "$DIRECT_RESULTS_ROOT" constrained_choice; }; then
+    "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" "${HIDDEN_FILTER_ARGS[@]}" "${RATIONALE_ARGS[@]}" \
+      --case filter_rag \
+      --filter-cache-only \
+      --results-root "$RATIONALE_RESULTS_ROOT" \
+      "${RUN_ARGS[@]}"
+  fi
 
   if [[ "$ANSWER_MODE" == "both" || "$ANSWER_MODE" == "rationale" ]]; then
-    run_mode rationale "$RATIONALE_RESULTS_ROOT" free_generation "${RATIONALE_ARGS[@]}"
+    run_hidden_mode rationale "$RATIONALE_RESULTS_ROOT" free_generation "${RATIONALE_ARGS[@]}"
   fi
   if [[ "$ANSWER_MODE" == "both" || "$ANSWER_MODE" == "direct_choice" ]]; then
-    run_mode direct_choice "$DIRECT_RESULTS_ROOT" constrained_choice "${DIRECT_ARGS[@]}"
+    run_hidden_mode direct_choice "$DIRECT_RESULTS_ROOT" constrained_choice "${DIRECT_ARGS[@]}"
   fi
 fi
 
 if [[ "${DRY_RUN:-0}" != "1" && "$ANSWER_MODE" == "both" ]]; then
   "$PYTHON" "$SUMMARIZER" \
     --rationale-no-rag-root "$RATIONALE_NO_RAG_ROOT" \
+    --rationale-rag2-results-root "$RATIONALE_RAG2_RESULTS_ROOT" \
     --rationale-results-root "$RATIONALE_RESULTS_ROOT" \
     --direct-no-rag-root "$DIRECT_NO_RAG_ROOT" \
+    --direct-rag2-results-root "$DIRECT_RAG2_RESULTS_ROOT" \
     --direct-results-root "$DIRECT_RESULTS_ROOT" \
+    --rationale-medmcqa-rag2-filter-model-path "$RATIONALE_MEDMCQA_RAG2_FILTER" \
+    --rationale-medqa-rag2-filter-model-path "$RATIONALE_MEDQA_RAG2_FILTER" \
+    --direct-medmcqa-rag2-filter-model-path "$MEDMCQA_RAG2_FILTER" \
+    --direct-medqa-rag2-filter-model-path "$MEDQA_RAG2_FILTER" \
     --medmcqa-filter-model-path "$MEDMCQA_HIDDEN_FILTER" \
     --medqa-filter-model-path "$MEDQA_HIDDEN_FILTER" \
     --output-dir "$BASE_RESULTS_ROOT" \

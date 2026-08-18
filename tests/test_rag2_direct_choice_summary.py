@@ -94,6 +94,7 @@ class DirectChoiceSummaryTests(unittest.TestCase):
 
         mode_rows = [
             {"filtering": "No-RAG", "top_k": None, "metrics": metrics},
+            {"filtering": "RAG2", "top_k": 2, "metrics": metrics},
             {"filtering": "Hidden State (tau=0.4)", "top_k": 2, "metrics": metrics},
         ]
         rendered = render_tau0p4_summary(
@@ -106,6 +107,7 @@ class DirectChoiceSummaryTests(unittest.TestCase):
         )
         self.assertIn("## Rationale + fixed terminal answer", rendered)
         self.assertIn("## Direct choice", rendered)
+        self.assertIn("| 2 | RAG2 |", rendered)
         self.assertIn("| 2 | Hidden State (tau=0.4) |", rendered)
         self.assertIn("| Rerank Top-k | Filtering | # doc after filtering |", rendered)
 
