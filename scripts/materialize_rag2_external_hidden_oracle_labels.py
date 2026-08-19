@@ -4,14 +4,16 @@ from __future__ import annotations
 """Compute gold-direction scores for frozen external-test h0/hD feature shards."""
 
 import argparse
+import gc
 import json
 import logging
 import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 from safetensors.torch import load_file
 
@@ -59,6 +61,69 @@ def threshold_name(value: float) -> str:
     return format(value, ".8g").replace("-", "m").replace(".", "p")
 
 
+def adaptive_question_feature_batches(
+    extractor: FeatureExtractor,
+    batch: Sequence[dict[str, Any]],
+    *,
+    absolute_start: int,
+) -> Iterator[tuple[int, Sequence[dict[str, Any]], list[str], Any]]:
+    """Retry only an OOM batch at half size, then return to the caller's normal size.
+
+    Eager attention has quadratic peak memory, so one unusually long MCQ can
+    make a batch of 32 much larger than adjacent batches.  Successful shards
+    keep the requested throughput; only the offending batch is subdivided.
+    """
+
+    sequences, _ = extractor.encode_questions(batch, [None] * len(batch))
+    gold = [
+        str(row.get("answer") or (row.get("answers") or [""])[0]).upper()
+        for row in batch
+    ]
+    if any(value not in {"A", "B", "C", "D"} for value in gold):
+        raise ValueError(f"Invalid gold answer at question offset {absolute_start}: {gold}")
+    oom = False
+    try:
+        features = extractor.no_document_features(
+            sequences,
+            [choice_index(value) for value in gold],
+        )
+    except torch.OutOfMemoryError:
+        oom = True
+    if oom:
+        # Perform cleanup after leaving the except block so the traceback no
+        # longer retains tensors from the failed attention forward pass.
+        maximum_tokens = max(len(value) for value in sequences)
+        del sequences
+        gc.collect()
+        torch.cuda.empty_cache()
+        if len(batch) <= 1:
+            raise RuntimeError(
+                "CUDA OOM even for one no-document question: "
+                f"offset={absolute_start} max_tokens={maximum_tokens}"
+            )
+        midpoint = len(batch) // 2
+        logging.warning(
+            "Question-feature OOM at offset=%s batch=%s max_tokens=%s; retrying this batch as %s + %s",
+            absolute_start,
+            len(batch),
+            maximum_tokens,
+            midpoint,
+            len(batch) - midpoint,
+        )
+        yield from adaptive_question_feature_batches(
+            extractor,
+            batch[:midpoint],
+            absolute_start=absolute_start,
+        )
+        yield from adaptive_question_feature_batches(
+            extractor,
+            batch[midpoint:],
+            absolute_start=absolute_start + midpoint,
+        )
+        return
+    yield absolute_start, batch, gold, features
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s | %(levelname)s | %(message)s")
@@ -81,10 +146,18 @@ def main() -> None:
     try:
         for shard_number, metadata_path in enumerate(metadata_paths, 1):
             output_path = shard_output / f"{metadata_path.stem}.jsonl"
-            if args.resume and output_path.is_file():
-                processed += sum(1 for _ in rows(output_path))
-                continue
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if args.resume and output_path.is_file():
+                completed_rows = sum(1 for _ in rows(output_path))
+                if completed_rows == int(metadata["documents"]):
+                    processed += completed_rows
+                    continue
+                logging.warning(
+                    "Ignoring incomplete completed-shard file %s: rows=%s expected=%s",
+                    output_path,
+                    completed_rows,
+                    metadata["documents"],
+                )
             indices = [int(value) for value in metadata["sample_indices"]]
             shard_rows = [candidates[index] for index in indices]
             actual_keys = [str(row["key"]) for row in shard_rows]
@@ -99,50 +172,52 @@ def main() -> None:
             offsets = tensors["document_offsets"].to(torch.int64).tolist()
             output_rows: list[dict[str, Any]] = []
             for start in range(0, len(shard_rows), args.question_batch_size):
-                batch = shard_rows[start : start + args.question_batch_size]
-                sequences, _ = extractor.encode_questions(batch, [None] * len(batch))
-                gold = [str(row.get("answer") or (row.get("answers") or [""])[0]).upper() for row in batch]
-                if any(value not in {"A", "B", "C", "D"} for value in gold):
-                    raise ValueError(f"Invalid gold answer in shard {metadata_path}: {gold}")
-                question_features = extractor.no_document_features(sequences, [choice_index(value) for value in gold])
-                recomputed_h0 = question_features.h0[:, 0, :]
-                comparison = cached_h0[start : start + len(batch)]
-                difference = float(torch.max(torch.abs(recomputed_h0 - comparison)).item())
-                max_h0_difference = max(max_h0_difference, difference)
-                if difference > args.h0_max_abs_tolerance:
-                    raise RuntimeError(
-                        f"Cached h0 prompt/model mismatch in {metadata_path.name}: max_abs={difference:.6f} "
-                        f"> tolerance={args.h0_max_abs_tolerance}"
-                    )
-                c_unit = question_features.c_unit[:, 0, :]
-                for local, row in enumerate(batch):
-                    position = start + local
-                    documents = list(row.get("candidate_documents") or [])
-                    begin, end = offsets[position], offsets[position + 1]
-                    if end - begin != len(documents):
-                        raise RuntimeError(f"Document offset mismatch for {row['key']}")
-                    document_keys = metadata["document_keys"][position]
-                    for doc_index, (doc, hD) in enumerate(zip(documents, cached_hD[begin:end])):
-                        expected_key = [str(doc.get("db_id") or ""), int(doc.get("local_id", -1))]
-                        if list(document_keys[doc_index]) != expected_key:
-                            raise RuntimeError(f"Document identity mismatch for {row['key']} rank={doc_index + 1}")
-                        score = float(torch.dot(hD - comparison[local], c_unit[local]).item())
-                        labels = {
-                            threshold_name(value): ("Helpful" if score > value else "Not Helpful")
-                            for value in args.thresholds
-                        }
-                        output_rows.append({
-                            "schema_version": 1,
-                            "policy": "preanswer_gold_direction_external_test",
-                            "dataset": row["dataset"], "sample_key": row["key"],
-                            "sample_id": row["sample_id"], "row_idx": row["row_idx"],
-                            "pair_id": f"{row['sample_id']}::{doc_index + 1}::{stable_id(doc)}",
-                            "doc_rank": doc_index + 1, "doc_stable_id": stable_id(doc),
-                            "db_id": doc.get("db_id"), "local_id": doc.get("local_id"),
-                            "source": doc.get("source"), "projection_score": score,
-                            "labels": labels, "gold_answer": gold[local],
-                            "layer": args.layer,
-                        })
+                requested_batch = shard_rows[start : start + args.question_batch_size]
+                feature_batches = adaptive_question_feature_batches(
+                    extractor,
+                    requested_batch,
+                    absolute_start=start,
+                )
+                for batch_start, batch, gold, question_features in feature_batches:
+                    recomputed_h0 = question_features.h0[:, 0, :]
+                    comparison = cached_h0[batch_start : batch_start + len(batch)]
+                    difference = float(torch.max(torch.abs(recomputed_h0 - comparison)).item())
+                    max_h0_difference = max(max_h0_difference, difference)
+                    if difference > args.h0_max_abs_tolerance:
+                        raise RuntimeError(
+                            f"Cached h0 prompt/model mismatch in {metadata_path.name}: max_abs={difference:.6f} "
+                            f"> tolerance={args.h0_max_abs_tolerance}"
+                        )
+                    c_unit = question_features.c_unit[:, 0, :]
+                    for local, row in enumerate(batch):
+                        position = batch_start + local
+                        documents = list(row.get("candidate_documents") or [])
+                        begin, end = offsets[position], offsets[position + 1]
+                        if end - begin != len(documents):
+                            raise RuntimeError(f"Document offset mismatch for {row['key']}")
+                        document_keys = metadata["document_keys"][position]
+                        for doc_index, (doc, hD) in enumerate(zip(documents, cached_hD[begin:end])):
+                            expected_key = [str(doc.get("db_id") or ""), int(doc.get("local_id", -1))]
+                            if list(document_keys[doc_index]) != expected_key:
+                                raise RuntimeError(f"Document identity mismatch for {row['key']} rank={doc_index + 1}")
+                            score = float(torch.dot(hD - comparison[local], c_unit[local]).item())
+                            labels = {
+                                threshold_name(value): ("Helpful" if score > value else "Not Helpful")
+                                for value in args.thresholds
+                            }
+                            output_rows.append({
+                                "schema_version": 1,
+                                "policy": "preanswer_gold_direction_external_test",
+                                "dataset": row["dataset"], "sample_key": row["key"],
+                                "sample_id": row["sample_id"], "row_idx": row["row_idx"],
+                                "pair_id": f"{row['sample_id']}::{doc_index + 1}::{stable_id(doc)}",
+                                "doc_rank": doc_index + 1, "doc_stable_id": stable_id(doc),
+                                "db_id": doc.get("db_id"), "local_id": doc.get("local_id"),
+                                "source": doc.get("source"), "projection_score": score,
+                                "labels": labels, "gold_answer": gold[local],
+                                "layer": args.layer,
+                            })
+                    del question_features, recomputed_h0, comparison, c_unit
             temporary = output_path.with_suffix(".jsonl.partial")
             write_jsonl(temporary, output_rows)
             os.replace(temporary, output_path)

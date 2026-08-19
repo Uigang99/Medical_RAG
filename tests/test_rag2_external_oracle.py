@@ -4,11 +4,15 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from medrag.core import BenchmarkSample, RetrievedDocument
 from scripts.run_rag2_mcq_eval import apply_oracle_labels
+from scripts.materialize_rag2_external_hidden_oracle_labels import adaptive_question_feature_batches
 
 
 def sample() -> BenchmarkSample:
@@ -44,3 +48,22 @@ def test_apply_hidden_oracle_uses_strict_threshold(tmp_path):
     docs = [[document(1), document(2)]]
     apply_oracle_labels(argparse.Namespace(oracle_labels_path=path, oracle_policy="hidden_tau_0p4"), [sample()], docs)
     assert [value.filter_prediction for value in docs[0]] == ["not helpful", "helpful"]
+
+
+def test_adaptive_hidden_batch_splits_only_the_oom_batch():
+    class FakeExtractor:
+        def encode_questions(self, batch, documents):
+            return [[1, 2, 3] for _ in batch], []
+
+        def no_document_features(self, sequences, gold):
+            if len(sequences) > 2:
+                raise torch.OutOfMemoryError("synthetic")
+            return SimpleNamespace(size=len(sequences))
+
+    batch = [{"answer": "A"} for _ in range(5)]
+    values = list(adaptive_question_feature_batches(FakeExtractor(), batch, absolute_start=7))
+    assert [(start, len(rows), features.size) for start, rows, _, features in values] == [
+        (7, 2, 2),
+        (9, 1, 1),
+        (10, 2, 2),
+    ]
