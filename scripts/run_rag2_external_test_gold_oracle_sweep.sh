@@ -12,8 +12,49 @@ CANDIDATE_SOURCE="${CANDIDATE_SOURCE:-$PROJECT/databases/run_cache/rag2_llama3_p
 RATIONALE_ROOT="${RATIONALE_ROOT:-$PROJECT/databases/run_cache/rag2_llama3_paper_exact_terminal_v1/no_rag_rationales}"
 CACHE_ROOT="${CACHE_ROOT:-$PROJECT/databases/run_cache/rag2_external_test_gold_oracle_v1}"
 RESULTS_ROOT="${RESULTS_ROOT:-$PROJECT/results/rag2_external_test_gold_oracle_v1}"
-RAG2_LABELS="${RAG2_LABELS:?Set RAG2_LABELS to rag2_oracle_labels.jsonl}"
-HIDDEN_LABELS="${HIDDEN_LABELS:?Set HIDDEN_LABELS to hidden_oracle_labels.jsonl}"
+RAG2_LABELS="${RAG2_LABELS:-}"
+HIDDEN_LABELS="${HIDDEN_LABELS:-}"
+ANSWER_MODES="${ANSWER_MODES:-free_generation constrained_choice}"
+POLICIES="${POLICIES:-rag2 hidden_tau_0 hidden_tau_0p4}"
+TOP_K_VALUES="${TOP_K_VALUES:-1 2 4 8 16 32}"
+RUN_NO_RAG="${RUN_NO_RAG:-1}"
+
+read -r -a ANSWER_MODE_LIST <<< "$ANSWER_MODES"
+read -r -a POLICY_LIST <<< "$POLICIES"
+read -r -a TOP_K_LIST <<< "$TOP_K_VALUES"
+
+for MODE in "${ANSWER_MODE_LIST[@]}"; do
+  if [[ "$MODE" != "free_generation" && "$MODE" != "constrained_choice" ]]; then
+    echo "Unsupported ANSWER_MODES entry: $MODE" >&2
+    exit 2
+  fi
+done
+for POLICY in "${POLICY_LIST[@]}"; do
+  case "$POLICY" in
+    rag2)
+      [[ -n "$RAG2_LABELS" && -f "$RAG2_LABELS" ]] || {
+        echo "POLICIES includes rag2, but RAG2_LABELS is not a readable file: $RAG2_LABELS" >&2
+        exit 2
+      }
+      ;;
+    hidden_tau_0|hidden_tau_0p4)
+      [[ -n "$HIDDEN_LABELS" && -f "$HIDDEN_LABELS" ]] || {
+        echo "POLICIES includes $POLICY, but HIDDEN_LABELS is not a readable file: $HIDDEN_LABELS" >&2
+        exit 2
+      }
+      ;;
+    *)
+      echo "Unsupported POLICIES entry: $POLICY" >&2
+      exit 2
+      ;;
+  esac
+done
+for TOP_K in "${TOP_K_LIST[@]}"; do
+  if [[ ! "$TOP_K" =~ ^(1|2|4|8|16|32)$ ]]; then
+    echo "Unsupported TOP_K_VALUES entry: $TOP_K" >&2
+    exit 2
+  fi
+done
 
 COMMON=(
   --datasets medmcqa medqa mmlu_anatomy mmlu_clinical_knowledge
@@ -57,18 +98,20 @@ run_once() {
   "$@"
 }
 
-for MODE in free_generation constrained_choice; do
+for MODE in "${ANSWER_MODE_LIST[@]}"; do
   MODE_ROOT="$RESULTS_ROOT/$MODE"
   MAX_NEW=768
   [[ "$MODE" == "constrained_choice" ]] && MAX_NEW=1
-  run_once "$MODE_ROOT/no_rag/no_rag" "$PYTHON" "$EVALUATOR" "${COMMON[@]}" --case no_rag \
-    --answer-decision-mode "$MODE" --max-new-tokens "$MAX_NEW" \
-    --results-root "$MODE_ROOT/no_rag" "${EXTRA[@]}"
+  if [[ "$RUN_NO_RAG" == "1" ]]; then
+    run_once "$MODE_ROOT/no_rag/no_rag" "$PYTHON" "$EVALUATOR" "${COMMON[@]}" --case no_rag \
+      --answer-decision-mode "$MODE" --max-new-tokens "$MAX_NEW" \
+      --results-root "$MODE_ROOT/no_rag" "${EXTRA[@]}"
+  fi
 
-  for POLICY in rag2 hidden_tau_0 hidden_tau_0p4; do
+  for POLICY in "${POLICY_LIST[@]}"; do
     LABEL_PATH="$HIDDEN_LABELS"
     [[ "$POLICY" == "rag2" ]] && LABEL_PATH="$RAG2_LABELS"
-    for TOP_K in 1 2 4 8 16 32; do
+    for TOP_K in "${TOP_K_LIST[@]}"; do
       run_once "$MODE_ROOT/$POLICY/oracle_rag_${POLICY}_top${TOP_K}" "$PYTHON" "$EVALUATOR" "${COMMON[@]}" \
         --case oracle_rag --oracle-policy "$POLICY" --oracle-labels-path "$LABEL_PATH" \
         --filter-rerank-top-k "$TOP_K" --answer-decision-mode "$MODE" \
