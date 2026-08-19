@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+"""Compute gold-direction scores for frozen external-test h0/hD feature shards."""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Iterator
+
+import torch
+from safetensors.torch import load_file
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from extract_rag2_preanswer_hidden_pilot import FeatureExtractor, choice_index
+from medrag.io_utils import write_json, write_jsonl
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--candidates-path", type=Path, required=True)
+    p.add_argument("--feature-cache-dir", type=Path, required=True)
+    p.add_argument("--model-name-or-path", type=Path, required=True)
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--layer", type=int, default=28)
+    p.add_argument("--thresholds", type=float, nargs="+", default=[0.0, 0.4])
+    p.add_argument("--question-batch-size", type=int, default=32)
+    p.add_argument("--max-input-tokens", type=int, default=2048)
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
+    p.add_argument("--attn-implementation", default="eager")
+    p.add_argument("--h0-max-abs-tolerance", type=float, default=0.08)
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--log-level", default="INFO")
+    return p.parse_args()
+
+
+def rows(path: Path) -> Iterator[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if line.strip():
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"Malformed JSONL: {path}:{number}") from error
+
+
+def stable_id(doc: dict[str, Any]) -> str:
+    return str(doc.get("stable_id") or doc.get("corpus_id") or doc.get("chunk_id") or doc.get("db_id") or f"{doc.get('source')}:{doc.get('local_id')}")
+
+
+def threshold_name(value: float) -> str:
+    return format(value, ".8g").replace("-", "m").replace(".", "p")
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s | %(levelname)s | %(message)s")
+    candidates = list(rows(args.candidates_path))
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    shard_output = args.output_dir / "shards"
+    shard_output.mkdir(parents=True, exist_ok=True)
+    metadata_paths = sorted((args.feature_cache_dir / "shards").glob("*.json"))
+    if not metadata_paths:
+        raise FileNotFoundError(f"No feature shard metadata: {args.feature_cache_dir}")
+
+    extractor_args = SimpleNamespace(
+        device=args.device, dtype=args.dtype, model_name_or_path=args.model_name_or_path,
+        trust_remote_code=False, attn_implementation=args.attn_implementation,
+        layers=[str(args.layer)], max_input_tokens=args.max_input_tokens,
+    )
+    extractor = FeatureExtractor(extractor_args)
+    processed = 0
+    max_h0_difference = 0.0
+    try:
+        for shard_number, metadata_path in enumerate(metadata_paths, 1):
+            output_path = shard_output / f"{metadata_path.stem}.jsonl"
+            if args.resume and output_path.is_file():
+                processed += sum(1 for _ in rows(output_path))
+                continue
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            indices = [int(value) for value in metadata["sample_indices"]]
+            shard_rows = [candidates[index] for index in indices]
+            actual_keys = [str(row["key"]) for row in shard_rows]
+            if actual_keys != list(metadata["sample_keys"]):
+                raise RuntimeError(f"Candidate/feature sample order mismatch: {metadata_path}")
+            tensor_path = Path(metadata.get("tensor_path") or metadata_path.with_suffix(".safetensors"))
+            if not tensor_path.is_absolute():
+                tensor_path = metadata_path.parent / tensor_path.name
+            tensors = load_file(str(tensor_path), device="cpu")
+            cached_h0 = tensors["h0"].float()
+            cached_hD = tensors["hD"].float()
+            offsets = tensors["document_offsets"].to(torch.int64).tolist()
+            output_rows: list[dict[str, Any]] = []
+            for start in range(0, len(shard_rows), args.question_batch_size):
+                batch = shard_rows[start : start + args.question_batch_size]
+                sequences, _ = extractor.encode_questions(batch, [None] * len(batch))
+                gold = [str(row.get("answer") or (row.get("answers") or [""])[0]).upper() for row in batch]
+                if any(value not in {"A", "B", "C", "D"} for value in gold):
+                    raise ValueError(f"Invalid gold answer in shard {metadata_path}: {gold}")
+                question_features = extractor.no_document_features(sequences, [choice_index(value) for value in gold])
+                recomputed_h0 = question_features.h0[:, 0, :]
+                comparison = cached_h0[start : start + len(batch)]
+                difference = float(torch.max(torch.abs(recomputed_h0 - comparison)).item())
+                max_h0_difference = max(max_h0_difference, difference)
+                if difference > args.h0_max_abs_tolerance:
+                    raise RuntimeError(
+                        f"Cached h0 prompt/model mismatch in {metadata_path.name}: max_abs={difference:.6f} "
+                        f"> tolerance={args.h0_max_abs_tolerance}"
+                    )
+                c_unit = question_features.c_unit[:, 0, :]
+                for local, row in enumerate(batch):
+                    position = start + local
+                    documents = list(row.get("candidate_documents") or [])
+                    begin, end = offsets[position], offsets[position + 1]
+                    if end - begin != len(documents):
+                        raise RuntimeError(f"Document offset mismatch for {row['key']}")
+                    document_keys = metadata["document_keys"][position]
+                    for doc_index, (doc, hD) in enumerate(zip(documents, cached_hD[begin:end])):
+                        expected_key = [str(doc.get("db_id") or ""), int(doc.get("local_id", -1))]
+                        if list(document_keys[doc_index]) != expected_key:
+                            raise RuntimeError(f"Document identity mismatch for {row['key']} rank={doc_index + 1}")
+                        score = float(torch.dot(hD - comparison[local], c_unit[local]).item())
+                        labels = {
+                            threshold_name(value): ("Helpful" if score > value else "Not Helpful")
+                            for value in args.thresholds
+                        }
+                        output_rows.append({
+                            "schema_version": 1,
+                            "policy": "preanswer_gold_direction_external_test",
+                            "dataset": row["dataset"], "sample_key": row["key"],
+                            "sample_id": row["sample_id"], "row_idx": row["row_idx"],
+                            "pair_id": f"{row['sample_id']}::{doc_index + 1}::{stable_id(doc)}",
+                            "doc_rank": doc_index + 1, "doc_stable_id": stable_id(doc),
+                            "db_id": doc.get("db_id"), "local_id": doc.get("local_id"),
+                            "source": doc.get("source"), "projection_score": score,
+                            "labels": labels, "gold_answer": gold[local],
+                            "layer": args.layer,
+                        })
+            temporary = output_path.with_suffix(".jsonl.partial")
+            write_jsonl(temporary, output_rows)
+            os.replace(temporary, output_path)
+            processed += len(output_rows)
+            logging.info("Hidden gold direction shard %s/%s: %s pairs (total=%s)", shard_number, len(metadata_paths), len(output_rows), processed)
+            del tensors, cached_h0, cached_hD
+    finally:
+        del extractor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    combined_path = args.output_dir / "hidden_oracle_labels.jsonl"
+    temporary = combined_path.with_suffix(".jsonl.partial")
+    with temporary.open("w", encoding="utf-8") as destination:
+        total = 0
+        for path in sorted(shard_output.glob("*.jsonl")):
+            for row in rows(path):
+                destination.write(json.dumps(row, ensure_ascii=False) + "\n")
+                total += 1
+    os.replace(temporary, combined_path)
+    expected = sum(len(row.get("candidate_documents") or []) for row in candidates)
+    if total != expected:
+        raise RuntimeError(f"Hidden output incomplete: {total}/{expected}")
+    write_json(args.output_dir / "manifest.json", {
+        "type": "rag2_external_hidden_oracle_labels", "questions": len(candidates), "pairs": total,
+        "thresholds": args.thresholds, "layer": args.layer, "feature_cache_dir": str(args.feature_cache_dir.resolve()),
+        "model_name_or_path": str(args.model_name_or_path.resolve()), "max_recomputed_h0_abs_difference": max_h0_difference,
+    })
+
+
+if __name__ == "__main__":
+    main()

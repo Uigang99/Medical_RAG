@@ -106,6 +106,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--docs-per-question", type=int, default=10)
+    parser.add_argument(
+        "--candidate-query-alignment",
+        choices=["strict", "identity_only"],
+        default="strict",
+        help=(
+            "strict requires candidates to have been retrieved with this no-RAG response. "
+            "identity_only is for frozen-candidate oracle audits: it validates sample/question/options "
+            "but preserves the different query that originally selected the documents."
+        ),
+    )
     parser.add_argument("--max-doc-chars", type=int, default=2600)
     parser.add_argument("--question-batch-size", type=int, default=32)
     parser.add_argument("--generation-batch-size", type=int, default=128)
@@ -1184,7 +1194,7 @@ def align_candidate_row_with_baseline(
 
     sample_id = str(row.get("sample_id") or "")
     baseline_query = str(baseline.get("rationale_query") or "").strip()
-    if args.candidate_input_format == "retrieval_documents":
+    if args.candidate_input_format == "retrieval_documents" and args.candidate_query_alignment == "strict":
         candidate_query = str(row.get("query_text") or "").strip()
         if candidate_query != baseline_query:
             raise ValueError(
@@ -1197,9 +1207,13 @@ def align_candidate_row_with_baseline(
         raise ValueError(f"Evidence candidate question does not match no-RAG baseline: {sample_id}")
     if normalized_options(row) != dict(baseline.get("options") or {}):
         raise ValueError(f"Evidence candidate options do not match no-RAG baseline: {sample_id}")
-    row["query_text"] = baseline_query
-    row["retrieval_query_type"] = "reused_no_rag_rationale_query"
-    row["rerank_query_type"] = "parent_document_selection_metadata"
+    if args.candidate_input_format != "retrieval_documents":
+        row["query_text"] = baseline_query
+        row["retrieval_query_type"] = "reused_no_rag_rationale_query"
+        row["rerank_query_type"] = "parent_document_selection_metadata"
+    else:
+        row["labeling_no_rag_query_text"] = baseline_query
+        row["retrieval_query_type"] = row.get("retrieval_query_type") or "frozen_external_candidate_query"
 
 
 def validate_trace_inputs(args: argparse.Namespace) -> dict[str, int]:
@@ -1293,6 +1307,7 @@ def run_trace_job(
                 else None
             ),
             "docs_per_question": args.docs_per_question,
+            "candidate_query_alignment": args.candidate_query_alignment,
             "selected_input_rows": total_questions,
             "expected_pairs": total_pairs,
             "max_doc_chars": args.max_doc_chars,

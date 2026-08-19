@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
             "MedCPT reranking, and dataset-routed Flan-T5 filtering."
         )
     )
-    parser.add_argument("--case", choices=["no_rag", "rerank_rag", "filter_rag"], required=True)
+    parser.add_argument("--case", choices=["no_rag", "rerank_rag", "filter_rag", "oracle_rag"], required=True)
     parser.add_argument("--datasets", nargs="+", choices=MCQ_DATASETS, default=MCQ_DATASETS)
     parser.add_argument("--collection", default="unified")
     parser.add_argument("--split", default="test")
@@ -164,6 +164,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cross-encoder-path", type=Path, default=DEFAULT_CROSS_ENCODER)
     parser.add_argument("--medmcqa-filter-model-path", type=Path, default=DEFAULT_MEDMCQA_FILTER)
     parser.add_argument("--medqa-filter-model-path", type=Path, default=DEFAULT_MEDQA_FILTER)
+    parser.add_argument(
+        "--oracle-labels-path",
+        type=Path,
+        default=None,
+        help="Gold document-label JSONL used only by --case oracle_rag.",
+    )
+    parser.add_argument(
+        "--oracle-policy",
+        choices=["rag2", "hidden_tau_0", "hidden_tau_0p4"],
+        default=None,
+        help="Label/score field to materialize as Helpful for --case oracle_rag.",
+    )
     parser.add_argument(
         "--hidden-filter-backbone-path",
         type=Path,
@@ -231,7 +243,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "For --case filter_rag, define the reranked Top-k prefix eligible for filtering. "
+            "For --case filter_rag or oracle_rag, define the reranked Top-k prefix eligible for filtering. "
             "All --rerank-top-k documents are scored and cached once, but only helpful documents "
             "inside this prefix are augmented; the final document count is therefore between zero and k. "
             "Defaults to --rerank-top-k."
@@ -3285,6 +3297,57 @@ def _rank_scored_documents(docs: list[RetrievedDocument]) -> None:
             doc.filter_rank = None
 
 
+def apply_oracle_labels(
+    args: argparse.Namespace,
+    samples: list[BenchmarkSample],
+    reranked_docs: list[list[RetrievedDocument]],
+) -> list[list[RetrievedDocument]]:
+    """Apply externally materialized gold labels without invoking a learned filter."""
+
+    assert args.oracle_labels_path is not None
+    labels: dict[tuple[str, int, str], dict[str, Any]] = {}
+    with args.oracle_labels_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Malformed oracle JSONL: {args.oracle_labels_path}:{line_number}") from error
+            key = (str(row.get("sample_key") or ""), int(row.get("doc_rank") or 0), str(row.get("doc_stable_id") or ""))
+            if key in labels:
+                raise ValueError(f"Duplicate oracle decision: {key}")
+            labels[key] = row
+    used: set[tuple[str, int, str]] = set()
+    for sample, documents in zip(samples, reranked_docs):
+        for rank, document in enumerate(documents, 1):
+            key = (sample_key(sample), rank, document.stable_id)
+            row = labels.get(key)
+            if row is None:
+                raise KeyError(f"Missing oracle decision: {key}")
+            used.add(key)
+            if args.oracle_policy == "rag2":
+                helpful = str(row.get("pseudo_label") or "") == "Helpful" and bool(row.get("quality_pass"))
+                score = row.get("delta_ppl")
+            else:
+                threshold = 0.0 if args.oracle_policy == "hidden_tau_0" else 0.4
+                score = float(row["projection_score"])
+                helpful = score > threshold
+            document.filter_prediction = "helpful" if helpful else "not helpful"
+            document.filter_score = None if score is None else float(score)
+            document.filter_prob_helpful = None
+            document.metadata["oracle_filter"] = {
+                "policy": args.oracle_policy,
+                "gold_label": row.get("pseudo_label") if args.oracle_policy == "rag2" else None,
+                "projection_score": row.get("projection_score"),
+            }
+        _rank_scored_documents(documents)
+    if len(used) != sum(len(value) for value in reranked_docs):
+        raise RuntimeError("Oracle label application did not cover every reranked document")
+    logging.info("Applied %s oracle decisions from %s", len(used), args.oracle_labels_path)
+    return reranked_docs
+
+
 def _filter_score_row(
     sample: BenchmarkSample,
     docs: list[RetrievedDocument],
@@ -3593,8 +3656,9 @@ def write_outputs(
     output_case = args.case
     if args.case == "rerank_rag" and args.generation_top_k is not None:
         output_case = f"{args.case}_top{args.generation_top_k}"
-    elif args.case == "filter_rag" and args.filter_rerank_top_k is not None:
-        output_case = f"{args.case}_top{args.filter_rerank_top_k}"
+    elif args.case in {"filter_rag", "oracle_rag"} and args.filter_rerank_top_k is not None:
+        suffix = f"_{args.oracle_policy}" if args.case == "oracle_rag" else ""
+        output_case = f"{args.case}{suffix}_top{args.filter_rerank_top_k}"
     output_dir = args.results_root / output_case / timestamp
     output_dir.mkdir(parents=True, exist_ok=False)
     config = {**config, "output_dir": str(output_dir), "created_at": datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -3613,6 +3677,7 @@ def write_outputs(
         row["filter_model_route"] = (
             "medqa" if args.case == "filter_rag" and result.sample.dataset == "medqa"
             else "medmcqa" if args.case == "filter_rag"
+            else "gold_oracle" if args.case == "oracle_rag"
             else None
         )
     write_jsonl(output_dir / "results.jsonl", rows)
@@ -3623,7 +3688,7 @@ def write_outputs(
     if exclusions:
         write_json(output_dir / "rationale_exclusions.json", exclusions)
 
-    if args.case == "filter_rag":
+    if args.case in {"filter_rag", "oracle_rag"}:
         by_dataset: dict[str, dict[str, Any]] = {}
         eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
         for result in results:
@@ -3683,7 +3748,7 @@ def write_outputs(
 
 def validate_paths(args: argparse.Namespace) -> None:
     required = [] if args.candidate_cache_only or args.filter_cache_only else [args.llm_model_path]
-    if args.case in {"rerank_rag", "filter_rag"}:
+    if args.case in {"rerank_rag", "filter_rag", "oracle_rag"}:
         required.extend([args.query_encoder_path, args.cross_encoder_path])
         required.extend(args.vector_db_root / source for source in args.sources)
     if args.case == "filter_rag":
@@ -3705,6 +3770,12 @@ def validate_paths(args: argparse.Namespace) -> None:
                         "--medmcqa-document-transformer-checkpoint is required for MedMCQA/MMLU"
                     )
                 required.append(args.medmcqa_document_transformer_checkpoint)
+    if args.case == "oracle_rag":
+        if args.oracle_labels_path is None or args.oracle_policy is None:
+            raise ValueError("--case oracle_rag requires --oracle-labels-path and --oracle-policy")
+        required.append(args.oracle_labels_path)
+    elif args.oracle_labels_path is not None or args.oracle_policy is not None:
+        raise ValueError("--oracle-labels-path/--oracle-policy are supported only with --case oracle_rag")
     if args.candidate_cache_source_path is not None:
         required.extend(
             [
@@ -3769,8 +3840,8 @@ def validate_paths(args: argparse.Namespace) -> None:
                 f"--generation-top-k must be in [1, {args.rerank_top_k}], got {args.generation_top_k}."
             )
     if args.filter_rerank_top_k is not None:
-        if args.case != "filter_rag":
-            raise ValueError("--filter-rerank-top-k is supported only with --case filter_rag.")
+        if args.case not in {"filter_rag", "oracle_rag"}:
+            raise ValueError("--filter-rerank-top-k is supported only with --case filter_rag or oracle_rag.")
         if args.filter_rerank_top_k <= 0 or args.filter_rerank_top_k > args.rerank_top_k:
             raise ValueError(
                 f"--filter-rerank-top-k must be in [1, {args.rerank_top_k}], "
@@ -3822,7 +3893,7 @@ def main() -> None:
             args.rerank_top_k,
             (
                 args.filter_rerank_top_k or args.rerank_top_k
-                if args.case == "filter_rag"
+                if args.case in {"filter_rag", "oracle_rag"}
                 else args.generation_top_k or args.rerank_top_k
             ),
         )
@@ -3904,9 +3975,16 @@ def main() -> None:
             args.generation_top_k or args.rerank_top_k if args.case == "rerank_rag" else None
         ),
         "filter_rerank_top_k": (
-            args.filter_rerank_top_k or args.rerank_top_k if args.case == "filter_rag" else None
+            args.filter_rerank_top_k or args.rerank_top_k
+            if args.case in {"filter_rag", "oracle_rag"} else None
         ),
+        "oracle_policy": args.oracle_policy,
+        "oracle_labels_path": str(args.oracle_labels_path.resolve()) if args.oracle_labels_path else None,
         "filter_policy": (
+            "gold-label oracle: inside each rerank Top-k prefix, retain only documents whose externally "
+            "materialized policy label is Helpful; preserve rerank order, no fill, no learned filter"
+            if args.case == "oracle_rag"
+            else
             f"split every reranked document into all unique "
             f"{'single sentences' if args.filter_window_context_sentences == 0 else 'centred sentence-context windows'}; "
             "use the route-specific frozen Direct Sentence/Window Filter to extract each evidence unit's "
@@ -4082,7 +4160,7 @@ def main() -> None:
     if args.case == "rerank_rag":
         generation_top_k = args.generation_top_k or args.rerank_top_k
         context_docs = [docs[:generation_top_k] for docs in reranked_docs]
-    else:
+    elif args.case == "filter_rag":
         reranked_docs, filter_cache_dir = ensure_filter_scores(
             args,
             samples,
@@ -4109,6 +4187,13 @@ def main() -> None:
         eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
         context_docs = [
             materialize_filter_generation_context(args, docs[:eligible_top_k])
+            for docs in reranked_docs
+        ]
+    else:
+        reranked_docs = apply_oracle_labels(args, samples, reranked_docs)
+        eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
+        context_docs = [
+            [copy.copy(document) for document in docs[:eligible_top_k] if document.filter_prediction == "helpful"]
             for docs in reranked_docs
         ]
     results, details = generate_rag_answers(
