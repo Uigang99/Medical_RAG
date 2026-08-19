@@ -65,7 +65,8 @@ from medrag.filtering.rag2_official import LABEL_NAMES, LABEL_TOKENS, add_label_
 TRAINER_VERSION = "rag2_hidden_feature_filter_ablation_v2"
 INPUT_MODES = ("text_only", "hidden_only", "text_hidden")
 LABEL_MODES = ("symmetric_neutral", "positive_vs_rest")
-TRAIN_BALANCE_MODES = ("natural", "four_group_loss")
+TRAIN_BALANCE_MODES = ("natural", "four_group_loss", "no_rag_state_loss")
+NO_RAG_STATES = ("no_rag_correct", "no_rag_wrong")
 BALANCE_GROUPS = (
     "no_rag_correct__helpful",
     "no_rag_correct__not_helpful",
@@ -123,7 +124,10 @@ def parse_args() -> argparse.Namespace:
         default="natural",
         help=(
             "four_group_loss gives equal total training-loss mass to no-RAG "
-            "correct/wrong x Helpful/Not Helpful without duplicating rows."
+            "correct/wrong x Helpful/Not Helpful without duplicating rows; "
+            "no_rag_state_loss gives 50%% mass to no-RAG correct and wrong "
+            "while preserving the natural Helpful/Not Helpful ratio within "
+            "each state."
         ),
     )
     parser.add_argument(
@@ -131,8 +135,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Use an equal-size four-group validation subset for epoch selection. "
-            "Natural validation and test metrics are still saved after training."
+            "Use a validation subset matched to --train-balance-mode for epoch "
+            "selection: equal-size four groups for four_group_loss, or equal-size "
+            "no-RAG correct/wrong states with natural labels retained for "
+            "no_rag_state_loss. Natural validation and test metrics are still "
+            "saved after training."
         ),
     )
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
@@ -235,6 +242,14 @@ def get_balance_group(transition: Any, target: Any) -> str:
     return f"{state}__{target_value}"
 
 
+def get_no_rag_state(balance_group: Any) -> str:
+    value = str(balance_group)
+    state = value.split("__", maxsplit=1)[0]
+    if state not in NO_RAG_STATES:
+        raise ValueError(f"Unsupported no-RAG state balance group: {balance_group!r}")
+    return state
+
+
 def add_four_group_training_weights(train: Dataset) -> tuple[Dataset, dict[str, Any]]:
     counts = Counter(str(value) for value in train["balance_group"])
     missing = [name for name in BALANCE_GROUPS if counts[name] == 0]
@@ -255,6 +270,69 @@ def add_four_group_training_weights(train: Dataset) -> tuple[Dataset, dict[str, 
         "effective_group_loss_mass": effective_mass,
         "effective_group_fraction": {
             name: effective_mass[name] / total_mass for name in BALANCE_GROUPS
+        },
+        "row_count_unchanged": len(weighted) == total,
+    }
+
+
+def add_no_rag_state_training_weights(train: Dataset) -> tuple[Dataset, dict[str, Any]]:
+    """Balance no-RAG correctness only, retaining labels within each state.
+
+    Every row from a state receives the same weight.  Consequently the two
+    states contribute 50% of expected loss each, while Helpful/Not Helpful
+    proportions inside either state are exactly the proportions in the
+    original training data.
+    """
+
+    groups = [str(value) for value in train["balance_group"]]
+    states = [get_no_rag_state(value) for value in groups]
+    state_counts = Counter(states)
+    missing = [name for name in NO_RAG_STATES if state_counts[name] == 0]
+    if missing:
+        raise RuntimeError(f"Cannot balance training data; empty no-RAG states: {missing}")
+    total = len(train)
+    state_weights = {
+        name: total / (len(NO_RAG_STATES) * state_counts[name])
+        for name in NO_RAG_STATES
+    }
+    weighted = train.add_column(
+        "_sample_weight",
+        [float(state_weights[state]) for state in states],
+    )
+    group_counts = Counter(groups)
+    effective_group_mass = {
+        name: float(group_counts[name] * state_weights[get_no_rag_state(name)])
+        for name in BALANCE_GROUPS
+    }
+    effective_state_mass = {
+        state: float(state_counts[state] * state_weights[state])
+        for state in NO_RAG_STATES
+    }
+    total_mass = sum(effective_state_mass.values())
+
+    def label_fractions(counts: dict[str, float]) -> dict[str, dict[str, float]]:
+        result: dict[str, dict[str, float]] = {}
+        for state in NO_RAG_STATES:
+            helpful = float(counts[f"{state}__helpful"])
+            not_helpful = float(counts[f"{state}__not_helpful"])
+            denominator = helpful + not_helpful
+            result[state] = {
+                "helpful": helpful / denominator,
+                "not_helpful": not_helpful / denominator,
+            }
+        return result
+
+    return weighted, {
+        "mode": "no_rag_state_loss",
+        "state_counts": dict(state_counts),
+        "state_weights": state_weights,
+        "group_counts": dict(group_counts),
+        "natural_label_fraction_within_state": label_fractions(group_counts),
+        "effective_label_fraction_within_state": label_fractions(effective_group_mass),
+        "effective_state_loss_mass": effective_state_mass,
+        "effective_state_fraction": {
+            state: effective_state_mass[state] / total_mass
+            for state in NO_RAG_STATES
         },
         "row_count_unchanged": len(weighted) == total,
     }
@@ -284,6 +362,47 @@ def make_four_group_balanced_validation(validation: Dataset, seed: int) -> tuple
         "selected_per_group": minimum,
         "selected_rows": len(balanced),
         "selection": "deterministic equal-size undersampling without replacement",
+        "seed": int(seed),
+    }
+
+
+def make_no_rag_state_balanced_validation(
+    validation: Dataset,
+    seed: int,
+) -> tuple[Dataset, dict[str, Any]]:
+    """Select equal no-RAG states without stratifying on the utility label."""
+
+    indices: dict[str, list[int]] = {name: [] for name in NO_RAG_STATES}
+    for index, group in enumerate(validation["balance_group"]):
+        indices[get_no_rag_state(group)].append(index)
+    minimum = min(len(values) for values in indices.values())
+    if minimum == 0:
+        raise RuntimeError("Cannot construct state-balanced validation with an empty state")
+    selected: list[int] = []
+    selected_group_counts: Counter[str] = Counter()
+    for offset, state in enumerate(NO_RAG_STATES):
+        generator = random.Random(int(seed) + offset * 1009)
+        values = list(indices[state])
+        generator.shuffle(values)
+        state_selected = values[:minimum]
+        selected.extend(state_selected)
+        selected_group_counts.update(
+            str(validation[index]["balance_group"])
+            for index in state_selected
+        )
+    # Sorting restores feature-shard locality and keeps evaluation deterministic.
+    selected.sort()
+    balanced = validation.select(selected)
+    return balanced, {
+        "mode": "no_rag_state",
+        "source_state_counts": {name: len(indices[name]) for name in NO_RAG_STATES},
+        "selected_per_state": minimum,
+        "selected_rows": len(balanced),
+        "selected_group_counts": dict(selected_group_counts),
+        "selection": (
+            "deterministic equal-size no-RAG-state undersampling without "
+            "utility-label stratification"
+        ),
         "seed": int(seed),
     }
 
@@ -374,10 +493,21 @@ def prepare_splits(
         prepared["train"], reports["train"]["group_balancing"] = add_four_group_training_weights(
             prepared["train"]
         )
-    if args.balanced_validation:
-        prepared["validation_group_balanced"], reports["validation_group_balanced"] = (
-            make_four_group_balanced_validation(prepared["validation"], args.seed)
+    elif args.train_balance_mode == "no_rag_state_loss":
+        prepared["train"], reports["train"]["group_balancing"] = (
+            add_no_rag_state_training_weights(prepared["train"])
         )
+    if args.balanced_validation:
+        if args.train_balance_mode == "no_rag_state_loss":
+            balanced_validation, validation_report = make_no_rag_state_balanced_validation(
+                prepared["validation"], args.seed
+            )
+        else:
+            balanced_validation, validation_report = make_four_group_balanced_validation(
+                prepared["validation"], args.seed
+            )
+        prepared["validation_group_balanced"] = balanced_validation
+        reports["validation_group_balanced"] = validation_report
     return prepared, reports
 
 
@@ -494,8 +624,8 @@ class ShardGroupedSampler(Sampler[int]):
 
 
 class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
-    def __init__(self, *args: Any, group_balanced_loss: bool = False, **kwargs: Any) -> None:
-        self.group_balanced_loss = bool(group_balanced_loss)
+    def __init__(self, *args: Any, sample_weighted_loss: bool = False, **kwargs: Any) -> None:
+        self.sample_weighted_loss = bool(sample_weighted_loss)
         super().__init__(*args, **kwargs)
 
     def _get_train_sampler(self, train_dataset: Any | None = None) -> Sampler[int] | None:
@@ -512,7 +642,7 @@ class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
         num_items_in_batch: torch.Tensor | None = None,
     ) -> Any:
         sample_weight = inputs.pop("sample_weight", None)
-        if not self.group_balanced_loss:
+        if not self.sample_weighted_loss:
             parent_parameters = inspect.signature(super().compute_loss).parameters
             if "num_items_in_batch" in parent_parameters:
                 return super().compute_loss(
@@ -535,8 +665,8 @@ class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
         ).reshape(labels.shape)
         valid = labels.ne(-100)
         per_example = (token_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
-        # Dataset-level weights have mean one and give every no-RAG-state x
-        # utility-label group exactly 25% expected training-loss mass.
+        # Dataset-level weights have mean one. Their grouping contract is
+        # recorded in the run manifest for the selected train balance mode.
         loss = (per_example * sample_weight.to(per_example.device, dtype=per_example.dtype)).mean()
         return (loss, outputs) if return_outputs else loss
 
@@ -839,7 +969,7 @@ def main() -> None:
         preprocess_logits_for_metrics=preprocess_logits,
         compute_metrics=compute_metrics,
         callbacks=callbacks,
-        group_balanced_loss=args.train_balance_mode == "four_group_loss",
+        sample_weighted_loss=args.train_balance_mode != "natural",
     )
 
     reproduction = {
@@ -861,6 +991,13 @@ def main() -> None:
         "training_balance": {
             "mode": args.train_balance_mode,
             "balanced_validation_for_checkpoint_selection": args.balanced_validation,
+            "validation_balance_mode": (
+                "no_rag_state"
+                if args.balanced_validation and args.train_balance_mode == "no_rag_state_loss"
+                else "four_group"
+                if args.balanced_validation
+                else "natural"
+            ),
             "balance_group_is_model_input": False,
             "answer_transition_is_model_input": False,
         },
@@ -910,6 +1047,13 @@ def main() -> None:
             "forbidden_inputs": ["c", "projection_score", "gold_answer", "answer_transition"],
             "train_balance_mode": args.train_balance_mode,
             "balanced_validation_for_checkpoint_selection": args.balanced_validation,
+            "validation_balance_mode": (
+                "no_rag_state"
+                if args.balanced_validation and args.train_balance_mode == "no_rag_state_loss"
+                else "four_group"
+                if args.balanced_validation
+                else "natural"
+            ),
             "best_checkpoint": trainer.state.best_model_checkpoint,
             "best_metric": trainer.state.best_metric,
         },
