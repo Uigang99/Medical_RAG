@@ -37,6 +37,7 @@ import datasets as datasets_package
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers as transformers_package
 from datasets import Dataset, load_dataset
 from safetensors import safe_open
@@ -61,9 +62,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from medrag.filtering.rag2_official import LABEL_NAMES, LABEL_TOKENS, add_label_tokens
 
 
-TRAINER_VERSION = "rag2_hidden_feature_filter_ablation_v1"
+TRAINER_VERSION = "rag2_hidden_feature_filter_ablation_v2"
 INPUT_MODES = ("text_only", "hidden_only", "text_hidden")
 LABEL_MODES = ("symmetric_neutral", "positive_vs_rest")
+TRAIN_BALANCE_MODES = ("natural", "four_group_loss")
+BALANCE_GROUPS = (
+    "no_rag_correct__helpful",
+    "no_rag_correct__not_helpful",
+    "no_rag_wrong__helpful",
+    "no_rag_wrong__not_helpful",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +117,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hidden-shard-cache-size", type=int, default=32)
     parser.add_argument("--prefix-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--train-balance-mode",
+        choices=TRAIN_BALANCE_MODES,
+        default="natural",
+        help=(
+            "four_group_loss gives equal total training-loss mass to no-RAG "
+            "correct/wrong x Helpful/Not Helpful without duplicating rows."
+        ),
+    )
+    parser.add_argument(
+        "--balanced-validation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use an equal-size four-group validation subset for epoch selection. "
+            "Natural validation and test metrics are still saved after training."
+        ),
+    )
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
@@ -195,6 +221,73 @@ def load_raw_splits(args: argparse.Namespace) -> dict[str, Dataset]:
     return {key: loaded[key] for key in files}
 
 
+def get_balance_group(transition: Any, target: Any) -> str:
+    transition_value = str(transition).strip().upper()
+    if transition_value.startswith("C->"):
+        state = "no_rag_correct"
+    elif transition_value.startswith("W->"):
+        state = "no_rag_wrong"
+    else:
+        raise ValueError(f"Unsupported answer transition for balancing: {transition!r}")
+    target_value = str(target).strip().lower().replace(" ", "_")
+    if target_value not in {"helpful", "not_helpful"}:
+        raise ValueError(f"Unsupported binary target for balancing: {target!r}")
+    return f"{state}__{target_value}"
+
+
+def add_four_group_training_weights(train: Dataset) -> tuple[Dataset, dict[str, Any]]:
+    counts = Counter(str(value) for value in train["balance_group"])
+    missing = [name for name in BALANCE_GROUPS if counts[name] == 0]
+    if missing:
+        raise RuntimeError(f"Cannot balance training data; empty groups: {missing}")
+    total = len(train)
+    weights = {name: total / (len(BALANCE_GROUPS) * counts[name]) for name in BALANCE_GROUPS}
+    weighted = train.add_column(
+        "_sample_weight",
+        [float(weights[str(group)]) for group in train["balance_group"]],
+    )
+    effective_mass = {name: float(counts[name] * weights[name]) for name in BALANCE_GROUPS}
+    total_mass = sum(effective_mass.values())
+    return weighted, {
+        "mode": "four_group_loss",
+        "group_counts": dict(counts),
+        "group_weights": weights,
+        "effective_group_loss_mass": effective_mass,
+        "effective_group_fraction": {
+            name: effective_mass[name] / total_mass for name in BALANCE_GROUPS
+        },
+        "row_count_unchanged": len(weighted) == total,
+    }
+
+
+def make_four_group_balanced_validation(validation: Dataset, seed: int) -> tuple[Dataset, dict[str, Any]]:
+    indices: dict[str, list[int]] = {name: [] for name in BALANCE_GROUPS}
+    for index, group in enumerate(validation["balance_group"]):
+        value = str(group)
+        if value not in indices:
+            raise RuntimeError(f"Unexpected validation balance group: {value}")
+        indices[value].append(index)
+    minimum = min(len(values) for values in indices.values())
+    if minimum == 0:
+        raise RuntimeError("Cannot construct balanced validation with an empty group")
+    selected: list[int] = []
+    for offset, name in enumerate(BALANCE_GROUPS):
+        generator = random.Random(int(seed) + offset * 1009)
+        values = list(indices[name])
+        generator.shuffle(values)
+        selected.extend(values[:minimum])
+    # Sorting restores feature-shard locality and keeps evaluation deterministic.
+    selected.sort()
+    balanced = validation.select(selected)
+    return balanced, {
+        "source_group_counts": {name: len(indices[name]) for name in BALANCE_GROUPS},
+        "selected_per_group": minimum,
+        "selected_rows": len(balanced),
+        "selection": "deterministic equal-size undersampling without replacement",
+        "seed": int(seed),
+    }
+
+
 def prepare_splits(
     raw: dict[str, Dataset],
     tokenizer: Any,
@@ -223,6 +316,12 @@ def prepare_splits(
             "feature_question_row": [int(value) for value in examples["feature_question_row"]],
             "target_name": [str(value) for value in examples["target"]],
             "pair_id": [str(value) for value in examples["pair_id"]],
+            "balance_group": [
+                get_balance_group(transition, target)
+                for transition, target in zip(
+                    examples["answer_transition_audit_only"], examples["target"]
+                )
+            ],
         }
 
     # Length is measured without truncation and filtered explicitly below.  A
@@ -266,10 +365,19 @@ def prepare_splits(
                     "max": int(lengths.max()),
                 },
                 "targets": dict(Counter(str(value) for value in tokenized["target_name"])),
+                "balance_groups": dict(Counter(str(value) for value in tokenized["balance_group"])),
             }
             prepared[split_name] = tokenized
     finally:
         tokenizer.model_max_length = original_model_max_length
+    if args.train_balance_mode == "four_group_loss":
+        prepared["train"], reports["train"]["group_balancing"] = add_four_group_training_weights(
+            prepared["train"]
+        )
+    if args.balanced_validation:
+        prepared["validation_group_balanced"], reports["validation_group_balanced"] = (
+            make_four_group_balanced_validation(prepared["validation"], args.seed)
+        )
     return prepared, reports
 
 
@@ -337,6 +445,10 @@ class RAG2AblationCollator:
             values = torch.tensor(row["labels"], dtype=torch.long)
             labels[index, : values.numel()] = values
         batch["labels"] = labels
+        if "_sample_weight" in rows[0]:
+            batch["sample_weight"] = torch.tensor(
+                [float(row["_sample_weight"]) for row in rows], dtype=torch.float32
+            )
         if self.input_mode != "text_only":
             if self.store is None:
                 raise RuntimeError("Hidden feature mode requires a feature store")
@@ -382,11 +494,51 @@ class ShardGroupedSampler(Sampler[int]):
 
 
 class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
+    def __init__(self, *args: Any, group_balanced_loss: bool = False, **kwargs: Any) -> None:
+        self.group_balanced_loss = bool(group_balanced_loss)
+        super().__init__(*args, **kwargs)
+
     def _get_train_sampler(self, train_dataset: Any | None = None) -> Sampler[int] | None:
         dataset = train_dataset if train_dataset is not None else self.train_dataset
         if dataset is None:
             return None
         return ShardGroupedSampler(dataset, int(self.args.data_seed or self.args.seed))
+
+    def compute_loss(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor],
+        return_outputs: bool = False,
+        num_items_in_batch: torch.Tensor | None = None,
+    ) -> Any:
+        sample_weight = inputs.pop("sample_weight", None)
+        if not self.group_balanced_loss:
+            parent_parameters = inspect.signature(super().compute_loss).parameters
+            if "num_items_in_batch" in parent_parameters:
+                return super().compute_loss(
+                    model,
+                    inputs,
+                    return_outputs=return_outputs,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            return super().compute_loss(model, inputs, return_outputs=return_outputs)
+        if sample_weight is None:
+            sample_weight = torch.ones(inputs["labels"].shape[0], device=inputs["labels"].device)
+        labels = inputs["labels"]
+        outputs = model(**inputs)
+        logits = outputs.logits.float()
+        token_loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            labels.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).reshape(labels.shape)
+        valid = labels.ne(-100)
+        per_example = (token_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+        # Dataset-level weights have mean one and give every no-RAG-state x
+        # utility-label group exactly 25% expected training-loss mass.
+        loss = (per_example * sample_weight.to(per_example.device, dtype=per_example.dtype)).mean()
+        return (loss, outputs) if return_outputs else loss
 
     def _save(self, output_dir: str | None = None, state_dict: dict[str, torch.Tensor] | None = None) -> None:
         """Save custom hidden-prefix models without safetensors alias errors.
@@ -583,6 +735,8 @@ def main() -> None:
             "dry_run": True,
             "dataset": args.dataset,
             "input_mode": args.input_mode,
+            "train_balance_mode": args.train_balance_mode,
+            "balanced_validation": args.balanced_validation,
             "data_report": data_report,
             "sample_hidden_shapes": {"h0": list(h0.shape), "delta_h": list(delta.shape)},
             "gold_leakage_check": "c and projection score are not loaded",
@@ -614,6 +768,11 @@ def main() -> None:
         pad_to_multiple_of=8 if args.bf16 or args.tf32 else None,
     )
     preprocess_logits, compute_metrics = build_metrics(label_ids)
+    epoch_validation = (
+        prepared["validation_group_balanced"]
+        if args.balanced_validation
+        else prepared["validation"]
+    )
     kwargs: dict[str, Any] = {
         "output_dir": str(output_dir),
         "run_name": args.run_name,
@@ -674,12 +833,13 @@ def main() -> None:
         model=model,
         args=training_args,
         train_dataset=prepared["train"],
-        eval_dataset=prepared["validation"],
+        eval_dataset=epoch_validation,
         data_collator=collator,
         processing_class=tokenizer,
         preprocess_logits_for_metrics=preprocess_logits,
         compute_metrics=compute_metrics,
         callbacks=callbacks,
+        group_balanced_loss=args.train_balance_mode == "four_group_loss",
     )
 
     reproduction = {
@@ -697,6 +857,12 @@ def main() -> None:
         "label_contract": {
             "threshold": args.expected_label_threshold,
             "mode": args.expected_label_mode,
+        },
+        "training_balance": {
+            "mode": args.train_balance_mode,
+            "balanced_validation_for_checkpoint_selection": args.balanced_validation,
+            "balance_group_is_model_input": False,
+            "answer_transition_is_model_input": False,
         },
         "hidden_input": {
             "included": ["h0", "delta_h=hD-h0"] if args.input_mode != "text_only" else [],
@@ -716,10 +882,18 @@ def main() -> None:
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_state()
     validation_metrics = trainer.evaluate(prepared["validation"], metric_key_prefix="validation_best")
+    validation_balanced_metrics = None
+    if args.balanced_validation:
+        validation_balanced_metrics = trainer.evaluate(
+            prepared["validation_group_balanced"], metric_key_prefix="validation_balanced_best"
+        )
     test_metrics = trainer.evaluate(prepared["test"], metric_key_prefix="test_best")
     trainer.log_metrics("validation_best", validation_metrics)
     trainer.log_metrics("test_best", test_metrics)
     trainer.save_metrics("validation_best", validation_metrics)
+    if validation_balanced_metrics is not None:
+        trainer.log_metrics("validation_balanced_best", validation_balanced_metrics)
+        trainer.save_metrics("validation_balanced_best", validation_balanced_metrics)
     trainer.save_metrics("test_best", test_metrics)
     final_dir = output_dir / "final_model"
     trainer.save_model(str(final_dir))
@@ -734,6 +908,8 @@ def main() -> None:
             "hidden_size": feature_store.hidden_size if feature_store is not None else None,
             "hidden_inputs": ["h0", "delta_h"] if feature_store is not None else [],
             "forbidden_inputs": ["c", "projection_score", "gold_answer", "answer_transition"],
+            "train_balance_mode": args.train_balance_mode,
+            "balanced_validation_for_checkpoint_selection": args.balanced_validation,
             "best_checkpoint": trainer.state.best_model_checkpoint,
             "best_metric": trainer.state.best_metric,
         },
