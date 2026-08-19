@@ -12,7 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from medrag.core import BenchmarkSample, RetrievedDocument
 from scripts.run_rag2_mcq_eval import apply_oracle_labels
-from scripts.materialize_rag2_external_hidden_oracle_labels import adaptive_question_feature_batches
+from scripts.materialize_rag2_external_hidden_oracle_labels import (
+    adaptive_question_feature_batches,
+    h0_exceeds_numerical_tolerance,
+    validate_feature_cache_contract,
+)
 
 
 def sample() -> BenchmarkSample:
@@ -67,3 +71,57 @@ def test_adaptive_hidden_batch_splits_only_the_oom_batch():
         (9, 1, 1),
         (10, 2, 2),
     ]
+
+
+def test_h0_numerical_drift_is_separate_from_semantic_cache_validation():
+    args = SimpleNamespace(
+        h0_max_abs_tolerance=0.5,
+        h0_max_relative_l2_tolerance=0.02,
+        h0_min_cosine_similarity=0.999,
+    )
+    assert h0_exceeds_numerical_tolerance(
+        max_abs=0.125,
+        max_relative_l2=0.024579,
+        min_cosine=0.99970049,
+        args=args,
+    )
+
+
+def test_feature_cache_contract_validates_prompt_model_and_counts(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    config = model / "config.json"
+    config.write_text("{}", encoding="utf-8")
+    stat = config.stat()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    manifest = {
+        "type": "rag2_mcq_eval_preanswer_hidden_features",
+        "version": "rag2_preanswer_hidden_states_v1",
+        "questions": 1,
+        "documents": 1,
+        "shards": 1,
+        "settings": {
+            "prompt_version": "rag2_fixed_direct_choice_context_v1",
+            "state_model": {
+                "path": str(model),
+                "files": [{"name": config.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}],
+                "weight_shards": [],
+            },
+            "hidden_layer": 28,
+            "hidden_max_input_tokens": 2048,
+            "hidden_dtype": "bfloat16",
+            "hidden_attn_implementation": "eager",
+        },
+    }
+    (cache / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    args = SimpleNamespace(
+        feature_cache_dir=cache,
+        model_name_or_path=model,
+        layer=28,
+        max_input_tokens=2048,
+        dtype="bfloat16",
+        attn_implementation="eager",
+    )
+    candidates = [{"candidate_documents": [{"db_id": "x", "local_id": 1}]}]
+    assert validate_feature_cache_contract(args, candidates) == manifest

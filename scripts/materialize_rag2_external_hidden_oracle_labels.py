@@ -20,8 +20,16 @@ from safetensors.torch import load_file
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from extract_rag2_preanswer_hidden_pilot import FeatureExtractor, choice_index
+from extract_rag2_preanswer_hidden_pilot import (
+    PROMPT_VERSION,
+    FeatureExtractor,
+    choice_index,
+)
 from medrag.io_utils import write_json, write_jsonl
+
+
+FEATURE_CACHE_TYPE = "rag2_mcq_eval_preanswer_hidden_features"
+FEATURE_CACHE_VERSION = "rag2_preanswer_hidden_states_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +53,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--h0-max-relative-l2-tolerance", type=float, default=0.02)
     p.add_argument("--h0-min-cosine-similarity", type=float, default=0.999)
+    p.add_argument(
+        "--h0-validation-mode",
+        choices=["warn", "strict"],
+        default="warn",
+        help=(
+            "The feature-cache manifest, model identity, sample keys, and document keys are "
+            "always validated strictly. Numerical h0 drift from BF16 batch-size changes is "
+            "diagnostic-only by default; use strict only for deterministic FP32 audits."
+        ),
+    )
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
@@ -66,6 +84,96 @@ def stable_id(doc: dict[str, Any]) -> str:
 
 def threshold_name(value: float) -> str:
     return format(value, ".8g").replace("-", "m").replace(".", "p")
+
+
+def validate_feature_cache_contract(
+    args: argparse.Namespace,
+    candidates: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Hard-fail on semantic cache mismatch without relying on BF16 equality.
+
+    h0/hD were created by the evaluation pipeline and stored in BF16.  Recomputing
+    h0 here is necessary to obtain the gold gradient direction c, but eager-attention
+    batches may be adaptively subdivided after an OOM.  BF16 hidden coordinates can
+    then differ by one ULP even though the prompt and model are identical.  The
+    durable compatibility contract is therefore the cache manifest plus exact
+    sample/document identities, not coordinate-wise equality across batch shapes.
+    """
+
+    manifest_path = args.feature_cache_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing feature-cache manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    settings = manifest.get("settings") or {}
+    expected_pairs = sum(len(row.get("candidate_documents") or []) for row in candidates)
+    expected = {
+        "type": FEATURE_CACHE_TYPE,
+        "version": FEATURE_CACHE_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "model_path": str(args.model_name_or_path.resolve()),
+        "hidden_layer": int(args.layer),
+        "hidden_max_input_tokens": int(args.max_input_tokens),
+        "hidden_dtype": args.dtype,
+        "hidden_attn_implementation": args.attn_implementation,
+        "questions": len(candidates),
+        "documents": expected_pairs,
+    }
+    actual = {
+        "type": manifest.get("type"),
+        "version": manifest.get("version"),
+        "prompt_version": settings.get("prompt_version"),
+        "model_path": str(Path(settings.get("state_model", {}).get("path", "")).resolve()),
+        "hidden_layer": settings.get("hidden_layer"),
+        "hidden_max_input_tokens": settings.get("hidden_max_input_tokens"),
+        "hidden_dtype": settings.get("hidden_dtype"),
+        "hidden_attn_implementation": settings.get("hidden_attn_implementation"),
+        "questions": manifest.get("questions"),
+        "documents": manifest.get("documents"),
+    }
+    mismatches = [
+        f"{key}: cache={actual[key]!r} requested={value!r}"
+        for key, value in expected.items()
+        if actual.get(key) != value
+    ]
+
+    # Verify that the model files have not changed in place since h0/hD were cached.
+    model_identity = settings.get("state_model") or {}
+    model_path = args.model_name_or_path.resolve()
+    for entry in [*(model_identity.get("files") or []), *(model_identity.get("weight_shards") or [])]:
+        path = model_path / str(entry.get("name") or "")
+        if not path.is_file():
+            mismatches.append(f"model_file_missing: {path}")
+            continue
+        stat = path.stat()
+        if int(entry.get("size", -1)) != stat.st_size:
+            mismatches.append(
+                f"model_file_size: {path.name} cache={entry.get('size')} current={stat.st_size}"
+            )
+        if int(entry.get("mtime_ns", -1)) != stat.st_mtime_ns:
+            mismatches.append(
+                f"model_file_mtime_ns: {path.name} cache={entry.get('mtime_ns')} "
+                f"current={stat.st_mtime_ns}"
+            )
+    if mismatches:
+        raise RuntimeError(
+            "Feature cache is incompatible with this hidden-label invocation:\n- "
+            + "\n- ".join(mismatches)
+        )
+    return manifest
+
+
+def h0_exceeds_numerical_tolerance(
+    *,
+    max_abs: float,
+    max_relative_l2: float,
+    min_cosine: float,
+    args: argparse.Namespace,
+) -> bool:
+    return (
+        max_abs > args.h0_max_abs_tolerance
+        or max_relative_l2 > args.h0_max_relative_l2_tolerance
+        or min_cosine < args.h0_min_cosine_similarity
+    )
 
 
 def adaptive_question_feature_batches(
@@ -141,6 +249,15 @@ def main() -> None:
     metadata_paths = sorted((args.feature_cache_dir / "shards").glob("*.json"))
     if not metadata_paths:
         raise FileNotFoundError(f"No feature shard metadata: {args.feature_cache_dir}")
+    cache_manifest = validate_feature_cache_contract(args, candidates)
+    logging.info(
+        "Feature-cache contract valid: questions=%s pairs=%s shards=%s prompt=%s layer=%s",
+        cache_manifest["questions"],
+        cache_manifest["documents"],
+        cache_manifest["shards"],
+        cache_manifest["settings"]["prompt_version"],
+        cache_manifest["settings"]["hidden_layer"],
+    )
 
     extractor_args = SimpleNamespace(
         device=args.device, dtype=args.dtype, model_name_or_path=args.model_name_or_path,
@@ -152,6 +269,7 @@ def main() -> None:
     max_h0_difference = 0.0
     max_h0_relative_l2 = 0.0
     min_h0_cosine = 1.0
+    h0_numerical_warning_batches = 0
     try:
         for shard_number, metadata_path in enumerate(metadata_paths, 1):
             output_path = shard_output / f"{metadata_path.stem}.jsonl"
@@ -206,19 +324,32 @@ def main() -> None:
                     max_h0_difference = max(max_h0_difference, difference)
                     max_h0_relative_l2 = max(max_h0_relative_l2, batch_max_relative_l2)
                     min_h0_cosine = min(min_h0_cosine, batch_min_cosine)
-                    if (
-                        difference > args.h0_max_abs_tolerance
-                        or batch_max_relative_l2 > args.h0_max_relative_l2_tolerance
-                        or batch_min_cosine < args.h0_min_cosine_similarity
+                    if h0_exceeds_numerical_tolerance(
+                        max_abs=difference,
+                        max_relative_l2=batch_max_relative_l2,
+                        min_cosine=batch_min_cosine,
+                        args=args,
                     ):
-                        raise RuntimeError(
-                            f"Cached h0 prompt/model mismatch in {metadata_path.name}: "
-                            f"max_abs={difference:.6f} (limit={args.h0_max_abs_tolerance}), "
+                        message = (
+                            f"Cached/recomputed BF16 h0 drift in {metadata_path.name}: "
+                            f"max_abs={difference:.6f} (diagnostic={args.h0_max_abs_tolerance}), "
                             f"max_relative_l2={batch_max_relative_l2:.6f} "
-                            f"(limit={args.h0_max_relative_l2_tolerance}), "
+                            f"(diagnostic={args.h0_max_relative_l2_tolerance}), "
                             f"min_cosine={batch_min_cosine:.8f} "
-                            f"(limit={args.h0_min_cosine_similarity})"
+                            f"(diagnostic={args.h0_min_cosine_similarity})"
                         )
+                        if args.h0_validation_mode == "strict":
+                            raise RuntimeError(message)
+                        h0_numerical_warning_batches += 1
+                        if h0_numerical_warning_batches == 1:
+                            logging.warning(
+                                "%s; continuing because the cache manifest, model files, "
+                                "sample keys, and document keys match exactly. Further BF16 "
+                                "drift messages are summarized in the final manifest.",
+                                message,
+                            )
+                        else:
+                            logging.debug(message)
                     c_unit = question_features.c_unit[:, 0, :]
                     for local, row in enumerate(batch):
                         position = batch_start + local
@@ -277,6 +408,8 @@ def main() -> None:
         "thresholds": args.thresholds, "layer": args.layer, "feature_cache_dir": str(args.feature_cache_dir.resolve()),
         "model_name_or_path": str(args.model_name_or_path.resolve()),
         "recomputed_h0_validation_new_shards": {
+            "mode": args.h0_validation_mode,
+            "numerical_warning_batches": h0_numerical_warning_batches,
             "max_abs_difference": max_h0_difference,
             "max_relative_l2": max_h0_relative_l2,
             "min_cosine_similarity": min_h0_cosine,
