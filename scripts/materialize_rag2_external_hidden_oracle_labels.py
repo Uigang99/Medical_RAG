@@ -37,7 +37,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     p.add_argument("--attn-implementation", default="eager")
-    p.add_argument("--h0-max-abs-tolerance", type=float, default=0.08)
+    p.add_argument(
+        "--h0-max-abs-tolerance",
+        type=float,
+        default=0.5,
+        help="Catastrophic per-coordinate mismatch guard; BF16 batch-size changes can differ by one ULP.",
+    )
+    p.add_argument("--h0-max-relative-l2-tolerance", type=float, default=0.02)
+    p.add_argument("--h0-min-cosine-similarity", type=float, default=0.999)
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--log-level", default="INFO")
     return p.parse_args()
@@ -143,6 +150,8 @@ def main() -> None:
     extractor = FeatureExtractor(extractor_args)
     processed = 0
     max_h0_difference = 0.0
+    max_h0_relative_l2 = 0.0
+    min_h0_cosine = 1.0
     try:
         for shard_number, metadata_path in enumerate(metadata_paths, 1):
             output_path = shard_output / f"{metadata_path.stem}.jsonl"
@@ -181,12 +190,34 @@ def main() -> None:
                 for batch_start, batch, gold, question_features in feature_batches:
                     recomputed_h0 = question_features.h0[:, 0, :]
                     comparison = cached_h0[batch_start : batch_start + len(batch)]
-                    difference = float(torch.max(torch.abs(recomputed_h0 - comparison)).item())
+                    residual = recomputed_h0 - comparison
+                    difference = float(torch.max(torch.abs(residual)).item())
+                    relative_l2 = torch.linalg.vector_norm(residual, dim=-1) / torch.linalg.vector_norm(
+                        comparison, dim=-1
+                    ).clamp_min(1e-12)
+                    cosine = torch.nn.functional.cosine_similarity(
+                        recomputed_h0,
+                        comparison,
+                        dim=-1,
+                        eps=1e-12,
+                    )
+                    batch_max_relative_l2 = float(relative_l2.max().item())
+                    batch_min_cosine = float(cosine.min().item())
                     max_h0_difference = max(max_h0_difference, difference)
-                    if difference > args.h0_max_abs_tolerance:
+                    max_h0_relative_l2 = max(max_h0_relative_l2, batch_max_relative_l2)
+                    min_h0_cosine = min(min_h0_cosine, batch_min_cosine)
+                    if (
+                        difference > args.h0_max_abs_tolerance
+                        or batch_max_relative_l2 > args.h0_max_relative_l2_tolerance
+                        or batch_min_cosine < args.h0_min_cosine_similarity
+                    ):
                         raise RuntimeError(
-                            f"Cached h0 prompt/model mismatch in {metadata_path.name}: max_abs={difference:.6f} "
-                            f"> tolerance={args.h0_max_abs_tolerance}"
+                            f"Cached h0 prompt/model mismatch in {metadata_path.name}: "
+                            f"max_abs={difference:.6f} (limit={args.h0_max_abs_tolerance}), "
+                            f"max_relative_l2={batch_max_relative_l2:.6f} "
+                            f"(limit={args.h0_max_relative_l2_tolerance}), "
+                            f"min_cosine={batch_min_cosine:.8f} "
+                            f"(limit={args.h0_min_cosine_similarity})"
                         )
                     c_unit = question_features.c_unit[:, 0, :]
                     for local, row in enumerate(batch):
@@ -244,7 +275,17 @@ def main() -> None:
     write_json(args.output_dir / "manifest.json", {
         "type": "rag2_external_hidden_oracle_labels", "questions": len(candidates), "pairs": total,
         "thresholds": args.thresholds, "layer": args.layer, "feature_cache_dir": str(args.feature_cache_dir.resolve()),
-        "model_name_or_path": str(args.model_name_or_path.resolve()), "max_recomputed_h0_abs_difference": max_h0_difference,
+        "model_name_or_path": str(args.model_name_or_path.resolve()),
+        "recomputed_h0_validation_new_shards": {
+            "max_abs_difference": max_h0_difference,
+            "max_relative_l2": max_h0_relative_l2,
+            "min_cosine_similarity": min_h0_cosine,
+            "limits": {
+                "max_abs_difference": args.h0_max_abs_tolerance,
+                "max_relative_l2": args.h0_max_relative_l2_tolerance,
+                "min_cosine_similarity": args.h0_min_cosine_similarity,
+            },
+        },
     })
 
 
