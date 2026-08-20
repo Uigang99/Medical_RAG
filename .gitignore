@@ -45,6 +45,7 @@ venv/
 # reproducible pipeline.
 /configs/
 /scripts/*
+!/scripts/analyze_rag2_hidden_score_gold_margin.py
 !/scripts/analyze_rag2_hidden_vs_terra_semantic.py
 !/scripts/analyze_rag2_label_threshold_policies.py
 !/scripts/analyze_rag2_preanswer_hidden_labels.py
@@ -99,6 +100,7 @@ venv/
 !/scripts/train_rag2_hidden_feature_filter.py
 
 /tests/*
+!/tests/test_rag2_hidden_score_gold_margin.py
 !/tests/test_rag2_codex_labeling_resilience.py
 !/tests/test_rag2_mcq.py
 !/tests/test_rag2_oracle.py
