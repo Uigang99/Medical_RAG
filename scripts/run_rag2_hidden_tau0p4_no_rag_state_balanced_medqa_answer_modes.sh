@@ -14,7 +14,9 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=1
+# Default to physical GPU 1, but honour an explicit caller selection such as
+# `CUDA_VISIBLE_DEVICES=0 bash ...` when GPU 0 is temporarily available.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
 PYTHON=/home/user/Uiheon/.venv_vllm/bin/python

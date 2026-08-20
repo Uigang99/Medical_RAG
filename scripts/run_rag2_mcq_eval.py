@@ -4122,13 +4122,25 @@ def main() -> None:
         write_outputs(args, results, details, config)
         return
 
-    embeddings = ensure_dense_query_embeddings(args, grouped, artifacts)
-    query_vectors = np.concatenate([embeddings[dataset] for dataset in args.datasets], axis=0)
     query_texts = [
         dense_query_text(args, sample, row)
         for dataset in args.datasets
         for sample, row in zip(grouped[dataset], artifacts[dataset])
     ]
+    if args.candidate_cache_source_path is not None:
+        # An explicit completed candidate cache is validated below against
+        # every sample key and exact dense-query text before its requested
+        # subset is materialised. Query vectors are never consumed on this
+        # path, so recomputing MedCPT embeddings first wastes time/VRAM and can
+        # OOM even though neither retrieval nor reranking is needed.
+        query_vectors = np.empty((len(samples), 0), dtype="float32")
+        logging.info(
+            "Explicit candidate-cache source supplied; skipping dense-query "
+            "embedding, retrieval, and reranking before exact cache validation."
+        )
+    else:
+        embeddings = ensure_dense_query_embeddings(args, grouped, artifacts)
+        query_vectors = np.concatenate([embeddings[dataset] for dataset in args.datasets], axis=0)
     initial_docs, reranked_docs, cache_dir = ensure_candidates(
         args,
         samples,
