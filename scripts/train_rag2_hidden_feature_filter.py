@@ -41,7 +41,7 @@ import torch.nn.functional as F
 import transformers as transformers_package
 from datasets import Dataset, load_dataset
 from safetensors import safe_open
-from torch.utils.data import Sampler
+from torch.utils.data import DataLoader, Sampler
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -62,7 +62,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from medrag.filtering.rag2_official import LABEL_NAMES, LABEL_TOKENS, add_label_tokens
 
 
-TRAINER_VERSION = "rag2_hidden_feature_filter_ablation_v2"
+TRAINER_VERSION = "rag2_hidden_feature_filter_ablation_v3"
 INPUT_MODES = ("text_only", "hidden_only", "text_hidden")
 LABEL_MODES = ("symmetric_neutral", "positive_vs_rest")
 TRAIN_BALANCE_MODES = ("natural", "four_group_loss", "no_rag_state_loss")
@@ -118,6 +118,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hidden-shard-cache-size", type=int, default=32)
     parser.add_argument("--prefix-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--pairwise-ranking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Add a within-question Helpful > Not Helpful ranking loss while "
+            "retaining the ordinary absolute label loss for every document. "
+            "This changes only training; inference still scores one document "
+            "at a time with the identical model input."
+        ),
+    )
+    parser.add_argument(
+        "--pairwise-loss-weight",
+        type=float,
+        default=1.0,
+        help="Fixed multiplier on the question-averaged pairwise logistic loss.",
+    )
+    parser.add_argument(
+        "--pairwise-balance-no-rag-states",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Give no-RAG-correct and no-RAG-wrong mixed-label questions equal "
+            "total mass in the pairwise term only. The absolute document loss "
+            "and its natural class prior remain unchanged."
+        ),
+    )
     parser.add_argument(
         "--train-balance-mode",
         choices=TRAIN_BALANCE_MODES,
@@ -552,11 +579,13 @@ class RAG2AblationCollator:
         input_mode: str,
         feature_store: SafeTensorFeatureStore | None,
         pad_to_multiple_of: int | None,
+        pairwise_ranking: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.input_mode = input_mode
         self.store = feature_store
         self.pad_to_multiple_of = pad_to_multiple_of
+        self.pairwise_ranking = bool(pairwise_ranking)
 
     def __call__(self, rows: Sequence[dict[str, Any]]) -> dict[str, torch.Tensor]:
         text_rows = [
@@ -575,6 +604,23 @@ class RAG2AblationCollator:
             values = torch.tensor(row["labels"], dtype=torch.long)
             labels[index, : values.numel()] = values
         batch["labels"] = labels
+        if self.pairwise_ranking:
+            question_ids: dict[tuple[int, int], int] = {}
+            group_ids: list[int] = []
+            target_ids: list[int] = []
+            state_ids: list[int] = []
+            for row in rows:
+                key = (int(row["feature_shard_index"]), int(row["feature_question_row"]))
+                if key not in question_ids:
+                    question_ids[key] = len(question_ids)
+                group_ids.append(question_ids[key])
+                target_ids.append(1 if str(row["target_name"]) == "helpful" else 0)
+                state_ids.append(
+                    0 if get_no_rag_state(row["balance_group"]) == "no_rag_correct" else 1
+                )
+            batch["pairwise_group_ids"] = torch.tensor(group_ids, dtype=torch.long)
+            batch["pairwise_target_ids"] = torch.tensor(target_ids, dtype=torch.long)
+            batch["pairwise_state_ids"] = torch.tensor(state_ids, dtype=torch.long)
         if "_sample_weight" in rows[0]:
             batch["sample_weight"] = torch.tensor(
                 [float(row["_sample_weight"]) for row in rows], dtype=torch.float32
@@ -623,9 +669,182 @@ class ShardGroupedSampler(Sampler[int]):
             yield from indices
 
 
+class QuestionGroupedBatchSampler(Sampler[list[int]]):
+    """Pack complete question groups without changing per-document inputs.
+
+    The ordinary DataLoader batch sampler can split a question at a batch
+    boundary after overlength rows are removed. Pairwise ranking would then
+    silently lose valid Helpful/Not Helpful comparisons. This sampler first
+    packs whole question groups into fixed-capacity batches within each feature
+    shard, then shuffles shard and batch order per epoch for training.
+    """
+
+    def __init__(self, dataset: Dataset, batch_size: int, seed: int) -> None:
+        self.seed = int(seed)
+        self.epoch = 0
+        self.batch_size = int(batch_size)
+        if self.batch_size < 1:
+            raise ValueError("Question-grouped batch size must be positive")
+        grouped: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
+        for index, (shard, question_row) in enumerate(
+            zip(dataset["feature_shard_index"], dataset["feature_question_row"])
+        ):
+            grouped[int(shard)][int(question_row)].append(index)
+        self.batches_by_shard: dict[int, list[list[int]]] = {}
+        for shard, questions in grouped.items():
+            batches: list[list[int]] = []
+            current: list[int] = []
+            # Largest-first packing keeps batches dense while never separating
+            # documents belonging to the same question.
+            ordered = sorted(questions.items(), key=lambda item: (-len(item[1]), item[0]))
+            for question_row, indices in ordered:
+                del question_row
+                if len(indices) > self.batch_size:
+                    raise ValueError(
+                        "per-device train batch size is smaller than a complete "
+                        f"question group: group={len(indices)} batch={self.batch_size}"
+                    )
+                if current and len(current) + len(indices) > self.batch_size:
+                    batches.append(current)
+                    current = []
+                current.extend(indices)
+            if current:
+                batches.append(current)
+            self.batches_by_shard[shard] = batches
+        self.length = sum(len(value) for value in self.batches_by_shard.values())
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        shards = list(self.batches_by_shard)
+        generator.shuffle(shards)
+        for shard in shards:
+            batches = [list(value) for value in self.batches_by_shard[shard]]
+            generator.shuffle(batches)
+            for batch in batches:
+                generator.shuffle(batch)
+                yield batch
+
+
+def summarize_pairwise_supervision(dataset: Dataset) -> dict[str, Any]:
+    """Summarize usable within-question comparisons and state weights."""
+
+    groups: dict[tuple[int, int], Counter[str]] = defaultdict(Counter)
+    states: dict[tuple[int, int], str] = {}
+    for shard, question_row, target, balance_group in zip(
+        dataset["feature_shard_index"],
+        dataset["feature_question_row"],
+        dataset["target_name"],
+        dataset["balance_group"],
+    ):
+        key = (int(shard), int(question_row))
+        groups[key][str(target)] += 1
+        state = get_no_rag_state(balance_group)
+        previous = states.setdefault(key, state)
+        if previous != state:
+            raise RuntimeError(f"Inconsistent no-RAG state inside question group {key}")
+    configurations: Counter[str] = Counter()
+    mixed_by_state: Counter[str] = Counter()
+    pair_comparisons_by_state: Counter[str] = Counter()
+    for key, counts in groups.items():
+        helpful = int(counts["helpful"])
+        not_helpful = int(counts["not helpful"])
+        if helpful and not_helpful:
+            configuration = "mixed"
+            mixed_by_state[states[key]] += 1
+            pair_comparisons_by_state[states[key]] += helpful * not_helpful
+        elif helpful:
+            configuration = "helpful_only"
+        elif not_helpful:
+            configuration = "not_helpful_only"
+        else:
+            raise RuntimeError(f"Question group without a binary target: {key}")
+        configurations[configuration] += 1
+    mixed_total = sum(mixed_by_state.values())
+    missing = [state for state in NO_RAG_STATES if mixed_by_state[state] == 0]
+    if missing:
+        raise RuntimeError(f"Pairwise ranking has no mixed-label questions for states: {missing}")
+    state_weights = {
+        state: mixed_total / (len(NO_RAG_STATES) * mixed_by_state[state])
+        for state in NO_RAG_STATES
+    }
+    return {
+        "questions": len(groups),
+        "question_label_configurations": dict(configurations),
+        "mixed_question_fraction": configurations["mixed"] / max(1, len(groups)),
+        "mixed_questions_by_no_rag_state": dict(mixed_by_state),
+        "candidate_pair_comparisons_by_no_rag_state": dict(pair_comparisons_by_state),
+        "pairwise_no_rag_state_weights": state_weights,
+    }
+
+
+def within_question_pairwise_loss(
+    utility_logits: torch.Tensor,
+    group_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    state_ids: torch.Tensor,
+    state_weights: torch.Tensor,
+) -> tuple[torch.Tensor, int, int]:
+    """Average all H>N comparisons within each question, then questions.
+
+    Each mixed-label question contributes one mean loss regardless of how many
+    Helpful x Not Helpful combinations it contains. ``state_weights`` has two
+    entries ordered as no-RAG correct/wrong and has global mean mass one.
+    """
+
+    question_losses: list[torch.Tensor] = []
+    question_weights: list[torch.Tensor] = []
+    comparison_count = 0
+    for group_id in torch.unique(group_ids):
+        mask = group_ids.eq(group_id)
+        positive = utility_logits[mask & target_ids.eq(1)]
+        negative = utility_logits[mask & target_ids.eq(0)]
+        if positive.numel() == 0 or negative.numel() == 0:
+            continue
+        differences = positive[:, None] - negative[None, :]
+        question_losses.append(F.softplus(-differences).mean())
+        comparison_count += int(differences.numel())
+        group_states = torch.unique(state_ids[mask])
+        if group_states.numel() != 1:
+            raise RuntimeError("A question group contains inconsistent no-RAG states")
+        question_weights.append(state_weights[group_states[0]])
+    if not question_losses:
+        return utility_logits.sum() * 0.0, 0, 0
+    losses = torch.stack(question_losses)
+    weights = torch.stack(question_weights).to(losses.dtype)
+    return (losses * weights).mean(), len(question_losses), comparison_count
+
+
 class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
-    def __init__(self, *args: Any, sample_weighted_loss: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        sample_weighted_loss: bool = False,
+        pairwise_ranking: bool = False,
+        pairwise_loss_weight: float = 1.0,
+        pairwise_state_weights: Sequence[float] = (1.0, 1.0),
+        helpful_token_id: int | None = None,
+        not_helpful_token_id: int | None = None,
+        **kwargs: Any,
+    ) -> None:
         self.sample_weighted_loss = bool(sample_weighted_loss)
+        self.pairwise_ranking = bool(pairwise_ranking)
+        self.pairwise_loss_weight = float(pairwise_loss_weight)
+        self.pairwise_state_weights = tuple(float(value) for value in pairwise_state_weights)
+        self.helpful_token_id = helpful_token_id
+        self.not_helpful_token_id = not_helpful_token_id
+        self._component_sums: Counter[str] = Counter()
+        self._component_steps = 0
+        if self.pairwise_ranking:
+            if self.pairwise_loss_weight <= 0:
+                raise ValueError("Pairwise loss weight must be positive when ranking is enabled")
+            if len(self.pairwise_state_weights) != len(NO_RAG_STATES):
+                raise ValueError("Expected pairwise state weights for correct and wrong states")
+            if self.helpful_token_id is None or self.not_helpful_token_id is None:
+                raise ValueError("Pairwise ranking requires both binary label token IDs")
         super().__init__(*args, **kwargs)
 
     def _get_train_sampler(self, train_dataset: Any | None = None) -> Sampler[int] | None:
@@ -633,6 +852,25 @@ class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
         if dataset is None:
             return None
         return ShardGroupedSampler(dataset, int(self.args.data_seed or self.args.seed))
+
+    def get_train_dataloader(self) -> DataLoader:
+        if not self.pairwise_ranking:
+            return super().get_train_dataloader()
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+        batch_sampler = QuestionGroupedBatchSampler(
+            self.train_dataset,
+            batch_size=int(self._train_batch_size),
+            seed=int(self.args.data_seed or self.args.seed),
+        )
+        dataloader = DataLoader(
+            self.train_dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+        return self.accelerator.prepare(dataloader)
 
     def compute_loss(
         self,
@@ -642,7 +880,10 @@ class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
         num_items_in_batch: torch.Tensor | None = None,
     ) -> Any:
         sample_weight = inputs.pop("sample_weight", None)
-        if not self.sample_weighted_loss:
+        pairwise_group_ids = inputs.pop("pairwise_group_ids", None)
+        pairwise_target_ids = inputs.pop("pairwise_target_ids", None)
+        pairwise_state_ids = inputs.pop("pairwise_state_ids", None)
+        if not self.sample_weighted_loss and not (self.pairwise_ranking and model.training):
             parent_parameters = inspect.signature(super().compute_loss).parameters
             if "num_items_in_batch" in parent_parameters:
                 return super().compute_loss(
@@ -652,23 +893,69 @@ class LocalitySeq2SeqTrainer(Seq2SeqTrainer):
                     num_items_in_batch=num_items_in_batch,
                 )
             return super().compute_loss(model, inputs, return_outputs=return_outputs)
-        if sample_weight is None:
-            sample_weight = torch.ones(inputs["labels"].shape[0], device=inputs["labels"].device)
         labels = inputs["labels"]
         outputs = model(**inputs)
         logits = outputs.logits.float()
-        token_loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
-            labels.reshape(-1),
-            reduction="none",
-            ignore_index=-100,
-        ).reshape(labels.shape)
-        valid = labels.ne(-100)
-        per_example = (token_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
-        # Dataset-level weights have mean one. Their grouping contract is
-        # recorded in the run manifest for the selected train balance mode.
-        loss = (per_example * sample_weight.to(per_example.device, dtype=per_example.dtype)).mean()
+        if self.sample_weighted_loss:
+            if sample_weight is None:
+                sample_weight = torch.ones(labels.shape[0], device=labels.device)
+            token_loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                reduction="none",
+                ignore_index=-100,
+            ).reshape(labels.shape)
+            valid = labels.ne(-100)
+            per_example = (token_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+            # Dataset-level weights have mean one. Their grouping contract is
+            # recorded in the run manifest for the selected train balance mode.
+            absolute_loss = (
+                per_example * sample_weight.to(per_example.device, dtype=per_example.dtype)
+            ).mean()
+        else:
+            absolute_loss = outputs.loss
+
+        pairwise_loss = logits.sum() * 0.0
+        mixed_questions = 0
+        comparisons = 0
+        if self.pairwise_ranking and model.training:
+            if pairwise_group_ids is None or pairwise_target_ids is None or pairwise_state_ids is None:
+                raise RuntimeError("Pairwise training batch is missing question metadata")
+            utility_logits = (
+                logits[:, 0, int(self.helpful_token_id)]
+                - logits[:, 0, int(self.not_helpful_token_id)]
+            )
+            state_weights = torch.tensor(
+                self.pairwise_state_weights,
+                dtype=utility_logits.dtype,
+                device=utility_logits.device,
+            )
+            pairwise_loss, mixed_questions, comparisons = within_question_pairwise_loss(
+                utility_logits=utility_logits,
+                group_ids=pairwise_group_ids,
+                target_ids=pairwise_target_ids,
+                state_ids=pairwise_state_ids,
+                state_weights=state_weights,
+            )
+        loss = absolute_loss + self.pairwise_loss_weight * pairwise_loss
+        if model.training and self.pairwise_ranking:
+            self._component_sums["absolute_loss"] += float(absolute_loss.detach().cpu())
+            self._component_sums["pairwise_loss"] += float(pairwise_loss.detach().cpu())
+            self._component_sums["mixed_questions"] += float(mixed_questions)
+            self._component_sums["pair_comparisons"] += float(comparisons)
+            self._component_steps += 1
         return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        if "loss" in logs and self._component_steps:
+            denominator = float(self._component_steps)
+            logs["absolute_loss"] = self._component_sums["absolute_loss"] / denominator
+            logs["pairwise_loss"] = self._component_sums["pairwise_loss"] / denominator
+            logs["mixed_questions_per_step"] = self._component_sums["mixed_questions"] / denominator
+            logs["pair_comparisons_per_step"] = self._component_sums["pair_comparisons"] / denominator
+            self._component_sums.clear()
+            self._component_steps = 0
+        super().log(logs, start_time=start_time)
 
     def _save(self, output_dir: str | None = None, state_dict: dict[str, torch.Tensor] | None = None) -> None:
         """Save custom hidden-prefix models without safetensors alias errors.
@@ -829,6 +1116,19 @@ def main() -> None:
         raise ValueError("Accumulation and shard cache sizes must be positive")
     if args.max_grad_norm < 0 or args.early_stopping_patience < 0:
         raise ValueError("Gradient norm/patience cannot be negative")
+    if args.pairwise_loss_weight < 0:
+        raise ValueError("Pairwise loss weight cannot be negative")
+    if args.pairwise_ranking and args.input_mode != "text_hidden":
+        logging.warning(
+            "Pairwise ranking is intended for text_hidden shortcut control; current mode=%s",
+            args.input_mode,
+        )
+    if args.pairwise_ranking and args.train_balance_mode != "natural":
+        logging.warning(
+            "Pairwise ranking is being combined with %s absolute-loss balancing. "
+            "The recommended controlled experiment uses --train-balance-mode natural.",
+            args.train_balance_mode,
+        )
     set_seed(args.seed)
     if args.tf32 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -851,6 +1151,20 @@ def main() -> None:
     raw = load_raw_splits(args)
     label_token_by_name = dict(zip(LABEL_NAMES, LABEL_TOKENS))
     prepared, data_report = prepare_splits(raw, tokenizer, label_token_by_name, args)
+    pairwise_report: dict[str, Any] | None = None
+    pairwise_state_weights = (1.0, 1.0)
+    if args.pairwise_ranking:
+        pairwise_report = summarize_pairwise_supervision(prepared["train"])
+        if args.pairwise_balance_no_rag_states:
+            weights = pairwise_report["pairwise_no_rag_state_weights"]
+            pairwise_state_weights = tuple(float(weights[state]) for state in NO_RAG_STATES)
+        pairwise_report["state_balancing_applied"] = args.pairwise_balance_no_rag_states
+        pairwise_report["applied_state_weights"] = dict(
+            zip(NO_RAG_STATES, pairwise_state_weights)
+        )
+        pairwise_report["absolute_loss_distribution"] = args.train_balance_mode
+        data_report["pairwise_training"] = pairwise_report
+        logging.info("Pairwise supervision: %s", json.dumps(pairwise_report, ensure_ascii=False))
     del raw
     gc.collect()
 
@@ -867,6 +1181,7 @@ def main() -> None:
             "input_mode": args.input_mode,
             "train_balance_mode": args.train_balance_mode,
             "balanced_validation": args.balanced_validation,
+            "pairwise_ranking": args.pairwise_ranking,
             "data_report": data_report,
             "sample_hidden_shapes": {"h0": list(h0.shape), "delta_h": list(delta.shape)},
             "gold_leakage_check": "c and projection score are not loaded",
@@ -896,6 +1211,7 @@ def main() -> None:
         input_mode=args.input_mode,
         feature_store=feature_store,
         pad_to_multiple_of=8 if args.bf16 or args.tf32 else None,
+        pairwise_ranking=args.pairwise_ranking,
     )
     preprocess_logits, compute_metrics = build_metrics(label_ids)
     epoch_validation = (
@@ -970,6 +1286,11 @@ def main() -> None:
         compute_metrics=compute_metrics,
         callbacks=callbacks,
         sample_weighted_loss=args.train_balance_mode != "natural",
+        pairwise_ranking=args.pairwise_ranking,
+        pairwise_loss_weight=args.pairwise_loss_weight,
+        pairwise_state_weights=pairwise_state_weights,
+        helpful_token_id=label_ids["helpful"],
+        not_helpful_token_id=label_ids["not helpful"],
     )
 
     reproduction = {
@@ -1000,6 +1321,22 @@ def main() -> None:
             ),
             "balance_group_is_model_input": False,
             "answer_transition_is_model_input": False,
+        },
+        "pairwise_training": {
+            "enabled": args.pairwise_ranking,
+            "loss": "mean_per_question softplus(-(helpful_logit - not_helpful_logit))",
+            "loss_weight": args.pairwise_loss_weight,
+            "complete_question_batching": args.pairwise_ranking,
+            "no_rag_state_balancing_in_pairwise_term_only": (
+                args.pairwise_balance_no_rag_states if args.pairwise_ranking else False
+            ),
+            "state_weights": (
+                dict(zip(NO_RAG_STATES, pairwise_state_weights))
+                if args.pairwise_ranking
+                else None
+            ),
+            "absolute_document_loss_retained_for_all_rows": True,
+            "changes_inference_input_or_decision_rule": False,
         },
         "hidden_input": {
             "included": ["h0", "delta_h=hD-h0"] if args.input_mode != "text_only" else [],
@@ -1054,6 +1391,10 @@ def main() -> None:
                 if args.balanced_validation
                 else "natural"
             ),
+            "pairwise_ranking": args.pairwise_ranking,
+            "pairwise_loss_weight": args.pairwise_loss_weight,
+            "pairwise_balance_no_rag_states": args.pairwise_balance_no_rag_states,
+            "pairwise_state_weights": dict(zip(NO_RAG_STATES, pairwise_state_weights)),
             "best_checkpoint": trainer.state.best_model_checkpoint,
             "best_metric": trainer.state.best_metric,
         },

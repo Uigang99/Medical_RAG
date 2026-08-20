@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import unittest
 
+import torch
 from datasets import Dataset
 
 from scripts.train_rag2_hidden_feature_filter import (
+    QuestionGroupedBatchSampler,
     add_no_rag_state_training_weights,
     make_no_rag_state_balanced_validation,
+    summarize_pairwise_supervision,
+    within_question_pairwise_loss,
 )
 
 
@@ -71,6 +75,90 @@ class NoRagStateBalancingTests(unittest.TestCase):
         selected_states = [value.split("__", 1)[0] for value in balanced["balance_group"]]
         self.assertEqual(selected_states.count("no_rag_correct"), 2)
         self.assertEqual(selected_states.count("no_rag_wrong"), 2)
+
+
+class PairwiseRankingTests(unittest.TestCase):
+    def test_question_batch_sampler_never_splits_a_question(self) -> None:
+        dataset = Dataset.from_dict(
+            {
+                "feature_shard_index": [0, 0, 0, 0, 0, 0, 1, 1],
+                "feature_question_row": [10, 10, 11, 11, 11, 12, 20, 20],
+            }
+        )
+        sampler = QuestionGroupedBatchSampler(dataset, batch_size=5, seed=42)
+        batches = list(iter(sampler))
+        index_to_batch = {
+            index: batch_index
+            for batch_index, batch in enumerate(batches)
+            for index in batch
+        }
+        self.assertEqual(sorted(index_to_batch), list(range(len(dataset))))
+        self.assertTrue(all(len(batch) <= 5 for batch in batches))
+        for question_row in {10, 11, 12, 20}:
+            indices = [
+                index
+                for index, value in enumerate(dataset["feature_question_row"])
+                if value == question_row
+            ]
+            self.assertEqual(len({index_to_batch[index] for index in indices}), 1)
+
+    def test_pairwise_summary_counts_mixed_and_single_label_questions(self) -> None:
+        dataset = Dataset.from_dict(
+            {
+                "feature_shard_index": [0] * 8,
+                "feature_question_row": [1, 1, 2, 2, 3, 3, 4, 4],
+                "target_name": [
+                    "helpful",
+                    "not helpful",
+                    "helpful",
+                    "helpful",
+                    "not helpful",
+                    "not helpful",
+                    "helpful",
+                    "not helpful",
+                ],
+                "balance_group": [
+                    "no_rag_correct__helpful",
+                    "no_rag_correct__not_helpful",
+                    "no_rag_correct__helpful",
+                    "no_rag_correct__helpful",
+                    "no_rag_wrong__not_helpful",
+                    "no_rag_wrong__not_helpful",
+                    "no_rag_wrong__helpful",
+                    "no_rag_wrong__not_helpful",
+                ],
+            }
+        )
+        report = summarize_pairwise_supervision(dataset)
+        self.assertEqual(
+            report["question_label_configurations"],
+            {"mixed": 2, "helpful_only": 1, "not_helpful_only": 1},
+        )
+        self.assertEqual(
+            report["mixed_questions_by_no_rag_state"],
+            {"no_rag_correct": 1, "no_rag_wrong": 1},
+        )
+        self.assertEqual(
+            report["pairwise_no_rag_state_weights"],
+            {"no_rag_correct": 1.0, "no_rag_wrong": 1.0},
+        )
+
+    def test_pairwise_loss_averages_each_question_before_state_weighting(self) -> None:
+        utility = torch.tensor([2.0, 0.0, 3.0, 0.0, 5.0])
+        groups = torch.tensor([0, 0, 1, 1, 2])
+        targets = torch.tensor([1, 0, 1, 0, 1])
+        states = torch.tensor([0, 0, 1, 1, 0])
+        weights = torch.tensor([0.5, 1.5])
+        loss, questions, comparisons = within_question_pairwise_loss(
+            utility, groups, targets, states, weights
+        )
+        expected = (
+            0.5 * torch.nn.functional.softplus(torch.tensor(-2.0))
+            + 1.5 * torch.nn.functional.softplus(torch.tensor(-3.0))
+        ) / 2.0
+        self.assertTrue(torch.allclose(loss, expected))
+        self.assertEqual(questions, 2)
+        self.assertEqual(comparisons, 2)
 
 
 if __name__ == "__main__":
