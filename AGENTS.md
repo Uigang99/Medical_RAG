@@ -29,7 +29,18 @@
 - Automatically commit a completed and verified material code change according
   to the global Git working agreements.
 - Use a `codex/<topic>` branch for major methodology changes, data-contract
-  migrations, or evaluator rewrites. Small bug fixes may remain on `main`.
-- Do not push automatically. Push only when the user explicitly asks.
+  migrations, evaluator rewrites, or experimental pipelines, and push each
+  verified coherent commit to that branch. Small isolated bug fixes,
+  documentation updates, and focused regression tests may remain on `main` and
+  be pushed directly after validation.
+- Treat the global automatic-publish policy as standing authorization for this
+  repository. Before pushing, fetch the remote, verify that the target branch
+  has not diverged, and confirm that only source code, tests, documentation, and
+  small configuration files are staged.
+- Merge a `codex/<topic>` branch into `main` automatically only after the scoped
+  implementation is complete, relevant regression tests pass, no long-running
+  experiment or result needed to validate the change is still pending, and the
+  branch contains no unrelated work. Otherwise leave the branch pushed and
+  continue its history there until those conditions are met.
 - Show runnable commands with absolute paths and preserve resumability for
   long-running generation, retrieval, attribution, and training jobs.
