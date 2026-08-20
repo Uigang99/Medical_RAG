@@ -3,14 +3,19 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import torch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from analyze_rag2_hidden_score_gold_margin import (  # noqa: E402
+    adaptive_exact_logits,
+    adaptive_question_features,
     binary_metrics,
     choice_behavior,
     group_summary,
@@ -19,6 +24,50 @@ from analyze_rag2_hidden_score_gold_margin import (  # noqa: E402
 
 
 class HiddenScoreGoldMarginTests(unittest.TestCase):
+    def test_adaptive_question_retry_releases_failed_batch_and_preserves_order(self) -> None:
+        class FakeModel:
+            def zero_grad(self, set_to_none: bool = True) -> None:
+                self.set_to_none = set_to_none
+
+        class FakeExtractor:
+            def __init__(self) -> None:
+                self.model = FakeModel()
+
+            def no_document_features(self, sequences, gold_indices):
+                if len(sequences) > 2:
+                    raise torch.OutOfMemoryError("synthetic CUDA out of memory")
+                values = torch.tensor([sequence[0] for sequence in sequences], dtype=torch.float32)
+                return SimpleNamespace(
+                    choice_logits=values[:, None].repeat(1, 4),
+                    c_norm=values[:, None],
+                )
+
+        logits, norms = adaptive_question_features(
+            FakeExtractor(),
+            [[1], [2], [3], [4]],
+            [0, 1, 2, 3],
+            description="unit-test",
+        )
+        self.assertEqual(logits[:, 0].tolist(), [1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(norms.tolist(), [1.0, 2.0, 3.0, 4.0])
+
+    def test_adaptive_exact_logit_retry_preserves_order(self) -> None:
+        extractor = SimpleNamespace(model=SimpleNamespace(zero_grad=lambda **_: None))
+
+        def fake_exact(_extractor, sequences):
+            if len(sequences) > 2:
+                raise torch.OutOfMemoryError("synthetic CUDA out of memory")
+            values = torch.tensor([sequence[0] for sequence in sequences], dtype=torch.float32)
+            return values[:, None].repeat(1, 4)
+
+        with patch("analyze_rag2_hidden_score_gold_margin.exact_choice_logits", fake_exact):
+            logits = adaptive_exact_logits(
+                extractor,
+                [[1], [2], [3], [4]],
+                description="unit-test",
+            )
+        self.assertEqual(logits[:, 0].tolist(), [1.0, 2.0, 3.0, 4.0])
+
     def test_choice_behavior_uses_gold_vs_strongest_competitor_margin(self) -> None:
         behavior = choice_behavior(np.asarray([1.0, 3.0, 2.0, -1.0]), gold_index=2)
         self.assertEqual(behavior["prediction"], "B")

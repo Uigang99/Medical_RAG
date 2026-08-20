@@ -375,27 +375,36 @@ def adaptive_exact_logits(
     *,
     description: str,
 ) -> torch.Tensor:
+    oom = False
     try:
         return exact_choice_logits(extractor, sequences)
     except BaseException as error:
-        if not is_oom(error) or len(sequences) <= 1:
+        if not is_oom(error):
             raise
-        logging.warning(
-            "%s OOM for batch=%s max_tokens=%s; retrying as two temporary micro-batches",
-            description,
-            len(sequences),
-            max(map(len, sequences)),
-        )
-        gc.collect()
-        torch.cuda.empty_cache()
-        midpoint = len(sequences) // 2
-        return torch.cat(
-            [
-                adaptive_exact_logits(extractor, sequences[:midpoint], description=description),
-                adaptive_exact_logits(extractor, sequences[midpoint:], description=description),
-            ],
-            dim=0,
-        )
+        # Leave the except block before retrying.  A live exception traceback
+        # retains the failed forward's CUDA tensors; recursively retrying from
+        # inside this block therefore makes each smaller batch inherit all
+        # previous failed allocations.
+        oom = True
+    if not oom:  # pragma: no cover - defensive; the try either returns or sets oom
+        raise RuntimeError("unreachable adaptive exact-logit state")
+    extractor.model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.cuda.empty_cache()
+    if len(sequences) <= 1:
+        raise RuntimeError(
+            f"CUDA OOM for one exact-logit prompt: {description} tokens={len(sequences[0])}"
+        ) from None
+    logging.warning(
+        "%s OOM for batch=%s max_tokens=%s; retrying as two temporary micro-batches",
+        description,
+        len(sequences),
+        max(map(len, sequences)),
+    )
+    midpoint = len(sequences) // 2
+    left = adaptive_exact_logits(extractor, sequences[:midpoint], description=description)
+    right = adaptive_exact_logits(extractor, sequences[midpoint:], description=description)
+    return torch.cat([left, right], dim=0)
 
 
 def adaptive_question_features(
@@ -405,28 +414,43 @@ def adaptive_question_features(
     *,
     description: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    oom = False
     try:
         features = extractor.no_document_features(sequences, gold_indices)
-        return features.choice_logits.float(), features.c_norm[:, 0].float()
+        logits = features.choice_logits.float()
+        c_norm = features.c_norm[:, 0].float()
+        del features
+        return logits, c_norm
     except BaseException as error:
-        if not is_oom(error) or len(sequences) <= 1:
+        if not is_oom(error):
             raise
-        logging.warning(
-            "%s OOM for batch=%s max_tokens=%s; retrying as two temporary micro-batches",
-            description,
-            len(sequences),
-            max(map(len, sequences)),
-        )
-        gc.collect()
-        torch.cuda.empty_cache()
-        midpoint = len(sequences) // 2
-        left = adaptive_question_features(
-            extractor, sequences[:midpoint], gold_indices[:midpoint], description=description
-        )
-        right = adaptive_question_features(
-            extractor, sequences[midpoint:], gold_indices[midpoint:], description=description
-        )
-        return torch.cat([left[0], right[0]], dim=0), torch.cat([left[1], right[1]], dim=0)
+        # Retry only after the exception traceback (and its partial autograd
+        # graph) has gone out of scope.  This is essential for a long outlier
+        # prompt that OOMs an otherwise safe batch.
+        oom = True
+    if not oom:  # pragma: no cover - defensive
+        raise RuntimeError("unreachable adaptive question-feature state")
+    extractor.model.zero_grad(set_to_none=True)
+    gc.collect()
+    torch.cuda.empty_cache()
+    if len(sequences) <= 1:
+        raise RuntimeError(
+            f"CUDA OOM for one no-document prompt: {description} tokens={len(sequences[0])}"
+        ) from None
+    logging.warning(
+        "%s OOM for batch=%s max_tokens=%s; retrying as two temporary micro-batches",
+        description,
+        len(sequences),
+        max(map(len, sequences)),
+    )
+    midpoint = len(sequences) // 2
+    left = adaptive_question_features(
+        extractor, sequences[:midpoint], gold_indices[:midpoint], description=description
+    )
+    right = adaptive_question_features(
+        extractor, sequences[midpoint:], gold_indices[midpoint:], description=description
+    )
+    return torch.cat([left[0], right[0]], dim=0), torch.cat([left[1], right[1]], dim=0)
 
 
 def candidate_documents(row: dict[str, Any]) -> list[dict[str, Any]]:
