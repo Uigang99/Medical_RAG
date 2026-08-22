@@ -427,6 +427,11 @@ def main() -> None:
     configure_logging(args.log_level)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+    # This environment does not ship the ``ninja`` executable required by
+    # FlashInfer's sampling JIT.  The native vLLM sampler is deterministic for
+    # the greedy settings used here and matches the rest of this project's
+    # stable generation pipelines.
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     if args.max_pairs <= 0 or args.docs_per_question <= 0:
         raise ValueError("--max-pairs and --docs-per-question must be positive")
     if args.max_pairs % 2:

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# FlashInfer sampling tries to JIT-compile through ``ninja`` during vLLM
+# warm-up.  The project environment intentionally uses vLLM's native sampler.
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
 PROJECT=/home/user/Uiheon/Medical_RAG
 PYTHON=/home/user/Uiheon/.venv_vllm/bin/python
 MODEL=/home/user/Uiheon/models/Llama-3-8B-Instruct
