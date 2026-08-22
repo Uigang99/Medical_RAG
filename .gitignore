@@ -69,8 +69,12 @@ venv/
 !/scripts/extract_rag2_preanswer_hidden_full.py
 !/scripts/extract_rag2_preanswer_hidden_multilayer_full.py
 !/scripts/extract_rag2_preanswer_hidden_pilot.py
+!/scripts/extract_rag2_anchored_layer_pilot_features.py
+!/scripts/extract_rag2_anchored_no_rag_features.py
 !/scripts/flatten_medcpt_vector_db.py
 !/scripts/generate_rag2_document_traces.py
+!/scripts/generate_rag2_anchored_layer_pilot.py
+!/scripts/generate_rag2_anchored_no_rag_train.py
 !/scripts/generate_rag2_no_rag_rationales.py
 !/scripts/label_rag2_candidates_with_codex.py
 !/scripts/materialize_rag2_preanswer_hidden_labels.py
@@ -81,6 +85,7 @@ venv/
 !/scripts/prepare_rag2_rationale_candidates.py
 !/scripts/reparse_rag2_paper_exact_answers.py
 !/scripts/run_rag2_codex_labeling_pilot.py
+!/scripts/run_rag2_anchored_train_no_rag_features.sh
 !/scripts/run_rag2_direct_choice_all_mcq_topk_sweep.sh
 !/scripts/run_rag2_hidden_tau0p4_all_mcq_answer_modes.sh
 !/scripts/run_rag2_mcq_eval.py
@@ -106,3 +111,5 @@ venv/
 !/tests/test_rag2_oracle.py
 !/tests/test_rag2_direct_choice_summary.py
 !/tests/test_rag2_preanswer_hidden_cache.py
+!/tests/test_rag2_anchored_trace.py
+!/tests/test_rag2_anchored_no_rag.py

@@ -95,3 +95,92 @@ class StageProgress:
             self._pbar.close()
         elif self.enabled and self.total > 0:
             print()
+
+
+class PipelineProgress:
+    """One stable progress line with both pipeline and active-stage status.
+
+    ``overall_initial`` allows independent, sequential processes to represent
+    their position in one logical pipeline (for example generation, artifact
+    materialization, and hidden-state extraction) without keeping both models
+    resident on the GPU at once.
+    """
+
+    def __init__(
+        self,
+        *,
+        overall_total: int,
+        overall_initial: int = 0,
+        desc: str = "Pipeline",
+        enabled: bool = True,
+    ) -> None:
+        self.overall_total = max(0, int(overall_total))
+        self.overall_done = max(0, int(overall_initial))
+        self.enabled = bool(enabled)
+        self.stage = "initializing"
+        self.stage_total = 0
+        self.stage_done = 0
+        self._stage_initial = 0
+        self.stage_started_at = time.time()
+        self._pbar = (
+            tqdm(
+                total=self.overall_total,
+                initial=min(self.overall_done, self.overall_total),
+                desc=desc,
+                unit="sample",
+                dynamic_ncols=True,
+            )
+            if tqdm and enabled
+            else None
+        )
+        self._render()
+
+    def set_stage(self, stage: str, *, total: int, initial: int = 0) -> None:
+        self.stage = str(stage)
+        self.stage_total = max(0, int(total))
+        self.stage_done = min(max(0, int(initial)), self.stage_total)
+        self._stage_initial = self.stage_done
+        self.stage_started_at = time.time()
+        self._render()
+
+    def update(self, n: int = 1) -> None:
+        value = max(0, int(n))
+        self.stage_done = min(self.stage_total, self.stage_done + value)
+        self.overall_done = min(self.overall_total, self.overall_done + value)
+        if self._pbar is not None:
+            self._pbar.update(value)
+        self._render()
+
+    def _render(self) -> None:
+        if self._pbar is None:
+            return
+        elapsed = max(1e-9, time.time() - self.stage_started_at)
+        processed = max(0, self.stage_done)
+        newly_processed = max(0, processed - self._stage_initial)
+        remaining = max(0, self.stage_total - processed)
+        stage_eta = (
+            elapsed / newly_processed * remaining
+            if newly_processed
+            else float("inf")
+        )
+        eta_text = "?" if stage_eta == float("inf") else _format_duration(stage_eta)
+        self._pbar.set_postfix_str(
+            f"stage={self.stage} {processed}/{self.stage_total} stage_eta={eta_text}",
+            refresh=False,
+        )
+
+    def close(self) -> None:
+        if self._pbar is not None:
+            self._render()
+            self._pbar.close()
+
+
+def _format_duration(seconds: float) -> str:
+    value = max(0, int(seconds))
+    hours, remainder = divmod(value, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"

@@ -243,6 +243,15 @@ def load_no_rag_protocol(source_path: Path, dataset: str, split: str) -> dict[st
 
 def retrieval_query_contract(protocol: dict[str, Any]) -> dict[str, str]:
     """Describe the query text used by this cache without conflating two protocols."""
+    if protocol.get("prompt_profile") == "paper_compatible_three_anchor":
+        return {
+            "query_field": "retrieval_query",
+            "canonicalization_version": "anchored_rationale_plus_fixed_terminal_answer_v1",
+            "query_semantics": (
+                "complete generated rationale plus the fixed terminal answer; the original MCQ "
+                "question and options are excluded"
+            ),
+        }
     if protocol.get("prompt_profile") == "paper_exact":
         return {
             "query_field": PAPER_EXACT_RETRIEVAL_QUERY_FIELD,
@@ -276,6 +285,15 @@ def resolve_rationale_query(
     if not generated:
         return None, None
     options = row.get("options") or {}
+    if protocol.get("prompt_profile") == "paper_compatible_three_anchor":
+        stored_query = str(
+            row.get("retrieval_query")
+            or ((row.get("parsed") or {}).get("rationale_query") or "")
+        ).strip()
+        answer = str(
+            ((row.get("parsed") or {}).get("final_answer") or "")
+        ).strip().upper()
+        return stored_query or None, answer or None
     if protocol.get("prompt_profile") == "paper_exact":
         # The released RAG2 prompt does not specify a response marker.  Its
         # retrieval query is consequently the unmodified visible response,
