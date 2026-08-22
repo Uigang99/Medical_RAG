@@ -476,6 +476,7 @@ def evaluate(
     device: torch.device,
     args: argparse.Namespace,
     description: str,
+    overall_progress: tqdm | None = None,
 ) -> dict[str, Any]:
     model.eval()
     predictions: list[np.ndarray] = []
@@ -484,12 +485,17 @@ def evaluate(
     sample_ids: list[str] = []
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.bf16)
     with autocast:
-        for batch in tqdm(loader, desc=description, unit="batch"):
+        iterator = loader if overall_progress is not None else tqdm(loader, desc=description, unit="batch")
+        if overall_progress is not None:
+            overall_progress.set_postfix(stage=description, refresh=True)
+        for batch in iterator:
             output = model(**move_model_inputs(batch, device))
             predictions.append(output["utility_score"].float().cpu().numpy())
             teachers.append(batch["teacher_score"].numpy())
             states.append(batch["no_rag_state"].numpy())
             sample_ids.extend(batch["sample_ids"])
+            if overall_progress is not None:
+                overall_progress.update(len(batch["pair_ids"]))
     predicted_score = np.concatenate(predictions)
     teacher_score = np.concatenate(teachers)
     state = np.concatenate(states)
@@ -760,74 +766,121 @@ def main() -> None:
         trainer_state = load_checkpoint(args.resume_from_checkpoint, model, optimizer, scheduler, objective)
         logging.info("Resumed from %s at epoch %s", args.resume_from_checkpoint, trainer_state["completed_epoch"])
 
-    for epoch in range(int(trainer_state["completed_epoch"]) + 1, args.num_train_epochs + 1):
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        rolling: Counter[str] = Counter()
-        progress = tqdm(loaders["train"], desc=f"Train:{args.dataset}:epoch{epoch}", unit="batch")
-        for batch_index, batch in enumerate(progress, start=1):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.bf16):
-                output = model(**move_model_inputs(batch, device))
-                loss, details = objective(
-                    output["utility_score"],
-                    batch["teacher_score"].to(device),
-                    batch["no_rag_state"].to(device),
-                    batch["document_to_question"].to(device),
-                    training=True,
-                )
-                scaled_loss = loss / args.gradient_accumulation_steps
-            scaled_loss.backward()
-            update = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(loaders["train"])
-            if update:
-                if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        (parameter for parameter in model.parameters() if parameter.requires_grad),
-                        args.max_grad_norm,
+    work_per_epoch = len(datasets["train"]) + len(datasets["validation"])
+    final_evaluation_work = len(datasets["validation"]) + len(datasets["test"])
+    total_work = args.num_train_epochs * work_per_epoch + final_evaluation_work
+    completed_work = int(trainer_state["completed_epoch"]) * work_per_epoch
+    overall_progress = tqdm(
+        total=total_work,
+        initial=completed_work,
+        desc=f"LatentUtilityOverall:{args.dataset}",
+        unit="pair",
+        dynamic_ncols=True,
+    )
+    try:
+        for epoch in range(int(trainer_state["completed_epoch"]) + 1, args.num_train_epochs + 1):
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            rolling: Counter[str] = Counter()
+            overall_progress.set_postfix(
+                stage=f"train epoch {epoch}/{args.num_train_epochs}",
+                epoch_batch=f"0/{len(loaders['train'])}",
+                refresh=True,
+            )
+            for batch_index, batch in enumerate(loaders["train"], start=1):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.bf16):
+                    output = model(**move_model_inputs(batch, device))
+                    loss, details = objective(
+                        output["utility_score"],
+                        batch["teacher_score"].to(device),
+                        batch["no_rag_state"].to(device),
+                        batch["document_to_question"].to(device),
+                        training=True,
                     )
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                trainer_state["global_step"] += 1
-            for key, value in details.items():
-                rolling[key] += value
-            if batch_index % args.logging_steps == 0:
-                progress.set_postfix(
-                    loss=f"{rolling['loss']/args.logging_steps:.3f}",
-                    dro=f"{objective.weights[0].item():.2f}/{objective.weights[1].item():.2f}",
-                )
-                rolling.clear()
-        validation = evaluate(model, loaders["validation"], device, args, f"Validation:{args.dataset}:epoch{epoch}")
-        metric = float(validation["selection_metric_worst_group_auroc"])
-        improved = metric > float(trainer_state["best_metric"]) + args.minimum_improvement
-        trainer_state["completed_epoch"] = epoch
-        trainer_state["history"].append({"epoch": epoch, "validation": validation, "group_dro_weights": objective.weights.detach().cpu().tolist()})
-        if improved:
-            trainer_state["best_metric"] = metric
-            trainer_state["best_epoch"] = epoch
-            trainer_state["epochs_without_improvement"] = 0
-            model.save_trainable(output_dir / "best_model")
-            atomic_json(output_dir / "best_model" / "validation_metrics.json", validation)
-        else:
-            trainer_state["epochs_without_improvement"] += 1
-        save_checkpoint(output_dir / "last_checkpoint", model, optimizer, scheduler, objective, trainer_state)
-        atomic_json(output_dir / "training_history.json", trainer_state)
-        logging.info(
-            "Epoch %d: robust_auc=%.4f C=%.4f W=%.4f macro_f1=%.4f best_epoch=%s",
-            epoch,
-            metric,
-            validation["no_rag_correct"]["auroc"],
-            validation["no_rag_wrong"]["auroc"],
-            validation["overall"]["macro_f1"],
-            trainer_state["best_epoch"],
-        )
-        if trainer_state["epochs_without_improvement"] >= args.early_stopping_patience > 0:
-            logging.info("Early stopping after %d epochs without robust-AUROC improvement", trainer_state["epochs_without_improvement"])
-            break
+                    scaled_loss = loss / args.gradient_accumulation_steps
+                scaled_loss.backward()
+                update = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(loaders["train"])
+                if update:
+                    if args.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            (parameter for parameter in model.parameters() if parameter.requires_grad),
+                            args.max_grad_norm,
+                        )
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    trainer_state["global_step"] += 1
+                for key, value in details.items():
+                    rolling[key] += value
+                overall_progress.update(len(batch["pair_ids"]))
+                if batch_index % args.logging_steps == 0:
+                    overall_progress.set_postfix(
+                        stage=f"train epoch {epoch}/{args.num_train_epochs}",
+                        epoch_batch=f"{batch_index}/{len(loaders['train'])}",
+                        loss=f"{rolling['loss']/args.logging_steps:.3f}",
+                        dro=f"{objective.weights[0].item():.2f}/{objective.weights[1].item():.2f}",
+                        refresh=True,
+                    )
+                    rolling.clear()
+            validation = evaluate(
+                model,
+                loaders["validation"],
+                device,
+                args,
+                f"validation epoch {epoch}/{args.num_train_epochs}",
+                overall_progress=overall_progress,
+            )
+            metric = float(validation["selection_metric_worst_group_auroc"])
+            improved = metric > float(trainer_state["best_metric"]) + args.minimum_improvement
+            trainer_state["completed_epoch"] = epoch
+            trainer_state["history"].append({"epoch": epoch, "validation": validation, "group_dro_weights": objective.weights.detach().cpu().tolist()})
+            if improved:
+                trainer_state["best_metric"] = metric
+                trainer_state["best_epoch"] = epoch
+                trainer_state["epochs_without_improvement"] = 0
+                model.save_trainable(output_dir / "best_model")
+                atomic_json(output_dir / "best_model" / "validation_metrics.json", validation)
+            else:
+                trainer_state["epochs_without_improvement"] += 1
+            save_checkpoint(output_dir / "last_checkpoint", model, optimizer, scheduler, objective, trainer_state)
+            atomic_json(output_dir / "training_history.json", trainer_state)
+            logging.info(
+                "Epoch %d: robust_auc=%.4f C=%.4f W=%.4f macro_f1=%.4f best_epoch=%s",
+                epoch,
+                metric,
+                validation["no_rag_correct"]["auroc"],
+                validation["no_rag_wrong"]["auroc"],
+                validation["overall"]["macro_f1"],
+                trainer_state["best_epoch"],
+            )
+            if trainer_state["epochs_without_improvement"] >= args.early_stopping_patience > 0:
+                logging.info("Early stopping after %d epochs without robust-AUROC improvement", trainer_state["epochs_without_improvement"])
+                # Remove work belonging to epochs that early stopping skipped;
+                # the final best-model validation/test still remains.
+                overall_progress.total = overall_progress.n + final_evaluation_work
+                overall_progress.refresh()
+                break
 
-    best_weights = torch.load(output_dir / "best_model" / "trainable_model.bin", map_location="cpu", weights_only=True)
-    model.load_state_dict(best_weights, strict=False)
-    validation_best = evaluate(model, loaders["validation"], device, args, "ValidationBest")
-    test_best = evaluate(model, loaders["test"], device, args, "TestBest")
+        best_weights = torch.load(output_dir / "best_model" / "trainable_model.bin", map_location="cpu", weights_only=True)
+        model.load_state_dict(best_weights, strict=False)
+        validation_best = evaluate(
+            model,
+            loaders["validation"],
+            device,
+            args,
+            "final best-model validation",
+            overall_progress=overall_progress,
+        )
+        test_best = evaluate(
+            model,
+            loaders["test"],
+            device,
+            args,
+            "final best-model test",
+            overall_progress=overall_progress,
+        )
+    finally:
+        overall_progress.close()
     final_dir = output_dir / "final_model"
     model.save_trainable(final_dir)
     tokenizer.save_pretrained(final_dir)
