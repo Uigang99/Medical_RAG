@@ -130,6 +130,7 @@ class PipelineProgress:
         self.overall_done = max(0, int(overall_initial))
         self.enabled = bool(enabled)
         self.stage = "initializing"
+        self.detail = ""
         self.stage_total = 0
         self.stage_done = 0
         self._stage_initial = 0
@@ -149,10 +150,15 @@ class PipelineProgress:
 
     def set_stage(self, stage: str, *, total: int, initial: int = 0) -> None:
         self.stage = str(stage)
+        self.detail = ""
         self.stage_total = max(0, int(total))
         self.stage_done = min(max(0, int(initial)), self.stage_total)
         self._stage_initial = self.stage_done
         self.stage_started_at = time.time()
+        self._render()
+
+    def set_detail(self, detail: str) -> None:
+        self.detail = str(detail)
         self._render()
 
     def update(self, n: int = 1) -> None:
@@ -177,7 +183,8 @@ class PipelineProgress:
         )
         eta_text = "?" if stage_eta == float("inf") else _format_duration(stage_eta)
         self._pbar.set_postfix_str(
-            f"stage={self.stage} {processed}/{self.stage_total} stage_eta={eta_text}",
+            f"stage={self.stage} {processed}/{self.stage_total} "
+            f"stage_eta={eta_text}{f' {self.detail}' if self.detail else ''}",
             refresh=False,
         )
 
