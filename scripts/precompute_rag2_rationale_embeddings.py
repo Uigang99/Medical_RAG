@@ -347,6 +347,12 @@ def row_validation_reasons(
         reasons.append("generation_policy_version_mismatch")
     rationale_query, reparsed_answer = resolve_rationale_query(row, protocol)
     rationale_query = " ".join(str(rationale_query or "").split())
+    if protocol.get("prompt_profile") == "paper_compatible_three_anchor":
+        rationale = str(parsed.get("rationale") or "").strip()
+        if not rationale:
+            reasons.append("missing_rationale")
+        if "Rationale:" in rationale or "### END OF REASONING ###" in rationale:
+            reasons.append("anchored_control_marker_leak")
     if not rationale_query:
         reasons.append("missing_rationale_query")
     if not parsed.get("final_answer"):

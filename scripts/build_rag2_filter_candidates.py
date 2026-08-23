@@ -55,6 +55,10 @@ CANONICAL_RATIONALE_QUERY_FIELD = "reparsed(no_rag_generation).rationale_query"
 RETRIEVAL_QUERY_CANONICALIZATION_VERSION = "rationale_only_plus_single_canonical_answer_v3"
 PAPER_EXACT_RATIONALE_QUERY_FIELD = "parsed.rationale_query(raw_visible_response)"
 PAPER_EXACT_RETRIEVAL_QUERY_CANONICALIZATION_VERSION = "raw_visible_response_no_rewrite_v1"
+ANCHORED_RATIONALE_QUERY_FIELD = "retrieval_query"
+ANCHORED_RETRIEVAL_QUERY_CANONICALIZATION_VERSION = (
+    "anchored_rationale_plus_fixed_terminal_answer_v1"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -208,15 +212,18 @@ def validate_configuration(args: argparse.Namespace) -> None:
 
 
 def validate_query_cache_manifest(manifest: dict[str, Any], dataset: str, split: str) -> None:
-    paper_exact = manifest.get("prompt_profile") == "paper_exact"
-    expected_query_field = (
-        PAPER_EXACT_RATIONALE_QUERY_FIELD if paper_exact else CANONICAL_RATIONALE_QUERY_FIELD
-    )
-    expected_canonicalization = (
-        PAPER_EXACT_RETRIEVAL_QUERY_CANONICALIZATION_VERSION
-        if paper_exact
-        else RETRIEVAL_QUERY_CANONICALIZATION_VERSION
-    )
+    profile = manifest.get("prompt_profile")
+    paper_exact = profile == "paper_exact"
+    anchored = profile == "paper_compatible_three_anchor"
+    if anchored:
+        expected_query_field = ANCHORED_RATIONALE_QUERY_FIELD
+        expected_canonicalization = ANCHORED_RETRIEVAL_QUERY_CANONICALIZATION_VERSION
+    elif paper_exact:
+        expected_query_field = PAPER_EXACT_RATIONALE_QUERY_FIELD
+        expected_canonicalization = PAPER_EXACT_RETRIEVAL_QUERY_CANONICALIZATION_VERSION
+    else:
+        expected_query_field = CANONICAL_RATIONALE_QUERY_FIELD
+        expected_canonicalization = RETRIEVAL_QUERY_CANONICALIZATION_VERSION
     expected = {
         "dataset": dataset,
         "split": split,
@@ -232,7 +239,11 @@ def validate_query_cache_manifest(manifest: dict[str, Any], dataset: str, split:
             "expected": True,
             "actual": manifest.get("query_includes_answer_conclusion"),
         }
-    allowed_quality_policies = {"technical", "conservative"} if paper_exact else {"conservative"}
+    allowed_quality_policies = (
+        {"technical", "conservative"}
+        if paper_exact or anchored
+        else {"conservative"}
+    )
     if manifest.get("quality_policy") not in allowed_quality_policies:
         mismatches["quality_policy"] = {
             "expected": sorted(allowed_quality_policies),
@@ -566,13 +577,26 @@ def build_source_sequential_hits(
     bucket_sources = {str(spec["bucket_id"]): str(spec["source"]) for spec in bucket_specs}
     bucket_order = [str(spec["bucket_id"]) for spec in bucket_specs]
     hits_by_source: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    progress = StageProgress(total=len(sample_indices) * len(bucket_specs), desc="DenseRetrieval", enabled=True)
+    physical_shard_passes = sum(
+        len(retriever._indexes[source]._shards)
+        if retriever._indexes[source]._is_sharded
+        else 1
+        for source in args.sources
+    )
+    progress = StageProgress(
+        total=len(sample_indices) * physical_shard_passes,
+        desc="DenseRetrieval",
+        enabled=True,
+    )
     selected_vectors = np.ascontiguousarray(query_vectors[sample_indices], dtype="float32")
 
     try:
         for source in args.sources:
             source_store = retriever._indexes[source]
             rows = int(source_store.rows)
+            physical_shard_count = (
+                len(source_store._shards) if source_store._is_sharded else 1
+            )
             local_top_k = min(per_source_top_k, rows)
             source_specs = [spec for spec in bucket_specs if spec["source"] == source]
             bucket_state: dict[str, tuple[np.ndarray, np.ndarray]] = {
@@ -608,7 +632,10 @@ def build_source_sequential_hits(
                     raise RuntimeError(
                         f"No retrieval bucket assigned to {source} physical shard {physical_shard_id}."
                     )
-                logging.info(
+                progress.set_detail(
+                    f"source={source} shard={physical_shard_id + 1}/{physical_shard_count}"
+                )
+                logging.debug(
                     "[%s] physical shard %s: rows=%s; transferring to FAISS-GPU "
                     "(add_batch=%s, search_batch=%s)",
                     source,
@@ -624,7 +651,7 @@ def build_source_sequential_hits(
                     resource,
                 )
                 try:
-                    logging.info(
+                    logging.debug(
                         "[%s] physical shard %s: GPU index ready; exact-searching %s query vectors.",
                         source,
                         physical_shard_id + 1,
@@ -661,10 +688,10 @@ def build_source_sequential_hits(
                         source_store.unload_index()
 
                 completed_rows += shard_rows
+                progress.update(len(sample_indices))
             for spec in source_specs:
                 bucket_id = str(spec["bucket_id"])
                 hits_by_source[bucket_id] = bucket_state[bucket_id]
-                progress.update(len(sample_indices))
             logging.info("[%s] retrieval complete across physical shard(s): buckets=%s", source, len(source_specs))
     finally:
         progress.close()

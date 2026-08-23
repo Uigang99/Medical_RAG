@@ -58,6 +58,7 @@ class StageProgress:
         self.desc = desc
         self.enabled = bool(enabled)
         self.done = 0
+        self.detail = ""
         self.started_at = time.time()
         self._last_render = 0.0
         self._pbar = (
@@ -71,7 +72,10 @@ class StageProgress:
         self.done += n
         if self._pbar is not None:
             elapsed = time.time() - self.started_at
-            self._pbar.set_postfix_str(f"elapsed={elapsed:.1f}s", refresh=False)
+            detail = f" {self.detail}" if self.detail else ""
+            self._pbar.set_postfix_str(
+                f"elapsed={elapsed:.1f}s{detail}", refresh=False
+            )
             self._pbar.update(n)
             return
         if not self.enabled or self.total <= 0:
@@ -89,6 +93,14 @@ class StageProgress:
             end="",
             flush=True,
         )
+
+    def set_detail(self, detail: str) -> None:
+        self.detail = str(detail)
+        if self._pbar is not None:
+            elapsed = time.time() - self.started_at
+            self._pbar.set_postfix_str(
+                f"elapsed={elapsed:.1f}s {self.detail}", refresh=False
+            )
 
     def close(self) -> None:
         if self._pbar is not None:

@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -223,6 +224,19 @@ def run_command(command: list[str], dry_run: bool) -> None:
         subprocess.run(command, cwd=WORKSPACE_ROOT, env=os.environ.copy(), check=True)
 
 
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{secs:d}s"
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -250,10 +264,36 @@ def main() -> None:
         ",".join(args.stages),
         len(commands),
     )
+    pipeline_started = time.monotonic()
     for index, (name, command) in enumerate(commands, start=1):
-        logging.info("[%s/%s] Starting %s", index, len(commands), name)
+        completed = index - 1
+        elapsed = time.monotonic() - pipeline_started
+        estimated_remaining = (
+            elapsed / completed * (len(commands) - completed)
+            if completed > 0
+            else None
+        )
+        logging.info(
+            "Pipeline %s/%s (%.1f%%) | current=%s | elapsed=%s | overall ETA=%s",
+            completed,
+            len(commands),
+            100.0 * completed / max(len(commands), 1),
+            name,
+            format_duration(elapsed),
+            format_duration(estimated_remaining),
+        )
         run_command(command, args.dry_run)
-        logging.info("[%s/%s] Finished %s", index, len(commands), name)
+        elapsed = time.monotonic() - pipeline_started
+        estimated_remaining = elapsed / index * (len(commands) - index)
+        logging.info(
+            "Pipeline %s/%s (%.1f%%) | finished=%s | elapsed=%s | overall ETA=%s",
+            index,
+            len(commands),
+            100.0 * index / max(len(commands), 1),
+            name,
+            format_duration(elapsed),
+            format_duration(estimated_remaining),
+        )
 
 
 if __name__ == "__main__":
