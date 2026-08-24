@@ -131,6 +131,21 @@ def parse_args() -> argparse.Namespace:
             "are excluded once, rather than converted into overlapping overflow windows."
         ),
     )
+    parser.add_argument(
+        "--overlength-policy",
+        choices=("drop", "overflow"),
+        default="drop",
+        help=(
+            "'drop' preserves the local one-pair/one-feature protocol. 'overflow' reproduces "
+            "the released RAG2 classifier preprocessing by creating overlapping features."
+        ),
+    )
+    parser.add_argument(
+        "--doc-stride",
+        type=int,
+        default=128,
+        help="Overlap between encoder features when --overlength-policy=overflow.",
+    )
     parser.add_argument("--max-target-length", type=int, default=30)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-steps", type=int, default=0)
@@ -528,7 +543,10 @@ def filter_overlength_inputs(
         map_kwargs["num_proc"] = args.preprocessing_num_workers
     measured = dataset.map(add_input_lengths, **map_kwargs)
     lengths = measured["_filter_input_length"]
-    keep_mask = [length <= args.max_seq_length for length in lengths]
+    keep_mask = [
+        True if args.overlength_policy == "overflow" else length <= args.max_seq_length
+        for length in lengths
+    ]
 
     def count_by(columns: tuple[str, ...], *, kept: bool) -> dict[str, int]:
         # Document-level rows use ``source`` while the independently labeled
@@ -552,7 +570,10 @@ def filter_overlength_inputs(
     }
     if args.preprocessing_num_workers > 1:
         filter_kwargs["num_proc"] = args.preprocessing_num_workers
-    filtered = measured.filter(lambda length: length <= args.max_seq_length, **filter_kwargs)
+    if args.overlength_policy == "overflow":
+        filtered = measured
+    else:
+        filtered = measured.filter(lambda length: length <= args.max_seq_length, **filter_kwargs)
     source_column = (
         "source"
         if "source" in measured.column_names
@@ -562,8 +583,13 @@ def filter_overlength_inputs(
     )
     stats = {
         "split": split_name,
-        "policy": "drop_overlength_once_no_overflow_windows",
+        "policy": (
+            "released_rag2_overflow_windows"
+            if args.overlength_policy == "overflow"
+            else "drop_overlength_once_no_overflow_windows"
+        ),
         "max_seq_length": args.max_seq_length,
+        "doc_stride": args.doc_stride if args.overlength_policy == "overflow" else None,
         "rows_before": len(measured),
         "rows_kept": len(filtered),
         "rows_dropped": len(measured) - len(filtered),
@@ -602,8 +628,20 @@ def tokenize_split(
 ) -> Dataset:
     def preprocess(examples: dict[str, list[Any]]) -> dict[str, Any]:
         targets = [label_tokens_by_name[normalize_training_label(value)] for value in examples["target"]]
-        # Length filtering has already guaranteed one complete pair per feature.
-        model_inputs = tokenizer(examples["_filter_input"], truncation=False, padding=False)
+        if args.overlength_policy == "overflow":
+            model_inputs = tokenizer(
+                examples["_filter_input"],
+                max_length=args.max_seq_length,
+                truncation=True,
+                stride=args.doc_stride,
+                return_overflowing_tokens=True,
+                padding=False,
+            )
+            sample_mapping = model_inputs.pop("overflow_to_sample_mapping")
+            targets = [targets[int(sample_index)] for sample_index in sample_mapping]
+        else:
+            # Length filtering has already guaranteed one complete pair per feature.
+            model_inputs = tokenizer(examples["_filter_input"], truncation=False, padding=False)
         target_tokens = tokenizer(
             text_target=targets,
             max_length=args.max_target_length,
@@ -613,13 +651,14 @@ def tokenize_split(
         model_inputs["labels"] = target_tokens
         return model_inputs
 
-    return dataset.map(
-        preprocess,
-        batched=True,
-        num_proc=args.preprocessing_num_workers,
-        remove_columns=dataset.column_names,
-        desc=f"Tokenizing {split_name} with official RAG2 format",
-    )
+    map_kwargs: dict[str, Any] = {
+        "batched": True,
+        "remove_columns": dataset.column_names,
+        "desc": f"Tokenizing {split_name} with official RAG2 format",
+    }
+    if args.preprocessing_num_workers > 1:
+        map_kwargs["num_proc"] = args.preprocessing_num_workers
+    return dataset.map(preprocess, **map_kwargs)
 
 
 def build_metric_functions(label_ids: dict[str, int], label_names: tuple[str, ...]):
@@ -693,6 +732,8 @@ def main() -> None:
         raise ValueError("--gradient-accumulation-steps must be at least 1")
     if args.max_grad_norm < 0:
         raise ValueError("--max-grad-norm must be non-negative")
+    if args.doc_stride < 0 or args.doc_stride >= args.max_seq_length:
+        raise ValueError("--doc-stride must be non-negative and smaller than --max-seq-length")
     if args.validation_interval_steps is not None:
         if not args.eval_each_epoch:
             raise ValueError("--validation-interval-steps requires --eval-each-epoch")
@@ -716,6 +757,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
     logging.info("Output directory: %s", output_dir)
 
+    logging.info("Workflow stage 1/5: loading paper-style train/validation/test splits")
     train_raw, validation_raw, test_raw, split_paths, rationale_join = load_splits(args)
     label_names, label_tokens = training_label_spec(args.label_mode)
     allowed_labels = set(label_names)
@@ -759,10 +801,13 @@ def main() -> None:
     tokenizer.model_max_length = args.max_seq_length
     logging.info("Added %s filter label tokens: %s", args.label_mode, label_ids)
     logging.info(
-        "Local encoder-length policy: max=%s, one complete pair per feature, no overflow windows",
+        "Encoder-length policy: mode=%s max=%s stride=%s",
+        args.overlength_policy,
         args.max_seq_length,
+        args.doc_stride if args.overlength_policy == "overflow" else "disabled",
     )
 
+    logging.info("Workflow stage 2/5: measuring encoder lengths and applying %s policy", args.overlength_policy)
     train_filtered, train_length_stats = filter_overlength_inputs(
         train_raw,
         tokenizer,
@@ -782,6 +827,7 @@ def main() -> None:
         "test",
     )
 
+    logging.info("Workflow stage 3/5: tokenizing classifier features (progress/ETA shown per split)")
     train = tokenize_split(
         train_filtered,
         tokenizer,
@@ -937,7 +983,11 @@ def main() -> None:
                 else "official evidence-then-question template"
             ),
             "max_seq_length": args.max_seq_length,
-            "overlength_policy": "exclude each >max_seq_length question-document pair; do not truncate or create overflow windows",
+            "overlength_policy": (
+                f"released RAG2 overflow features at max_seq_length with stride={args.doc_stride}"
+                if args.overlength_policy == "overflow"
+                else "exclude each >max_seq_length question-document pair; do not truncate or create overflow windows"
+            ),
             "validation": (
                 "one complete feature per retained question-document pair every "
                 f"{args.validation_interval_steps} optimizer steps"
@@ -955,7 +1005,11 @@ def main() -> None:
                 else "disabled because epoch validation is disabled"
             ),
             "test": "one complete feature per retained question-document pair, evaluated once using the best validation checkpoint",
-            "training_windows": "disabled",
+            "training_windows": (
+                f"enabled with released overflow preprocessing and stride={args.doc_stride}"
+                if args.overlength_policy == "overflow"
+                else "disabled"
+            ),
         },
         "input_length_filtering": {
             "train": train_length_stats,
@@ -1000,6 +1054,10 @@ def main() -> None:
     trainer = Seq2SeqTrainer(
         **trainer_kwargs,
     )
+    logging.info(
+        "Workflow stage 4/5: training for up to %.3f epochs; Trainer progress shows total steps and ETA",
+        args.num_train_epochs,
+    )
     train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     final_model_dir = output_dir / "final_model"
@@ -1013,6 +1071,7 @@ def main() -> None:
     if args.eval_each_epoch and not best_checkpoint:
         raise RuntimeError("No validation checkpoint was selected; cannot perform best-checkpoint test evaluation.")
     if args.evaluate_final_model:
+        logging.info("Workflow stage 5/5: evaluating validation and test with the validation-selected checkpoint")
         assert validation is not None and test is not None
         # ``load_best_model_at_end`` has already restored this checkpoint into
         # ``trainer.model``.  Both final evaluations therefore use the exact
