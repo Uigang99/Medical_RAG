@@ -221,6 +221,7 @@ def compact_trace(trace: dict[str, Any], source: dict[str, Any]) -> dict[str, An
         {
             "run_version": RUN_VERSION,
             "stage": "rag2_anchored_independent_with_document",
+            "split": str(source.get("split") or trace.get("split") or "train"),
             "row_idx": int(source["row_idx"]),
             "doc_rank": int(document["rerank_rank"]),
             "pair_id": str(document["pair_id"]),

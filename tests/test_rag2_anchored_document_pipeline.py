@@ -7,12 +7,16 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
+import torch
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from extract_rag2_anchored_document_features import (  # noqa: E402
     estimate_storage,
+    feature_paths,
+    process_shard,
     validate_no_rag_contract,
 )
 from generate_rag2_anchored_document_traces import (  # noqa: E402
@@ -96,7 +100,7 @@ class AnchoredDocumentPipelineTests(unittest.TestCase):
             root = Path(directory)
             paths = shard_paths(root, "medqa", "train", 0)
             paths["root"].mkdir(parents=True)
-            source = {"row_idx": 4}
+            source = {"row_idx": 4, "split": "train"}
             trace = {
                 "pilot_version": "pilot",
                 "document": {
@@ -109,6 +113,7 @@ class AnchoredDocumentPipelineTests(unittest.TestCase):
             self.assertNotIn("pilot_version", compact)
             self.assertNotIn("text", compact["document"])
             self.assertEqual(compact["pair_id"], "sample::1::doc")
+            self.assertEqual(compact["split"], "train")
             paths["pairs"].write_text("{}\n", encoding="utf-8")
             paths["complete"].write_text(
                 json.dumps(
@@ -122,6 +127,58 @@ class AnchoredDocumentPipelineTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertTrue(valid_complete(paths, 1, 8))
+
+    def test_feature_extraction_accepts_legacy_trace_without_split(self) -> None:
+        class FakeEncoding:
+            input_ids = [1, 2, 3]
+            anchor_indices = {"pre_rationale": 0, "post_rationale": 1, "pre_choice": 2}
+            anchor_token_ids = {"pre_rationale": 1, "post_rationale": 2, "pre_choice": 3}
+            anchor_token_text = {"pre_rationale": "a", "post_rationale": "b", "pre_choice": "c"}
+
+        class FakeExtractor:
+            layer_names = ["block_04"]
+
+            def extract(self, rows):
+                count = len(rows)
+                probabilities = torch.tensor([[0.1, 0.7, 0.1, 0.1]]).repeat(count, 1)
+                return (
+                    {
+                        "anchor_hidden": torch.zeros(count, 1, 3, 4),
+                        "choice_logits": torch.log(probabilities),
+                        "choice_probabilities": probabilities,
+                    },
+                    [FakeEncoding() for _ in rows],
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace_path = root / "legacy_pairs.jsonl"
+            trace_path.write_text(
+                json.dumps(
+                    {
+                        "trace_version": "rag2_anchored_rationale_answer_v1",
+                        "dataset": "medqa",
+                        "sample_id": "medqa:train:000001",
+                        "pair_id": "medqa:train:000001::1::doc",
+                        "row_idx": 1,
+                        "doc_rank": 1,
+                        "document": {"source": "pubmed", "stable_id": "doc"},
+                        "document_text_used": "Evidence.",
+                        "gold_answer": "B",
+                        "answer": "B",
+                        "answer_correct": True,
+                        "rationale_stats": {"ppl": 1.2},
+                        "quality_flags": [],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = Namespace(batch_size=8, layers=[4], split="train")
+            paths = feature_paths(root, "medqa", "train", "shard_00000")
+            self.assertEqual(process_shard(args, FakeExtractor(), trace_path, paths), 1)
+            metadata = json.loads(paths["meta"].read_text(encoding="utf-8"))
+            self.assertEqual(metadata["split"], "train")
 
     def test_no_rag_layer_contract_and_storage_estimate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

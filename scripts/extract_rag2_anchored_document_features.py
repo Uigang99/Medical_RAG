@@ -174,7 +174,11 @@ def process_shard(
                         "run_version": RUN_VERSION,
                         "trace_version": row["trace_version"],
                         "dataset": row["dataset"],
-                        "split": row["split"],
+                        # Traces produced before the split field was added are
+                        # still valid.  The extractor already receives the
+                        # immutable split as an explicit run argument, so use
+                        # it as the backward-compatible source of truth.
+                        "split": str(row.get("split") or args.split),
                         "sample_id": row["sample_id"],
                         "pair_id": row["pair_id"],
                         "row_idx": int(row["row_idx"]),
