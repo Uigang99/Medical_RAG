@@ -51,7 +51,7 @@ exec "${PYTHON_BIN}" \
   --metric-for-best-model accuracy \
   --eval-each-epoch \
   --evaluate-final-model \
-  --save-total-limit "${EPOCHS}" \
+  --save-total-limit 2 \
   --preprocessing-num-workers 16 \
   --dataloader-num-workers 16 \
   --dataloader-prefetch-factor 4 \

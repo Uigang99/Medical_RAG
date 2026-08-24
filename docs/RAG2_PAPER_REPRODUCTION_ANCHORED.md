@@ -61,8 +61,10 @@ reducing repeated passes preserves source and transition diversity:
 
 These values are also consistent with the best regions in previous local
 curves: roughly 1-6 epochs for 500k-600k-pair MedMCQA runs and about 12 epochs
-for 25k-33k-pair MedQA runs.  Every epoch checkpoint is retained, so the final
-test uses the best validation checkpoint rather than necessarily the last one.
+for 25k-33k-pair MedQA runs.  Every epoch is evaluated.  Disk retention is
+limited to two checkpoints (the validation-selected best checkpoint is always
+preserved), and the final test therefore uses the best validation checkpoint
+rather than necessarily the last one.
 
 ## Commands
 
