@@ -84,12 +84,14 @@ venv/
 !/scripts/monitor_rag2_codex_semantic_labels.py
 !/scripts/precompute_rag2_rationale_embeddings.py
 !/scripts/prepare_rag2_cpg_textbooks_paper128.py
+!/scripts/prepare_rag2_anchored_dynamic_oracle_candidates.py
 !/scripts/prepare_rag2_rationale_candidates.py
 !/scripts/reparse_rag2_paper_exact_answers.py
 !/scripts/run_rag2_codex_labeling_pilot.py
 !/scripts/run_rag2_anchored_train_no_rag_features.sh
 !/scripts/run_rag2_anchored_train_document_traces_features.sh
 !/scripts/run_rag2_anchored_train_retrieval_rerank.sh
+!/scripts/run_rag2_anchored_paper_balanced_dynamic_oracle.sh
 !/scripts/run_rag2_direct_choice_all_mcq_topk_sweep.sh
 !/scripts/run_rag2_hidden_tau0p4_all_mcq_answer_modes.sh
 !/scripts/run_rag2_mcq_eval.py
@@ -107,6 +109,7 @@ venv/
 !/scripts/summarize_rag2_hidden_tau0p4_answer_modes.py
 !/scripts/train_rag2_filter_model_paper.py
 !/scripts/train_rag2_hidden_feature_filter.py
+!/scripts/materialize_rag2_anchored_external_oracle_labels.py
 
 /tests/*
 !/tests/test_rag2_hidden_score_gold_margin.py

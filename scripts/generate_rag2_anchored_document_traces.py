@@ -48,15 +48,35 @@ DEFAULT_CANDIDATE_ROOT = (
     / "datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
     / "candidates/source_balanced32_rerank8_v1"
 )
+SUPPORTED_DATASETS = (
+    "medmcqa",
+    "medqa",
+    "mmlu_anatomy",
+    "mmlu_clinical_knowledge",
+    "mmlu_college_biology",
+    "mmlu_college_medicine",
+    "mmlu_medical_genetics",
+    "mmlu_professional_medicine",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--datasets", nargs="+", choices=["medmcqa", "medqa"], default=["medmcqa", "medqa"])
+    parser.add_argument("--datasets", nargs="+", choices=SUPPORTED_DATASETS, default=["medmcqa", "medqa"])
     parser.add_argument("--split", default="train")
     parser.add_argument("--candidate-root", type=Path, default=DEFAULT_CANDIDATE_ROOT)
     parser.add_argument("--candidate-file", default="candidates_top8.jsonl")
     parser.add_argument("--docs-per-question", type=int, default=8)
+    parser.add_argument(
+        "--allow-variable-docs-per-question",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Accept a positive, variable number of candidate_documents per question. The candidate manifest "
+            "must provide selected_pair_count. This is used for the union of documents selected by a dynamic "
+            "paper-balanced Top-k sweep."
+        ),
+    )
     parser.add_argument("--model-name-or-path", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--questions-per-shard", type=int, default=256)
@@ -122,9 +142,10 @@ def load_candidate_contract(args: argparse.Namespace, dataset: str) -> dict[str,
         "type": "rag2_filter_candidate_dataset",
         "dataset": dataset,
         "split": args.split,
-        "top_k": args.docs_per_question,
         "candidate_layout": "source_balanced",
     }
+    if not args.allow_variable_docs_per_question:
+        expected["top_k"] = args.docs_per_question
     mismatches = {
         key: {"expected": value, "actual": manifest.get(key)}
         for key, value in expected.items()
@@ -136,6 +157,13 @@ def load_candidate_contract(args: argparse.Namespace, dataset: str) -> dict[str,
     if question_count <= 0:
         raise ValueError(f"Invalid selected_question_count for {dataset}: {question_count}")
     stat = candidate_path.stat()
+    pair_count = (
+        int(manifest.get("selected_pair_count", -1))
+        if args.allow_variable_docs_per_question
+        else question_count * args.docs_per_question
+    )
+    if pair_count <= 0:
+        raise ValueError(f"Invalid selected_pair_count for {dataset}: {pair_count}")
     return {
         "dataset": dataset,
         "candidate_path": str(candidate_path.resolve()),
@@ -143,7 +171,7 @@ def load_candidate_contract(args: argparse.Namespace, dataset: str) -> dict[str,
         "candidate_size_bytes": stat.st_size,
         "candidate_mtime_ns": stat.st_mtime_ns,
         "question_count": question_count,
-        "pair_count": question_count * args.docs_per_question,
+        "pair_count": pair_count,
         "candidate_pool_top_k": manifest.get("candidate_pool_top_k"),
         "per_source_top_k": manifest.get("per_source_top_k"),
         "rerank_top_k": manifest.get("top_k"),
@@ -156,13 +184,16 @@ def normalized_candidate_rows(
     dataset: str,
     split: str,
     docs_per_question: int,
+    allow_variable_docs_per_question: bool = False,
 ) -> Iterator[dict[str, Any]]:
     for line_index, raw in enumerate(iter_jsonl(path)):
         row = normalized_mcq_row(raw)
         sample_id = str(raw.get("sample_id") or row.get("id") or f"{dataset}:{split}:{line_index:06d}")
         documents = list(raw.get("candidate_documents") or [])
         documents.sort(key=lambda item: int(item.get("rerank_rank") or 10**9))
-        if len(documents) != docs_per_question:
+        if not documents:
+            raise ValueError(f"No reranked documents for {sample_id}")
+        if not allow_variable_docs_per_question and len(documents) != docs_per_question:
             raise ValueError(
                 f"Expected {docs_per_question} reranked documents for {sample_id}, found {len(documents)}"
             )
@@ -212,6 +243,31 @@ def valid_complete(paths: dict[str, Path], question_count: int, pair_count: int)
     )
 
 
+def resumable_complete_pair_count(paths: dict[str, Path], question_count: int) -> int | None:
+    """Return a completed shard's pair count when its immutable marker is valid.
+
+    This deliberately does not infer ``questions * docs_per_question`` because
+    dynamic Top-k oracle candidates contain a variable-size union per question.
+    The exact pair count is checked again against the candidate rows before the
+    shard is reused in the main streaming pass.
+    """
+
+    if not paths["pairs"].is_file() or not paths["complete"].is_file():
+        return None
+    try:
+        marker = json.loads(paths["complete"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        marker.get("run_version") != RUN_VERSION
+        or int(marker.get("question_count", -1)) != question_count
+        or int(marker.get("pair_count", -1)) <= 0
+        or int(marker.get("pairs_size_bytes", -1)) != paths["pairs"].stat().st_size
+    ):
+        return None
+    return int(marker["pair_count"])
+
+
 def compact_trace(trace: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     document = dict(trace.get("document") or {})
     document.pop("text", None)
@@ -259,6 +315,7 @@ def immutable_contract(args: argparse.Namespace, contracts: dict[str, dict[str, 
         "datasets": list(args.datasets),
         "split": args.split,
         "docs_per_question": args.docs_per_question,
+        "allow_variable_docs_per_question": args.allow_variable_docs_per_question,
         "questions_per_shard": args.questions_per_shard,
         "max_new_tokens": args.max_new_tokens,
         "retry_max_new_tokens": args.retry_max_new_tokens,
@@ -311,13 +368,17 @@ def main() -> None:
                 args.questions_per_shard,
                 question_counts[dataset] - shard_index * args.questions_per_shard,
             )
-            expected_pairs = expected_questions * args.docs_per_question
-            if args.resume and valid_complete(
-                shard_paths(args.output_root, dataset, args.split, shard_index),
-                expected_questions,
-                expected_pairs,
-            ):
-                completed_pairs += expected_pairs
+            paths = shard_paths(args.output_root, dataset, args.split, shard_index)
+            if args.resume and args.allow_variable_docs_per_question:
+                completed = resumable_complete_pair_count(paths, expected_questions)
+                if completed is not None:
+                    completed_pairs += completed
+            else:
+                expected_pairs = expected_questions * args.docs_per_question
+                if args.resume and valid_complete(paths, expected_questions, expected_pairs):
+                    completed_pairs += expected_pairs
+    if completed_pairs > total_pairs:
+        raise RuntimeError(f"Completed pair count exceeds contract: {completed_pairs} > {total_pairs}")
 
     resources = None
     choice_token_ids: dict[str, int] = {}
@@ -343,7 +404,13 @@ def main() -> None:
         )
         for dataset in args.datasets:
             candidate_path = Path(contracts[dataset]["candidate_path"])
-            rows = normalized_candidate_rows(candidate_path, dataset, args.split, args.docs_per_question)
+            rows = normalized_candidate_rows(
+                candidate_path,
+                dataset,
+                args.split,
+                args.docs_per_question,
+                args.allow_variable_docs_per_question,
+            )
             observed_questions = 0
             dataset_shards = math.ceil(question_counts[dataset] / args.questions_per_shard)
             for shard_index, shard_rows in enumerate(stream_chunks(rows, args.questions_per_shard)):
@@ -351,7 +418,7 @@ def main() -> None:
                     f"dataset={dataset} shard={shard_index + 1}/{dataset_shards}"
                 )
                 observed_questions += len(shard_rows)
-                expected_pairs = len(shard_rows) * args.docs_per_question
+                expected_pairs = sum(len(row["documents"]) for row in shard_rows)
                 paths = shard_paths(args.output_root, dataset, args.split, shard_index)
                 if args.resume and valid_complete(paths, len(shard_rows), expected_pairs):
                     continue
@@ -412,6 +479,7 @@ def main() -> None:
                 "total_questions": sum(question_counts.values()),
                 "total_pairs": total_pairs,
                 "docs_per_question": args.docs_per_question,
+                "allow_variable_docs_per_question": args.allow_variable_docs_per_question,
                 "questions_per_shard": args.questions_per_shard,
                 "choice_token_ids": choice_token_ids,
                 "valid_pairs": sum(int(marker.get("valid_pair_count", 0)) for marker in markers),

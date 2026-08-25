@@ -24,9 +24,11 @@ from generate_rag2_anchored_document_traces import (  # noqa: E402
     compact_trace,
     load_candidate_contract,
     normalized_candidate_rows,
+    resumable_complete_pair_count,
     shard_paths,
     valid_complete,
 )
+from prepare_rag2_anchored_dynamic_oracle_candidates import project_union  # noqa: E402
 
 
 class AnchoredDocumentPipelineTests(unittest.TestCase):
@@ -75,6 +77,7 @@ class AnchoredDocumentPipelineTests(unittest.TestCase):
             candidate_file="candidates_top8.jsonl",
             split="train",
             docs_per_question=8,
+            allow_variable_docs_per_question=False,
         )
 
     def test_candidate_contract_and_pair_ids(self) -> None:
@@ -127,6 +130,80 @@ class AnchoredDocumentPipelineTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertTrue(valid_complete(paths, 1, 8))
+            self.assertEqual(resumable_complete_pair_count(paths, 1), 8)
+
+    def test_variable_candidate_contract_and_dynamic_topk_union(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate_root = root / "candidates"
+            target = candidate_root / "medqa" / "test"
+            target.mkdir(parents=True)
+            sources = ["pubmed", "pmc", "cpg", "textbooks"]
+            initial = []
+            for source in sources:
+                for rank in range(1, 5):
+                    initial.append(
+                        {
+                            "source": source,
+                            "stable_id": f"{source}:{rank}",
+                            "text": f"{source} evidence {rank}",
+                            "retrieval_score": float(100 - rank),
+                        }
+                    )
+            reranked = [dict(document) for document in reversed(initial)]
+            for index, document in enumerate(reranked, 1):
+                document["rerank_rank"] = index
+                document["rerank_score"] = float(100 - index)
+            union, selected = project_union(
+                {
+                    "key": "medqa::test::q1::0",
+                    "initial_documents": initial,
+                    "reranked_documents": reranked,
+                },
+                sources=sources,
+                top_k_values=[1, 2, 4],
+                master_per_source_top_k=4,
+            )
+            self.assertEqual({len(selected[str(k)]) for k in (1, 2, 4)}, {1, 2, 4})
+            self.assertGreaterEqual(len(union), 4)
+            self.assertEqual([row["rerank_rank"] for row in union], list(range(1, len(union) + 1)))
+            row = {
+                "sample_id": "medqa:test:q1",
+                "row_idx": 0,
+                "question": "Question?",
+                "options": {"A": "A1", "B": "B1", "C": "C1", "D": "D1"},
+                "answer": "B",
+                "candidate_documents": union,
+            }
+            (target / "candidates_topk_union.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+            (target / "candidate_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "type": "rag2_filter_candidate_dataset",
+                        "dataset": "medqa",
+                        "split": "test",
+                        "candidate_layout": "source_balanced",
+                        "selected_question_count": 1,
+                        "selected_pair_count": len(union),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                candidate_root=candidate_root,
+                candidate_file="candidates_topk_union.jsonl",
+                split="test",
+                docs_per_question=1,
+                allow_variable_docs_per_question=True,
+            )
+            contract = load_candidate_contract(args, "medqa")
+            self.assertEqual(contract["pair_count"], len(union))
+            normalized = list(
+                normalized_candidate_rows(
+                    Path(contract["candidate_path"]), "medqa", "test", 1, True
+                )
+            )
+            self.assertEqual(len(normalized[0]["documents"]), len(union))
 
     def test_feature_extraction_accepts_legacy_trace_without_split(self) -> None:
         class FakeEncoding:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from argparse import Namespace
+from pathlib import Path
 
-from medrag.core import BenchmarkSample, GenerationOutput
+from medrag.core import BenchmarkSample, GenerationOutput, RetrievedDocument
 from medrag.rag2_oracle import (
     canonicalize_rag2_labels,
     deterministic_question_sample,
@@ -17,6 +20,7 @@ from scripts.evaluate_rag2_oracle_label_topk_sweep import (
     prompt_versions,
     repair_terminal_generations,
 )
+from scripts.run_rag2_mcq_eval import apply_oracle_labels, sample_key
 
 
 def sample() -> BenchmarkSample:
@@ -191,6 +195,41 @@ class Rag2OracleTests(unittest.TestCase):
             )
         )
         self.assertEqual(hidden_policy_name(0.2), "hidden_tau_0p2")
+
+    def test_dynamic_oracle_join_uses_document_identity_when_rank_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            labels_path = Path(directory) / "labels.jsonl"
+            labels_path.write_text(
+                json.dumps(
+                    {
+                        "sample_key": sample_key(sample()),
+                        "doc_rank": 37,
+                        "doc_stable_id": "doc-1",
+                        "pseudo_label": "Helpful",
+                        "quality_pass": True,
+                        "delta_ppl": 0.5,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            document = RetrievedDocument(
+                source="pubmed",
+                local_id=1,
+                db_id="doc-1",
+                corpus_id=None,
+                chunk_id=None,
+                doc_id=None,
+                title=None,
+                text="Evidence",
+                retrieval_score=1.0,
+                rerank_score=2.0,
+                rerank_rank=1,
+            )
+            args = Namespace(oracle_labels_path=labels_path, oracle_policy="rag2")
+            result = apply_oracle_labels(args, [sample()], [[document]])
+            self.assertEqual(result[0][0].filter_prediction, "helpful")
+            self.assertEqual(result[0][0].filter_score, 0.5)
 
 
 if __name__ == "__main__":

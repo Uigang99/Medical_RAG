@@ -3607,6 +3607,7 @@ def apply_oracle_labels(
 
     assert args.oracle_labels_path is not None
     labels: dict[tuple[str, int, str], dict[str, Any]] = {}
+    labels_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
     with args.oracle_labels_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
@@ -3619,11 +3620,24 @@ def apply_oracle_labels(
             if key in labels:
                 raise ValueError(f"Duplicate oracle decision: {key}")
             labels[key] = row
+            identity_key = (key[0], key[2])
+            if not identity_key[0] or not identity_key[1]:
+                raise ValueError(f"Oracle decision has an incomplete identity: {key}")
+            if identity_key in labels_by_identity:
+                raise ValueError(f"Duplicate oracle document identity: {identity_key}")
+            labels_by_identity[identity_key] = row
     used: set[tuple[str, int, str]] = set()
     for sample, documents in zip(samples, reranked_docs):
         for rank, document in enumerate(documents, 1):
             key = (sample_key(sample), rank, document.stable_id)
             row = labels.get(key)
+            if row is None:
+                # Dynamic paper-balanced Top-k conditions rerank a different
+                # 4k pool for every k. The document's rank in the compact
+                # annotation union is therefore not its rank in a projected
+                # condition; sample key + stable document identity is the
+                # authoritative oracle join.
+                row = labels_by_identity.get((key[0], key[2]))
             if row is None:
                 raise KeyError(f"Missing oracle decision: {key}")
             used.add(key)
@@ -4586,7 +4600,6 @@ def main() -> None:
                 for docs in reranked_docs
             ]
     else:
-        reranked_docs = apply_oracle_labels(args, samples, reranked_docs)
         if args.paper_balanced_top_k is not None:
             initial_docs, reranked_docs = project_paper_balanced_candidates(
                 initial_docs,
@@ -4594,11 +4607,17 @@ def main() -> None:
                 sources=args.sources,
                 top_k=args.paper_balanced_top_k,
             )
+            # Apply labels only after reconstructing the exact 4k -> Top-k
+            # condition. This lets the oracle annotate the union of documents
+            # that can actually enter generation instead of wasting one-doc
+            # generations on all 128 master-cache candidates.
+            reranked_docs = apply_oracle_labels(args, samples, reranked_docs)
             context_docs = [
                 [copy.copy(document) for document in docs if document.filter_prediction == "helpful"]
                 for docs in reranked_docs
             ]
         else:
+            reranked_docs = apply_oracle_labels(args, samples, reranked_docs)
             eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
             context_docs = [
                 [copy.copy(document) for document in docs[:eligible_top_k] if document.filter_prediction == "helpful"]

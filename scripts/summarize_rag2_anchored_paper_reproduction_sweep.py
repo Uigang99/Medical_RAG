@@ -50,12 +50,18 @@ EXPECTED_DATASET_COUNTS = {
 }
 MMLU_DATASETS = tuple(dataset for dataset in DATASETS if dataset.startswith("mmlu_"))
 TOP_K_VALUES = (1, 2, 4, 8, 16, 32)
-SUMMARY_VERSION = "rag2_anchored_paper_reproduction_sweep_summary_v2"
+SUMMARY_VERSION = "rag2_anchored_paper_reproduction_sweep_summary_v3"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-root", type=Path, required=True)
+    parser.add_argument(
+        "--oracle-results-root",
+        type=Path,
+        default=None,
+        help="Optional dynamic Top-k RAG2 gold-label Oracle result root to append to every k.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--expected-prompt-profile", default="paper_compatible_three_anchor")
     parser.add_argument("--expected-answer-decision-mode", default="free_generation")
@@ -129,7 +135,7 @@ def validate_run_config(
     actual = {key: config.get(key) for key in expected}
     if actual != expected:
         raise RuntimeError(f"Run-contract mismatch in {run_dir}: {actual} != {expected}")
-    if expected_paper_balanced_projection and expected_case in {"rerank_rag", "filter_rag"}:
+    if expected_paper_balanced_projection and expected_case in {"rerank_rag", "filter_rag", "oracle_rag"}:
         actual_top_k = config.get("paper_balanced_top_k")
         expected_projected_pool = int(expected_top_k or 0) * 4
         if config.get("paper_balanced_candidate_pool_top_k") != expected_projected_pool:
@@ -140,7 +146,7 @@ def validate_run_config(
             )
     elif expected_case == "rerank_rag":
         actual_top_k = config.get("generation_top_k")
-    elif expected_case == "filter_rag":
+    elif expected_case in {"filter_rag", "oracle_rag"}:
         actual_top_k = config.get("filter_rerank_top_k")
     else:
         actual_top_k = None
@@ -269,7 +275,7 @@ def summarize_rows(
     }
 
 
-def condition_specs(results_root: Path) -> list[dict[str, Any]]:
+def condition_specs(results_root: Path, oracle_results_root: Path | None = None) -> list[dict[str, Any]]:
     specs = [
         {
             "top_k": None,
@@ -295,6 +301,15 @@ def condition_specs(results_root: Path) -> list[dict[str, Any]]:
                 },
             ]
         )
+        if oracle_results_root is not None:
+            specs.append(
+                {
+                    "top_k": top_k,
+                    "filtering": "RAG2 gold-label Oracle",
+                    "case": "oracle_rag",
+                    "case_root": oracle_results_root / f"oracle_rag_rag2_top{top_k}",
+                }
+            )
     return specs
 
 
@@ -319,7 +334,8 @@ def render_table(summary: dict[str, Any]) -> str:
         (
             "For every Top-k, dense Top-k is taken independently from each of the four logical corpora "
             "(4k candidates) and MedCPT reranks that exact pool to k. No filtering uses all k documents; "
-            "RAG2 filtering keeps only documents predicted Helpful among the same k."
+            "RAG2 filtering keeps only documents predicted Helpful among the same k. When present, the "
+            "gold-label Oracle keeps only independently labelled RAG2 Helpful documents from that identical set."
             if summary.get("paper_balanced_projection")
             else "Top-k is the shared MedCPT reranked prefix. No filtering uses all k documents; RAG2 "
             "filtering uses only documents predicted Helpful inside the same prefix."
@@ -393,7 +409,7 @@ def write_csv(path: Path, summary: dict[str, Any]) -> None:
 
 def main() -> None:
     args = parse_args()
-    specs = condition_specs(args.results_root)
+    specs = condition_specs(args.results_root, args.oracle_results_root)
     total_rows = sum(EXPECTED_DATASET_COUNTS.values()) * len(specs)
     progress = PipelineProgress(
         overall_total=total_rows + 3,
@@ -419,6 +435,10 @@ def main() -> None:
                 expected_paper_balanced_projection=args.expected_paper_balanced_projection,
                 progress=progress,
             )
+            if spec["case"] == "oracle_rag" and config.get("oracle_policy") != "rag2":
+                raise RuntimeError(
+                    f"Oracle policy mismatch in {run_dir}: {config.get('oracle_policy')!r} != 'rag2'"
+                )
             keys = sample_keys(rows)
             if reference_keys is None:
                 reference_keys = keys
@@ -450,6 +470,9 @@ def main() -> None:
         summary = {
             "version": SUMMARY_VERSION,
             "results_root": str(args.results_root.resolve()),
+            "oracle_results_root": (
+                str(args.oracle_results_root.resolve()) if args.oracle_results_root is not None else None
+            ),
             "prompt_profile": args.expected_prompt_profile,
             "answer_decision_mode": args.expected_answer_decision_mode,
             "paper_balanced_projection": args.expected_paper_balanced_projection,
