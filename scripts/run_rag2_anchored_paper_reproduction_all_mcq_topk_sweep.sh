@@ -6,7 +6,9 @@
 #   1) no-RAG rationale+answer artifacts,
 #   2) MedCPT query embeddings + 8x4 balanced retrieval + rerank Top-32,
 #   3) dataset-routed filter scores for all 32 documents,
-#   4) answer generation for reranked-prefix k in 1/2/4/8/16/32.
+#   4) unfiltered answer generation for reranked Top-k in 1/2/4/8/16/32,
+#   5) filtered answer generation for the same reranked prefixes,
+#   6) one combined, contract-validated summary table.
 
 set -euo pipefail
 
@@ -18,6 +20,7 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 PYTHON="/home/user/Uiheon/.venv_vllm/bin/python"
 PROJECT="/home/user/Uiheon/Medical_RAG"
 EVALUATOR="$PROJECT/scripts/run_rag2_mcq_eval.py"
+SUMMARIZER="$PROJECT/scripts/summarize_rag2_anchored_paper_reproduction_sweep.py"
 
 LLAMA_MODEL="/home/user/Uiheon/models/Llama-3-8B-Instruct"
 MEDMCQA_FILTER="/home/user/Uiheon/models/RAG2-Filter-FlanT5-large-PaperReproduction-Anchored/medmcqa/medmcqa_rag2_paper_reproduction_epoch6_len512_stride128/20260824_213214/final_model"
@@ -104,7 +107,7 @@ COMMON_ARGS=(
   --results-root "$RESULTS_ROOT"
 )
 
-TOTAL_STAGES=9
+TOTAL_STAGES=16
 COMPLETED_STAGES=0
 PIPELINE_STARTED_AT=$(date +%s)
 
@@ -130,34 +133,54 @@ run_stage() {
   COMPLETED_STAGES="$stage_index"
 }
 
-# Stage 1/4: one no-RAG baseline plus complete rationale+answer retrieval query.
+# Stage 1/6: one no-RAG baseline plus complete rationale+answer retrieval query.
 run_stage 1 "no-RAG rationale+answer" \
   "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" --case no_rag
 
-# Stage 2/4: one embedding/retrieval/reranking pass.  Each corpus contributes
+# Stage 2/6: one embedding/retrieval/reranking pass. Each corpus contributes
 # exactly eight dense hits; MedCPT reranks the pooled 32 once.
 run_stage 2 "balanced retrieval and reranking cache" \
   "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" \
   --case rerank_rag \
   --candidate-cache-only
 
-# Stage 3/4: score all reranked documents once.  MedQA is routed to its own
+# Stage 3/6: score all reranked documents once. MedQA is routed to its own
 # filter; MedMCQA and all six MMLU subsets share the MedMCQA filter.
 run_stage 3 "dataset-routed filter-score cache" \
   "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" \
   --case filter_rag \
   --filter-cache-only
 
-# Stage 4/4: k is the reranked prefix eligible for filtering.  It is not a
-# post-filter document cap; every Helpful document inside the prefix is used.
+# Stage 4/6: unfiltered RAG gives the answer LLM every document in the shared
+# reranked prefix. Retrieval and reranking are loaded from the cache above.
 STAGE_INDEX=3
 for TOP_K in 1 2 4 8 16 32; do
   STAGE_INDEX=$((STAGE_INDEX + 1))
-  run_stage "$STAGE_INDEX" "answer generation rerank-prefix k=$TOP_K" \
+  run_stage "$STAGE_INDEX" "unfiltered answer generation top-k=$TOP_K" \
+    "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" \
+    --case rerank_rag \
+    --generation-top-k "$TOP_K"
+done
+
+# Stage 5/6: k is the reranked prefix eligible for filtering. It is not a
+# post-filter document cap; every Helpful document inside the prefix is used.
+for TOP_K in 1 2 4 8 16 32; do
+  STAGE_INDEX=$((STAGE_INDEX + 1))
+  run_stage "$STAGE_INDEX" "filtered answer generation top-k=$TOP_K" \
     "$PYTHON" "$EVALUATOR" "${COMMON_ARGS[@]}" \
     --case filter_rag \
     --filter-rerank-top-k "$TOP_K"
 done
+
+# Stage 6/6: verify all 13 conditions contain the exact same 6,545-question
+# cohort, then report every dataset plus pooled/macro metrics in one table.
+STAGE_INDEX=$((STAGE_INDEX + 1))
+run_stage "$STAGE_INDEX" "combined result validation and summary" \
+  "$PYTHON" "$SUMMARIZER" \
+  --results-root "$RESULTS_ROOT" \
+  --output-dir "$RESULTS_ROOT/combined_summary" \
+  --expected-prompt-profile paper_compatible_three_anchor \
+  --expected-answer-decision-mode free_generation
 
 PIPELINE_FINISHED_AT=$(date +%s)
 printf '[overall %d/%d] complete elapsed=%s overall_eta=00h00m00s\n' \
