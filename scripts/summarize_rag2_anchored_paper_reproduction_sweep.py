@@ -50,7 +50,7 @@ EXPECTED_DATASET_COUNTS = {
 }
 MMLU_DATASETS = tuple(dataset for dataset in DATASETS if dataset.startswith("mmlu_"))
 TOP_K_VALUES = (1, 2, 4, 8, 16, 32)
-SUMMARY_VERSION = "rag2_anchored_paper_reproduction_sweep_summary_v1"
+SUMMARY_VERSION = "rag2_anchored_paper_reproduction_sweep_summary_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +59,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--expected-prompt-profile", default="paper_compatible_three_anchor")
     parser.add_argument("--expected-answer-decision-mode", default="free_generation")
+    parser.add_argument("--expected-per-source-top-k", type=int, default=8)
+    parser.add_argument("--expected-candidate-pool-top-k", type=int, default=32)
+    parser.add_argument("--expected-rerank-top-k", type=int, default=32)
+    parser.add_argument(
+        "--expected-paper-balanced-projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Require each reported k to be reconstructed as source Top-k x four corpora, followed by "
+            "MedCPT rerank Top-k, from one fully scored master cache."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -96,6 +108,10 @@ def validate_run_config(
     expected_top_k: int | None,
     expected_prompt_profile: str,
     expected_answer_decision_mode: str,
+    expected_per_source_top_k: int,
+    expected_candidate_pool_top_k: int,
+    expected_rerank_top_k: int,
+    expected_paper_balanced_projection: bool,
 ) -> dict[str, Any]:
     path = run_dir / "run_config.json"
     if not path.is_file():
@@ -106,14 +122,23 @@ def validate_run_config(
         "prompt_profile": expected_prompt_profile,
         "answer_decision_mode": expected_answer_decision_mode,
         "candidate_layout": "source_balanced",
-        "per_source_top_k": 8,
-        "candidate_pool_top_k": 32,
-        "rerank_top_k": 32,
+        "per_source_top_k": expected_per_source_top_k,
+        "candidate_pool_top_k": expected_candidate_pool_top_k,
+        "rerank_top_k": expected_rerank_top_k,
     }
     actual = {key: config.get(key) for key in expected}
     if actual != expected:
         raise RuntimeError(f"Run-contract mismatch in {run_dir}: {actual} != {expected}")
-    if expected_case == "rerank_rag":
+    if expected_paper_balanced_projection and expected_case in {"rerank_rag", "filter_rag"}:
+        actual_top_k = config.get("paper_balanced_top_k")
+        expected_projected_pool = int(expected_top_k or 0) * 4
+        if config.get("paper_balanced_candidate_pool_top_k") != expected_projected_pool:
+            raise RuntimeError(
+                f"Projected 4k candidate-pool mismatch in {run_dir}: "
+                f"actual={config.get('paper_balanced_candidate_pool_top_k')!r}, "
+                f"expected={expected_projected_pool!r}"
+            )
+    elif expected_case == "rerank_rag":
         actual_top_k = config.get("generation_top_k")
     elif expected_case == "filter_rag":
         actual_top_k = config.get("filter_rerank_top_k")
@@ -133,6 +158,10 @@ def load_condition(
     expected_top_k: int | None,
     expected_prompt_profile: str,
     expected_answer_decision_mode: str,
+    expected_per_source_top_k: int,
+    expected_candidate_pool_top_k: int,
+    expected_rerank_top_k: int,
+    expected_paper_balanced_projection: bool,
     progress: PipelineProgress | None = None,
 ) -> tuple[list[dict[str, Any]], Path, dict[str, Any]]:
     run_dir = latest_result_dir(case_root)
@@ -142,6 +171,10 @@ def load_condition(
         expected_top_k=expected_top_k,
         expected_prompt_profile=expected_prompt_profile,
         expected_answer_decision_mode=expected_answer_decision_mode,
+        expected_per_source_top_k=expected_per_source_top_k,
+        expected_candidate_pool_top_k=expected_candidate_pool_top_k,
+        expected_rerank_top_k=expected_rerank_top_k,
+        expected_paper_balanced_projection=expected_paper_balanced_projection,
     )
     rows: list[dict[str, Any]] = []
     keys: set[tuple[str, str]] = set()
@@ -283,8 +316,14 @@ def render_table(summary: dict[str, Any]) -> str:
         "Cohort: 6,545 questions (MedMCQA 4,183; MedQA 1,273; six MMLU subsets 1,089).",
         "Micro Avg = 6,545-question pooled accuracy; Macro Avg (8) = mean of eight dataset accuracies; "
         "Macro Avg (3 groups) = mean of MedMCQA, MedQA, and pooled MMLU accuracies.",
-        "Top-k is the shared MedCPT reranked prefix. No filtering uses all k documents; RAG2 filtering uses "
-        "only documents predicted Helpful inside the same prefix.",
+        (
+            "For every Top-k, dense Top-k is taken independently from each of the four logical corpora "
+            "(4k candidates) and MedCPT reranks that exact pool to k. No filtering uses all k documents; "
+            "RAG2 filtering keeps only documents predicted Helpful among the same k."
+            if summary.get("paper_balanced_projection")
+            else "Top-k is the shared MedCPT reranked prefix. No filtering uses all k documents; RAG2 "
+            "filtering uses only documents predicted Helpful inside the same prefix."
+        ),
         "",
         "| " + " | ".join(headers) + " |",
         "|" + "|".join(["---:", "---", "---:"] + ["---:"] * (len(headers) - 3)) + "|",
@@ -374,6 +413,10 @@ def main() -> None:
                 expected_top_k=spec["top_k"],
                 expected_prompt_profile=args.expected_prompt_profile,
                 expected_answer_decision_mode=args.expected_answer_decision_mode,
+                expected_per_source_top_k=args.expected_per_source_top_k,
+                expected_candidate_pool_top_k=args.expected_candidate_pool_top_k,
+                expected_rerank_top_k=args.expected_rerank_top_k,
+                expected_paper_balanced_projection=args.expected_paper_balanced_projection,
                 progress=progress,
             )
             keys = sample_keys(rows)
@@ -409,6 +452,12 @@ def main() -> None:
             "results_root": str(args.results_root.resolve()),
             "prompt_profile": args.expected_prompt_profile,
             "answer_decision_mode": args.expected_answer_decision_mode,
+            "paper_balanced_projection": args.expected_paper_balanced_projection,
+            "master_candidate_contract": {
+                "per_source_top_k": args.expected_per_source_top_k,
+                "candidate_pool_top_k": args.expected_candidate_pool_top_k,
+                "rerank_top_k_scored": args.expected_rerank_top_k,
+            },
             "expected_dataset_counts": EXPECTED_DATASET_COUNTS,
             "cohort_sha256": cohort_fingerprint(reference_keys or set()),
             "metric_definitions": {

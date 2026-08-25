@@ -268,6 +268,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--paper-balanced-top-k",
+        type=int,
+        default=None,
+        help=(
+            "Paper-text balanced-retrieval cutoff for an efficient Top-k sweep. Build one source-balanced "
+            "master cache with --per-source-top-k N, --candidate-pool-top-k 4N, and --rerank-top-k 4N. "
+            "For a requested k, retain dense ranks 1..k independently inside each logical corpus (4k total), "
+            "then select the best k by the already-cached MedCPT cross-encoder scores. Filtering is applied "
+            "only after this exact 4k-to-k projection."
+        ),
+    )
+    parser.add_argument(
         "--dense-query-mode",
         choices=["initial", "rationale"],
         default="rationale",
@@ -1117,10 +1129,19 @@ def ensure_dense_query_embeddings(
 def document_to_dict(doc: RetrievedDocument, include_text: bool) -> dict[str, Any]:
     row = doc.to_dict(include_text=include_text)
     row["stable_id"] = doc.stable_id
+    if "source_retrieval_rank" in doc.metadata:
+        row["source_retrieval_rank"] = doc.metadata["source_retrieval_rank"]
+    if "retrieval_bucket" in doc.metadata:
+        row["retrieval_bucket"] = doc.metadata["retrieval_bucket"]
     return row
 
 
 def document_from_dict(row: dict[str, Any]) -> RetrievedDocument:
+    metadata = dict(row.get("metadata") or {})
+    if row.get("source_retrieval_rank") is not None:
+        metadata["source_retrieval_rank"] = int(row["source_retrieval_rank"])
+    if row.get("retrieval_bucket") is not None:
+        metadata["retrieval_bucket"] = str(row["retrieval_bucket"])
     return RetrievedDocument(
         source=str(row.get("source") or ""),
         local_id=int(row.get("local_id", -1)),
@@ -1138,8 +1159,98 @@ def document_from_dict(row: dict[str, Any]) -> RetrievedDocument:
         filter_rank=row.get("filter_rank"),
         filter_prediction=row.get("filter_prediction"),
         filter_prob_helpful=row.get("filter_prob_helpful"),
-        metadata=row.get("metadata") or {},
+        metadata=metadata,
     )
+
+
+def project_paper_balanced_candidates(
+    initial_document_lists: list[list[RetrievedDocument]],
+    fully_reranked_document_lists: list[list[RetrievedDocument]],
+    *,
+    sources: list[str],
+    top_k: int,
+) -> tuple[list[list[RetrievedDocument]], list[list[RetrievedDocument]]]:
+    """Materialize the paper-described ``4 corpora x k -> rerank Top-k`` contract.
+
+    The master cache contains the dense Top-N from every logical corpus and
+    cross-encoder scores for all 4N documents.  Cross-encoder scores are
+    document-local, so slicing each corpus by its stored dense rank and sorting
+    the surviving 4k documents is equivalent to rerunning the reranker for
+    every k.  All sweep conditions can therefore reuse one expensive pass.
+    """
+    if top_k <= 0:
+        raise ValueError("paper-balanced top-k must be positive")
+    if len(initial_document_lists) != len(fully_reranked_document_lists):
+        raise RuntimeError(
+            "Paper-balanced projection row mismatch: "
+            f"initial={len(initial_document_lists)} reranked={len(fully_reranked_document_lists)}"
+        )
+
+    expected_source_counts = {source: top_k for source in sources}
+    expected_pool_size = top_k * len(sources)
+    projected_initial: list[list[RetrievedDocument]] = []
+    projected_reranked: list[list[RetrievedDocument]] = []
+
+    for row_index, (initial_docs, reranked_docs) in enumerate(
+        zip(initial_document_lists, fully_reranked_document_lists, strict=True)
+    ):
+        dense_prefix: list[RetrievedDocument] = []
+        inferred_source_ranks: Counter[str] = Counter()
+        source_rank_by_stable_id: dict[str, int] = {}
+        for document in initial_docs:
+            source_rank = document.metadata.get("source_retrieval_rank")
+            if source_rank is None:
+                # Legacy candidate caches stored the globally merged dense
+                # order but omitted the source-local rank. The global merge is
+                # score-sorted, so the occurrence index inside each source is
+                # exactly its local dense rank and can be recovered losslessly.
+                inferred_source_ranks[document.source] += 1
+                source_rank = inferred_source_ranks[document.source]
+            source_rank_by_stable_id[document.stable_id] = int(source_rank)
+            if int(source_rank) <= top_k:
+                dense_prefix.append(copy.copy(document))
+
+        actual_source_counts = Counter(document.source for document in dense_prefix)
+        if dict(actual_source_counts) != expected_source_counts or len(dense_prefix) != expected_pool_size:
+            raise RuntimeError(
+                "Paper-balanced dense-prefix invariant failed: "
+                f"row={row_index} expected={expected_source_counts} "
+                f"actual={dict(actual_source_counts)} total={len(dense_prefix)}"
+            )
+
+        eligible_reranked: list[RetrievedDocument] = []
+        for document in reranked_docs:
+            source_rank = document.metadata.get("source_retrieval_rank")
+            if source_rank is None:
+                source_rank = source_rank_by_stable_id.get(document.stable_id)
+            if source_rank is None:
+                raise RuntimeError(
+                    "Paper-balanced projection cannot align a reranked document to the dense pool: "
+                    f"row={row_index} document={document.stable_id}"
+                )
+            if int(source_rank) <= top_k:
+                eligible_reranked.append(copy.copy(document))
+        if len(eligible_reranked) != expected_pool_size:
+            raise RuntimeError(
+                "Paper-balanced rerank pool is incomplete. The master cache must retain scores/text for "
+                f"all candidates: row={row_index} expected={expected_pool_size} "
+                f"actual={len(eligible_reranked)}"
+            )
+        eligible_reranked.sort(
+            key=lambda document: (
+                document.rerank_score
+                if document.rerank_score is not None
+                else float("-inf")
+            ),
+            reverse=True,
+        )
+        selected = eligible_reranked[:top_k]
+        for rank, document in enumerate(selected, start=1):
+            document.rerank_rank = rank
+        projected_initial.append(dense_prefix)
+        projected_reranked.append(selected)
+
+    return projected_initial, projected_reranked
 
 
 def candidate_query_fingerprint(
@@ -3832,7 +3943,10 @@ def write_outputs(
 ) -> Path:
     timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     output_case = args.case
-    if args.case == "rerank_rag" and args.generation_top_k is not None:
+    if args.paper_balanced_top_k is not None and args.case in {"rerank_rag", "filter_rag", "oracle_rag"}:
+        suffix = f"_{args.oracle_policy}" if args.case == "oracle_rag" else ""
+        output_case = f"{args.case}{suffix}_top{args.paper_balanced_top_k}"
+    elif args.case == "rerank_rag" and args.generation_top_k is not None:
         output_case = f"{args.case}_top{args.generation_top_k}"
     elif args.case in {"filter_rag", "oracle_rag"} and args.filter_rerank_top_k is not None:
         suffix = f"_{args.oracle_policy}" if args.case == "oracle_rag" else ""
@@ -3868,7 +3982,11 @@ def write_outputs(
 
     if args.case in {"filter_rag", "oracle_rag"}:
         by_dataset: dict[str, dict[str, Any]] = {}
-        eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
+        eligible_top_k = (
+            args.paper_balanced_top_k
+            or args.filter_rerank_top_k
+            or args.rerank_top_k
+        )
         for result in results:
             bucket = by_dataset.setdefault(
                 result.sample.dataset,
@@ -4025,6 +4143,33 @@ def validate_paths(args: argparse.Namespace) -> None:
                 f"--filter-rerank-top-k must be in [1, {args.rerank_top_k}], "
                 f"got {args.filter_rerank_top_k}."
             )
+    if args.paper_balanced_top_k is not None:
+        if args.case not in {"rerank_rag", "filter_rag", "oracle_rag"}:
+            raise ValueError(
+                "--paper-balanced-top-k is supported only with rerank_rag, filter_rag, or oracle_rag."
+            )
+        if args.candidate_layout != "source_balanced":
+            raise ValueError("--paper-balanced-top-k requires --candidate-layout source_balanced.")
+        if args.sources != PAPER_SOURCES:
+            raise ValueError(
+                "--paper-balanced-top-k requires exactly the four logical paper corpora in canonical order: "
+                f"{PAPER_SOURCES}; got {args.sources}."
+            )
+        if args.paper_balanced_top_k <= 0 or args.paper_balanced_top_k > args.per_source_top_k:
+            raise ValueError(
+                "--paper-balanced-top-k must be in "
+                f"[1, {args.per_source_top_k}], got {args.paper_balanced_top_k}."
+            )
+        if args.rerank_top_k != args.candidate_pool_top_k:
+            raise ValueError(
+                "--paper-balanced-top-k requires the master cache to retain a rerank score and document text "
+                "for every dense candidate: --rerank-top-k must equal --candidate-pool-top-k."
+            )
+        if args.generation_top_k is not None or args.filter_rerank_top_k is not None:
+            raise ValueError(
+                "--paper-balanced-top-k cannot be combined with the legacy global-prefix "
+                "--generation-top-k/--filter-rerank-top-k options."
+            )
     if args.candidate_cache_only and args.case != "rerank_rag":
         raise ValueError("--candidate-cache-only is supported only with --case rerank_rag.")
     if args.filter_cache_only and args.case != "filter_rag":
@@ -4070,9 +4215,13 @@ def main() -> None:
             args.candidate_pool_top_k,
             args.rerank_top_k,
             (
-                args.filter_rerank_top_k or args.rerank_top_k
+                args.paper_balanced_top_k
+                or args.filter_rerank_top_k
+                or args.rerank_top_k
                 if args.case in {"filter_rag", "oracle_rag"}
-                else args.generation_top_k or args.rerank_top_k
+                else args.paper_balanced_top_k
+                or args.generation_top_k
+                or args.rerank_top_k
             ),
         )
         return
@@ -4161,11 +4310,23 @@ def main() -> None:
         "pubmed_shards_per_group": args.pubmed_shards_per_group,
         "rerank_top_k": args.rerank_top_k,
         "rerank_top_k_scored": args.rerank_top_k,
+        "paper_balanced_top_k": args.paper_balanced_top_k,
+        "paper_balanced_candidate_pool_top_k": (
+            args.paper_balanced_top_k * len(args.sources)
+            if args.paper_balanced_top_k is not None
+            else None
+        ),
         "generation_top_k": (
-            args.generation_top_k or args.rerank_top_k if args.case == "rerank_rag" else None
+            args.paper_balanced_top_k
+            or args.generation_top_k
+            or args.rerank_top_k
+            if args.case == "rerank_rag"
+            else None
         ),
         "filter_rerank_top_k": (
-            args.filter_rerank_top_k or args.rerank_top_k
+            args.paper_balanced_top_k
+            or args.filter_rerank_top_k
+            or args.rerank_top_k
             if args.case in {"filter_rag", "oracle_rag"} else None
         ),
         "oracle_policy": args.oracle_policy,
@@ -4360,8 +4521,17 @@ def main() -> None:
 
     no_rag_by_key = align_no_rag_artifacts(samples, artifacts)
     if args.case == "rerank_rag":
-        generation_top_k = args.generation_top_k or args.rerank_top_k
-        context_docs = [docs[:generation_top_k] for docs in reranked_docs]
+        if args.paper_balanced_top_k is not None:
+            initial_docs, reranked_docs = project_paper_balanced_candidates(
+                initial_docs,
+                reranked_docs,
+                sources=args.sources,
+                top_k=args.paper_balanced_top_k,
+            )
+            context_docs = reranked_docs
+        else:
+            generation_top_k = args.generation_top_k or args.rerank_top_k
+            context_docs = [docs[:generation_top_k] for docs in reranked_docs]
     elif args.case == "filter_rag":
         reranked_docs, filter_cache_dir = ensure_filter_scores(
             args,
@@ -4386,18 +4556,42 @@ def main() -> None:
                 filter_cache_dir,
             )
             return
-        eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
-        context_docs = [
-            materialize_filter_generation_context(args, docs[:eligible_top_k])
-            for docs in reranked_docs
-        ]
+        if args.paper_balanced_top_k is not None:
+            initial_docs, reranked_docs = project_paper_balanced_candidates(
+                initial_docs,
+                reranked_docs,
+                sources=args.sources,
+                top_k=args.paper_balanced_top_k,
+            )
+            context_docs = [
+                materialize_filter_generation_context(args, docs)
+                for docs in reranked_docs
+            ]
+        else:
+            eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
+            context_docs = [
+                materialize_filter_generation_context(args, docs[:eligible_top_k])
+                for docs in reranked_docs
+            ]
     else:
         reranked_docs = apply_oracle_labels(args, samples, reranked_docs)
-        eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
-        context_docs = [
-            [copy.copy(document) for document in docs[:eligible_top_k] if document.filter_prediction == "helpful"]
-            for docs in reranked_docs
-        ]
+        if args.paper_balanced_top_k is not None:
+            initial_docs, reranked_docs = project_paper_balanced_candidates(
+                initial_docs,
+                reranked_docs,
+                sources=args.sources,
+                top_k=args.paper_balanced_top_k,
+            )
+            context_docs = [
+                [copy.copy(document) for document in docs if document.filter_prediction == "helpful"]
+                for docs in reranked_docs
+            ]
+        else:
+            eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
+            context_docs = [
+                [copy.copy(document) for document in docs[:eligible_top_k] if document.filter_prediction == "helpful"]
+                for docs in reranked_docs
+            ]
     results, details = generate_rag_answers(
         args,
         samples,

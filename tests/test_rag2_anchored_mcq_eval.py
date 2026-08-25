@@ -18,7 +18,10 @@ from scripts.run_rag2_mcq_eval import (
     active_document_prompt_version,
     active_no_rag_prompt_version,
     build_document_messages_for_request,
+    document_from_dict,
+    document_to_dict,
     generate_rag_answers,
+    project_paper_balanced_candidates,
 )
 
 
@@ -58,6 +61,68 @@ def args() -> SimpleNamespace:
 
 
 class AnchoredMcqEvalTests(unittest.TestCase):
+    def test_candidate_cache_preserves_source_local_dense_rank(self) -> None:
+        document = RetrievedDocument(
+            source="pubmed",
+            local_id=7,
+            db_id="pubmed:7",
+            corpus_id="pubmed:7",
+            chunk_id=None,
+            doc_id=None,
+            title=None,
+            text="Medical evidence.",
+            retrieval_score=0.75,
+            metadata={
+                "source_retrieval_rank": 3,
+                "retrieval_bucket": "pubmed",
+            },
+        )
+
+        restored = document_from_dict(document_to_dict(document, include_text=True))
+
+        self.assertEqual(restored.metadata["source_retrieval_rank"], 3)
+        self.assertEqual(restored.metadata["retrieval_bucket"], "pubmed")
+
+    def test_paper_balanced_projection_rebuilds_four_k_pool_before_reranking(self) -> None:
+        sources = ["pubmed", "pmc", "cpg", "textbooks"]
+        initial = []
+        for source_index, source in enumerate(sources):
+            for source_rank in range(1, 4):
+                initial.append(
+                    RetrievedDocument(
+                        source=source,
+                        local_id=source_index * 10 + source_rank,
+                        db_id=f"{source}:{source_rank}",
+                        corpus_id=f"{source}:{source_rank}",
+                        chunk_id=None,
+                        doc_id=None,
+                        title=None,
+                        text=f"{source} evidence {source_rank}",
+                        retrieval_score=10.0 - source_rank,
+                        rerank_score=float(source_index * 10 + source_rank),
+                        metadata={"source_retrieval_rank": source_rank},
+                    )
+                )
+        fully_reranked = sorted(initial, key=lambda document: document.rerank_score, reverse=True)
+
+        projected_initial, projected_reranked = project_paper_balanced_candidates(
+            [initial],
+            [fully_reranked],
+            sources=sources,
+            top_k=2,
+        )
+
+        self.assertEqual(len(projected_initial[0]), 8)
+        self.assertEqual(
+            {source: sum(document.source == source for document in projected_initial[0]) for source in sources},
+            {source: 2 for source in sources},
+        )
+        self.assertEqual(len(projected_reranked[0]), 2)
+        self.assertTrue(
+            all(int(document.metadata["source_retrieval_rank"]) <= 2 for document in projected_reranked[0])
+        )
+        self.assertEqual([document.rerank_rank for document in projected_reranked[0]], [1, 2])
+
     def test_anchored_eval_uses_the_frozen_prompt_version(self) -> None:
         namespace = args()
         self.assertEqual(active_no_rag_prompt_version(namespace), PROMPT_VERSION)
