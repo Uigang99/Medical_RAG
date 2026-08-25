@@ -42,11 +42,21 @@ from medrag.rag2_anchored_trace import (  # noqa: E402
 RUN_VERSION = "rag2_anchored_no_rag_train_generation_v1"
 DEFAULT_MODEL = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 DEFAULT_BENCHMARK_ROOT = PROJECT_ROOT / "datasets/benchmark/mcq/unified"
+MCQ_EVAL_DATASETS = [
+    "medmcqa",
+    "medqa",
+    "mmlu_anatomy",
+    "mmlu_clinical_knowledge",
+    "mmlu_college_biology",
+    "mmlu_college_medicine",
+    "mmlu_medical_genetics",
+    "mmlu_professional_medicine",
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--datasets", nargs="+", choices=["medmcqa", "medqa"], default=["medmcqa", "medqa"])
+    parser.add_argument("--datasets", nargs="+", choices=MCQ_EVAL_DATASETS, default=["medmcqa", "medqa"])
     parser.add_argument("--split", default="train")
     parser.add_argument("--benchmark-root", type=Path, default=DEFAULT_BENCHMARK_ROOT)
     parser.add_argument("--model-name-or-path", type=Path, default=DEFAULT_MODEL)
@@ -285,13 +295,13 @@ def main() -> None:
             ).get("choice_token_ids") or {}
         logging.info("All generation shards already complete; skipping vLLM load.")
     progress = PipelineProgress(
-        overall_total=3 * total,
+        overall_total=2 * total,
         overall_initial=completed_generation,
         desc="AnchoredNoRAG",
     )
     try:
         progress.set_stage(
-            "1/3 no-RAG rationale+answer generation",
+            "1/2 no-RAG rationale+answer generation",
             total=total,
             initial=completed_generation,
         )
@@ -328,7 +338,7 @@ def main() -> None:
                     },
                 )
                 progress.update(len(output_rows))
-        progress.set_stage("2/3 artifact materialization", total=total)
+        progress.set_stage("2/2 artifact materialization", total=total)
         artifacts = {
             dataset: str(materialize_dataset(args, dataset, counts[dataset], progress).resolve())
             for dataset in args.datasets

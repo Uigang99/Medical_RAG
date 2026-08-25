@@ -50,6 +50,16 @@ from medrag.filtering.rag2_windowing import sentence_context_windows, windowing_
 from medrag.generation.transformers_generator import VLLMChatGenerator
 from medrag.io_utils import write_json, write_jsonl
 from medrag.progress import StageProgress
+from medrag.rag2_anchored_trace import (
+    END_REASONING_MARKER as ANCHORED_END_REASONING_MARKER,
+    GENERATION_POLICY_VERSION as ANCHORED_GENERATION_POLICY_VERSION,
+    PROMPT_VERSION as ANCHORED_PROMPT_VERSION,
+    RATIONALE_HEADER as ANCHORED_RATIONALE_HEADER,
+    build_anchored_user_prompt,
+    canonical_response as anchored_canonical_response,
+    normalize_rationale as normalize_anchored_rationale,
+    semantic_retrieval_queries as anchored_retrieval_queries,
+)
 from medrag.rag2_mcq import (
     DOCUMENT_PROMPT_VERSION,
     PAPER_ANSWER_FORMAT_DOCUMENT_PROMPT_VERSION,
@@ -187,12 +197,20 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--prompt-profile",
-        choices=["focused_v4", "paper_exact", "paper_exact_terminal", "paper_answer_format"],
+        choices=[
+            "focused_v4",
+            "paper_exact",
+            "paper_exact_terminal",
+            "paper_answer_format",
+            "paper_compatible_three_anchor",
+        ],
         default="focused_v4",
         help=(
             "Generation contract for both no-RAG and multi-document answers. "
             "paper_exact uses only the prompt text reported in RAG2; paper_exact_terminal adds only one "
-            "fixed terminal-line serialization rule; paper_answer_format is the legacy strict contract."
+            "fixed terminal-line serialization rule; paper_answer_format is the legacy strict contract; "
+            "paper_compatible_three_anchor reproduces the new training-data contract: free rationale to a fixed "
+            "reasoning boundary followed by one constrained A/B/C/D token."
         ),
     )
     parser.add_argument(
@@ -561,6 +579,8 @@ def configure_logging(level: str) -> None:
 
 
 def active_no_rag_prompt_version(args: argparse.Namespace) -> str:
+    if args.prompt_profile == "paper_compatible_three_anchor":
+        return ANCHORED_PROMPT_VERSION
     if args.prompt_profile == "paper_exact_terminal":
         return PAPER_EXACT_TERMINAL_PROMPT_VERSION
     if args.prompt_profile == "paper_answer_format":
@@ -571,6 +591,8 @@ def active_no_rag_prompt_version(args: argparse.Namespace) -> str:
 
 
 def active_document_prompt_version(args: argparse.Namespace) -> str:
+    if args.prompt_profile == "paper_compatible_three_anchor":
+        return ANCHORED_PROMPT_VERSION
     if args.prompt_profile == "paper_exact_terminal":
         return PAPER_EXACT_TERMINAL_DOCUMENT_PROMPT_VERSION
     if args.prompt_profile == "paper_answer_format":
@@ -620,18 +642,20 @@ def load_latest_artifacts_with_issues(
         parsed = row.get("parsed") or {}
         if parsed.get("parse_errors") or not parsed.get("rationale_query") or not parsed.get("final_answer"):
             raw_generation = str(row.get("model_raw_generation") or row.get("no_rag_generation") or "")
-            reparsed = parse_mcq_output_for_prompt_profile(
-                raw_generation,
-                normalized_options(sample.raw),
-                (
-                    "paper_exact_terminal"
-                    if prompt_version == PAPER_EXACT_TERMINAL_PROMPT_VERSION
-                    else "paper_exact"
-                    if prompt_version == PAPER_EXACT_PROMPT_VERSION
-                    else "focused_v4"
-                ),
-            )
-            if not reparsed.parse_errors and reparsed.rationale_query and reparsed.final_answer:
+            reparsed = None
+            if prompt_version != ANCHORED_PROMPT_VERSION:
+                reparsed = parse_mcq_output_for_prompt_profile(
+                    raw_generation,
+                    normalized_options(sample.raw),
+                    (
+                        "paper_exact_terminal"
+                        if prompt_version == PAPER_EXACT_TERMINAL_PROMPT_VERSION
+                        else "paper_exact"
+                        if prompt_version == PAPER_EXACT_PROMPT_VERSION
+                        else "focused_v4"
+                    ),
+                )
+            if reparsed is not None and not reparsed.parse_errors and reparsed.rationale_query and reparsed.final_answer:
                 recovered_query = (
                     reparsed.visible_text
                     if prompt_version in {PAPER_EXACT_PROMPT_VERSION, PAPER_EXACT_TERMINAL_PROMPT_VERSION}
@@ -715,6 +739,52 @@ def rationales_are_ready(args: argparse.Namespace, grouped: dict[str, list[Bench
 
 
 def generate_missing_rationales(args: argparse.Namespace) -> None:
+    if args.prompt_profile == "paper_compatible_three_anchor":
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "generate_rag2_anchored_no_rag_train.py"),
+            "--datasets",
+            *args.datasets,
+            "--split",
+            args.split,
+            "--benchmark-root",
+            str(args.benchmark_root / "mcq" / args.collection),
+            "--model-name-or-path",
+            str(args.llm_model_path),
+            "--output-root",
+            str(rationale_artifact_root(args)),
+            "--generation-batch-size",
+            str(args.generation_batch_size),
+            "--max-new-tokens",
+            str(args.rationale_max_new_tokens),
+            "--retry-max-new-tokens",
+            str(max(args.rationale_max_new_tokens, args.rationale_length_retry_max_new_tokens)),
+            "--temperature",
+            str(args.temperature),
+            "--top-p",
+            str(args.top_p),
+            "--tensor-parallel-size",
+            str(args.tensor_parallel_size),
+            "--gpu-memory-utilization",
+            str(args.gpu_memory_utilization),
+            "--llm-max-model-len",
+            str(args.llm_max_model_len),
+            "--vllm-max-num-seqs",
+            str(args.vllm_max_num_seqs),
+            "--vllm-max-num-batched-tokens",
+            str(args.vllm_max_num_batched_tokens),
+            "--vllm-performance-mode",
+            args.vllm_performance_mode,
+        ]
+        if args.regenerate_rationales:
+            command.append("--no-resume")
+        logging.info(
+            "Generating shared anchored no-RAG rationale+answer queries for %s datasets.",
+            len(args.datasets),
+        )
+        subprocess.run(command, check=True, env=os.environ.copy())
+        return
+
     paper_exact = args.prompt_profile in {"paper_exact", "paper_exact_terminal"}
     length_retry_attempts = 0 if paper_exact else args.rationale_length_retry_attempts
     invalid_retry_attempts = 0 if paper_exact else args.rationale_invalid_retry_attempts
@@ -1508,6 +1578,18 @@ def build_document_messages_for_request(
     choice_only: bool,
 ) -> list[dict[str, str]]:
     """Build the exact document-conditioned message list used for generation."""
+    if args.prompt_profile == "paper_compatible_three_anchor":
+        rendered_documents: list[str] = []
+        for row in document_rows:
+            # Match the anchored training traces: chunk body only, with blank
+            # lines as neutral boundaries and no source/title/rank metadata.
+            document_text = " ".join(str(row.get("text") or "").split())
+            if max_doc_chars > 0 and len(document_text) > max_doc_chars:
+                document_text = document_text[: max(0, max_doc_chars - 3)].rstrip() + "..."
+            if document_text:
+                rendered_documents.append(document_text)
+        evidence = "\n\n".join(rendered_documents) or None
+        return [{"role": "user", "content": build_anchored_user_prompt(sample.raw, evidence)}]
     if args.answer_decision_mode == "constrained_choice":
         rendered_documents: list[str] = []
         for row in document_rows:
@@ -1675,7 +1757,11 @@ def dynamic_document_rows(
     # title after ``build_paper_exact_documents_messages`` removed metadata
     # from the final prompt.  The legacy prompt profiles retain their prior
     # title-plus-text budget behavior.
-    include_title_in_budget = args.prompt_profile not in {"paper_exact", "paper_exact_terminal"}
+    include_title_in_budget = args.prompt_profile not in {
+        "paper_exact",
+        "paper_exact_terminal",
+        "paper_compatible_three_anchor",
+    }
     for row in document_rows:
         shell = dict(row)
         shell["title"] = ""
@@ -1697,7 +1783,13 @@ def dynamic_document_rows(
         selected_answer=selected_answer,
         choice_only=choice_only,
     )
-    assistant_prefill = FINAL_ANSWER_PREFILL if args.answer_decision_mode == "constrained_choice" else ""
+    assistant_prefill = (
+        FINAL_ANSWER_PREFILL
+        if args.answer_decision_mode == "constrained_choice"
+        else ANCHORED_RATIONALE_HEADER
+        if args.prompt_profile == "paper_compatible_three_anchor"
+        else ""
+    )
     fixed_prompt_tokens = rendered_token_count(
         tokenizer,
         shell_messages,
@@ -1847,12 +1939,23 @@ def build_generator(args: argparse.Namespace) -> VLLMChatGenerator:
     assistant_prefill = None
     if args.answer_decision_mode == "constrained_choice":
         assistant_prefill = FINAL_ANSWER_PREFILL
+    elif args.prompt_profile == "paper_compatible_three_anchor":
+        assistant_prefill = ANCHORED_RATIONALE_HEADER
+    stop = ["<|im_end|>", "<|eot_id|>"]
+    if args.prompt_profile == "paper_compatible_three_anchor":
+        stop.extend(
+            [
+                ANCHORED_END_REASONING_MARKER,
+                "\nFinal answer:",
+                "\nTherefore, the answer",
+            ]
+        )
     return VLLMChatGenerator(
         model_path=args.llm_model_path,
         max_new_tokens=1 if args.answer_decision_mode == "constrained_choice" else args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
-        stop=["<|im_end|>", "<|eot_id|>"],
+        stop=stop,
         bad_words=["```", "```python", "```text"],
         use_chat_template=True,
         use_tqdm=False,
@@ -1946,6 +2049,61 @@ def generate_rag_answers(
             attempts = [1] * len(outputs)
             terminal_repair_sources: list[str | None] = [None] * len(outputs)
             terminal_primary_texts: list[str | None] = [None] * len(outputs)
+            anchored_decisions: list[dict[str, Any] | None] = [None] * len(outputs)
+
+            if args.prompt_profile == "paper_compatible_three_anchor":
+                rationales: list[str] = []
+                quality_flags: list[list[str]] = []
+                decision_prefixes: list[str] = []
+                for idx, output in enumerate(outputs):
+                    raw_rationale = str(output.text or "").strip()
+                    rationale, flags = normalize_anchored_rationale(raw_rationale)
+                    if output.finish_reason == "length":
+                        flags.append("rationale_length_exhausted")
+                    rationales.append(rationale)
+                    quality_flags.append(sorted(set(flags)))
+                    terminal_primary_texts[idx] = raw_rationale
+                    decision_prefixes.append(
+                        f"{output.prompt}{rationale}\n"
+                        f"{ANCHORED_END_REASONING_MARKER}\n"
+                        "Final answer: ("
+                    )
+                choice_outputs = generator.generate_allowed_single_token_continuations(
+                    decision_prefixes
+                )
+                if len(choice_outputs) != len(outputs):
+                    raise RuntimeError(
+                        "Anchored constrained-choice generation count mismatch: "
+                        f"{len(choice_outputs)} != {len(outputs)}"
+                    )
+                for idx, (sample_tuple, primary, choice_output, rationale, flags) in enumerate(
+                    zip(pending, outputs, choice_outputs, rationales, quality_flags)
+                ):
+                    sample = sample_tuple[1]
+                    selected = str(choice_output.text or "").strip().upper()
+                    if selected not in {"A", "B", "C", "D"}:
+                        raise RuntimeError(
+                            "Anchored constrained decoder returned no valid option for "
+                            f"{sample_key(sample)}: {choice_output.text!r}"
+                        )
+                    options = normalized_options(sample.raw)
+                    canonical = anchored_canonical_response(rationale, selected, options)
+                    query_views = anchored_retrieval_queries(rationale, selected, options)
+                    outputs[idx] = GenerationOutput(
+                        text=canonical,
+                        prompt=primary.prompt,
+                        raw_text=primary.text,
+                        finish_reason=primary.finish_reason,
+                        stop_reason=primary.stop_reason,
+                    )
+                    anchored_decisions[idx] = {
+                        "rationale": rationale,
+                        "rationale_query": query_views["rationale_answer"],
+                        "final_answer": selected,
+                        "parse_errors": flags,
+                    }
+                    terminal_repair_sources[idx] = "anchored_constrained_single_token"
+                    attempts[idx] += 1
 
             if uses_free_terminal_generation(args):
                 needs_choice: list[int] = []
@@ -2018,7 +2176,11 @@ def generate_rag_answers(
             format_retry_attempts = (
                 0
                 if args.answer_decision_mode == "constrained_choice"
-                or args.prompt_profile in {"paper_exact", "paper_exact_terminal"}
+                or args.prompt_profile in {
+                    "paper_exact",
+                    "paper_exact_terminal",
+                    "paper_compatible_three_anchor",
+                }
                 else args.format_retry_attempts
             )
             for _ in range(format_retry_attempts):
@@ -2049,7 +2211,10 @@ def generate_rag_answers(
                     attempts[idx] += 1
 
             unresolved = []
-            if args.answer_decision_mode == "free_generation":
+            if (
+                args.answer_decision_mode == "free_generation"
+                and args.prompt_profile != "paper_compatible_three_anchor"
+            ):
                 for idx, ((_, sample, _), output) in enumerate(zip(pending, outputs)):
                     parsed = parse_mcq_output_for_prompt_profile(
                         output.text, normalized_options(sample.raw), args.prompt_profile
@@ -2094,7 +2259,18 @@ def generate_rag_answers(
                     attempts[idx] += 2
 
             for pending_idx, ((local_idx, sample, docs), output) in enumerate(zip(pending, outputs)):
-                if args.answer_decision_mode == "constrained_choice":
+                if args.prompt_profile == "paper_compatible_three_anchor":
+                    decision = anchored_decisions[pending_idx]
+                    if decision is None:
+                        raise RuntimeError(
+                            f"Missing anchored decision for {sample_key(sample)}"
+                        )
+                    final_answer = str(decision["final_answer"])
+                    rationale = str(decision["rationale"])
+                    rationale_query = str(decision["rationale_query"])
+                    parse_errors = list(decision["parse_errors"])
+                    prediction = final_answer
+                elif args.answer_decision_mode == "constrained_choice":
                     final_answer = extract_selected_option(output.text, sample)
                     if final_answer is None:
                         raise RuntimeError(
@@ -2176,7 +2352,9 @@ def no_rag_results(
         parsed = artifact.get("parsed") or {}
         prediction = str(parsed.get("final_answer") or artifact.get("model_raw_generation") or "")
         messages = (
-            build_paper_answer_format_no_rag_messages(sample.raw)
+            [{"role": "user", "content": build_anchored_user_prompt(sample.raw, None)}]
+            if args.prompt_profile == "paper_compatible_three_anchor"
+            else build_paper_answer_format_no_rag_messages(sample.raw)
             if args.prompt_profile == "paper_answer_format"
             else (
                 build_paper_exact_terminal_no_rag_messages(sample.raw)
@@ -3934,6 +4112,18 @@ def main() -> None:
         "prompt_profile": args.prompt_profile,
         "answer_decision_mode": args.answer_decision_mode,
         "answer_decision_contract": (
+            {
+                "prompt_version": ANCHORED_PROMPT_VERSION,
+                "generation_policy_version": ANCHORED_GENERATION_POLICY_VERSION,
+                "rationale_decoding": "greedy_free_generation_to_fixed_reasoning_boundary",
+                "choice_decoding": "greedy_argmax_over_allowed_single_token_A_B_C_D",
+                "terminal_format": "Final answer: (<OPTION LETTER>) <EXACT OPTION TEXT>",
+                "rationale_generated": True,
+                "parser_used": False,
+                "retrieval_query": "generated rationale plus fixed terminal answer; control markers excluded",
+            }
+            if args.prompt_profile == "paper_compatible_three_anchor"
+            else
             {
                 "prompt_version": PREANSWER_PROMPT_VERSION,
                 "assistant_prefill": FINAL_ANSWER_PREFILL,
