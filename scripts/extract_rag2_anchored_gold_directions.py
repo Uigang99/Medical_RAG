@@ -68,7 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train")
     parser.add_argument("--layer", type=int, default=28)
     parser.add_argument("--anchor", choices=("pre_rationale", "post_rationale", "pre_choice"), default="pre_choice")
-    parser.add_argument("--question-batch-size", type=int, default=16)
+    # Must match the cached h0 extraction batch so eager-attention padding and
+    # bfloat16 reduction geometry are replayed exactly.
+    parser.add_argument("--question-batch-size", type=int, default=32)
     parser.add_argument("--max-input-tokens", type=int, default=8192)
     parser.add_argument("--state-max-abs-tolerance", type=float, default=0.25)
     parser.add_argument("--state-min-cosine", type=float, default=0.999)
@@ -153,7 +155,9 @@ def shard_paths(root: Path, dataset: str, split: str, shard_name: str) -> dict[s
     }
 
 
-def complete_valid(paths: dict[str, Path], count: int, layer: int, anchor: str) -> bool:
+def complete_valid(
+    paths: dict[str, Path], count: int, layer: int, anchor: str, replay_batch_size: int
+) -> bool:
     if any(not paths[name].is_file() for name in ("directions", "questions", "complete")):
         return False
     try:
@@ -165,6 +169,7 @@ def complete_valid(paths: dict[str, Path], count: int, layer: int, anchor: str) 
         and int(marker.get("question_count", -1)) == count
         and int(marker.get("layer", -1)) == layer
         and marker.get("anchor") == anchor
+        and int(marker.get("replay_batch_size", -1)) == replay_batch_size
     )
 
 
@@ -230,23 +235,29 @@ class DirectionExtractor:
             [self.choice_token_ids[label] for label in CHOICES], dtype=torch.long, device=self.device
         )
         self._anchor_indices: torch.Tensor | None = None
+        self._replacement_h0: torch.Tensor | None = None
         self._captured_state: torch.Tensor | None = None
-        self._captured_direction: torch.Tensor | None = None
+        self._captured_leaf: torch.Tensor | None = None
         self._handle = self.block.register_forward_hook(self._hook)
 
-    def _hook(self, _module: Any, _inputs: Any, output: Any) -> None:
+    def _hook(self, _module: Any, _inputs: Any, output: Any) -> Any:
         hidden = output[0] if isinstance(output, tuple) else output
-        if self._anchor_indices is None:
+        if self._anchor_indices is None or self._replacement_h0 is None:
             return
         rows = torch.arange(hidden.shape[0], device=hidden.device)
         self._captured_state = hidden[rows, self._anchor_indices].detach()
-        saved = self._anchor_indices.detach().clone()
-
-        def capture(gradient: torch.Tensor) -> None:
-            batch_rows = torch.arange(gradient.shape[0], device=gradient.device)
-            self._captured_direction = -gradient[batch_rows, saved].detach()
-
-        hidden.register_hook(capture)
+        # The cached h0 is the state used by every downstream score.  Inject it
+        # at the selected anchor and detach the prefix so c is evaluated at
+        # exactly that state while only blocks after --layer retain a graph.
+        leaf = hidden.detach().clone()
+        leaf[rows, self._anchor_indices] = self._replacement_h0.to(
+            device=hidden.device, dtype=hidden.dtype
+        )
+        leaf.requires_grad_(True)
+        self._captured_leaf = leaf
+        if isinstance(output, tuple):
+            return (leaf, *output[1:])
+        return leaf
 
     def close(self) -> None:
         self._handle.remove()
@@ -273,20 +284,22 @@ class DirectionExtractor:
             encodings.append(encoding)
         return encodings
 
-    def forward(self, rows: Sequence[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def forward(
+        self, rows: Sequence[dict[str, Any]], cached_h0: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
         encodings = self.encode_rows(rows)
         input_ids, attention_mask, position_ids, anchors, last = pad_encodings(
             encodings, self.tokenizer.pad_token_id, self.device
         )
         self._anchor_indices = anchors
+        self._replacement_h0 = cached_h0.to(self.device)
         self._captured_state = None
-        self._captured_direction = None
+        self._captured_leaf = None
         batch_rows = torch.arange(input_ids.shape[0], device=self.device)
         try:
-            embeds = self.model.get_input_embeddings()(input_ids).detach().requires_grad_(True)
             with torch.enable_grad():
                 output = self.model.model(
-                    inputs_embeds=embeds,
+                    input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     use_cache=False,
@@ -300,9 +313,13 @@ class DirectionExtractor:
                     device=self.device,
                 )
                 F.cross_entropy(choice_logits, gold, reduction="sum").backward()
-            if self._captured_state is None or self._captured_direction is None:
+            if (
+                self._captured_state is None
+                or self._captured_leaf is None
+                or self._captured_leaf.grad is None
+            ):
                 raise RuntimeError("Selected block hook did not capture state and gradient")
-            directions = self._captured_direction.float()
+            directions = -self._captured_leaf.grad[batch_rows, anchors].detach().float()
             norms = torch.linalg.vector_norm(directions, dim=-1)
             probabilities = F.softmax(choice_logits.detach().float(), dim=-1)
             gold_logprob = F.log_softmax(choice_logits.detach().float(), dim=-1).gather(
@@ -318,22 +335,31 @@ class DirectionExtractor:
             }
         finally:
             self._anchor_indices = None
+            self._replacement_h0 = None
             self._captured_state = None
-            self._captured_direction = None
+            self._captured_leaf = None
 
-    def adaptive_forward(self, rows: Sequence[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def adaptive_forward(
+        self, rows: Sequence[dict[str, Any]], cached_h0: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        oom = False
         try:
-            return self.forward(rows)
+            return self.forward(rows, cached_h0)
         except torch.cuda.OutOfMemoryError:
             if len(rows) <= 1:
                 raise
-            logging.warning("Direction OOM for batch=%d; retrying as two half-batches", len(rows))
-            gc.collect()
-            torch.cuda.empty_cache()
-            middle = len(rows) // 2
-            left = self.adaptive_forward(rows[:middle])
-            right = self.adaptive_forward(rows[middle:])
-            return {key: torch.cat((left[key], right[key]), dim=0) for key in left}
+            oom = True
+        if not oom:  # pragma: no cover - return/exception above is exhaustive
+            raise AssertionError("unreachable")
+        # Retry only after leaving the except block; otherwise the exception
+        # traceback retains the failed CUDA graph throughout recursion.
+        logging.warning("Direction OOM for batch=%d; retrying as two half-batches", len(rows))
+        gc.collect()
+        torch.cuda.empty_cache()
+        middle = len(rows) // 2
+        left = self.adaptive_forward(rows[:middle], cached_h0[:middle])
+        right = self.adaptive_forward(rows[middle:], cached_h0[middle:])
+        return {key: torch.cat((left[key], right[key]), dim=0) for key in left}
 
 
 def validate_contract(args: argparse.Namespace) -> tuple[dict[str, Any], int, int]:
@@ -379,16 +405,19 @@ def process_shard(
     metadata: list[dict[str, Any]] = []
     offset = 0
     for batch in chunks(trace_rows, args.question_batch_size):
-        result = extractor.adaptive_forward(batch)
         expected = cached_h0[offset : offset + len(batch)]
+        result = extractor.adaptive_forward(batch, expected)
         replay = result["h0_replay"]
         max_abs = torch.amax(torch.abs(expected - replay), dim=-1)
         cosine = F.cosine_similarity(expected.float(), replay.float(), dim=-1)
-        invalid = (max_abs > args.state_max_abs_tolerance) & (cosine < args.state_min_cosine)
-        if bool(invalid.any()):
-            local = int(torch.nonzero(invalid, as_tuple=False)[0].item())
+        # Prompt hashes are already exact.  A low replay cosine now acts only
+        # as a gross contract guard because the cached state itself is injected
+        # before computing c; ordinary bf16 replay drift is audit metadata.
+        gross_invalid = cosine < 0.98
+        if bool(gross_invalid.any()):
+            local = int(torch.nonzero(gross_invalid, as_tuple=False)[0].item())
             raise RuntimeError(
-                f"Cached h0 replay mismatch for {batch[local]['sample_id']}: "
+                f"Gross cached h0 replay mismatch for {batch[local]['sample_id']}: "
                 f"max_abs={max_abs[local].item():.6f} cosine={cosine[local].item():.8f}"
             )
         for local, row in enumerate(batch):
@@ -405,6 +434,11 @@ def process_shard(
                     "no_rag_correct": prediction == row["gold_answer"],
                     "h0_replay_max_abs": float(max_abs[local].item()),
                     "h0_replay_cosine": float(cosine[local].item()),
+                    "h0_injected_for_direction": True,
+                    "h0_replay_within_nominal_tolerance": bool(
+                        max_abs[local] <= args.state_max_abs_tolerance
+                        or cosine[local] >= args.state_min_cosine
+                    ),
                 }
             )
         c_units.append(result["c_unit"].half())
@@ -432,6 +466,7 @@ def process_shard(
             "layer": str(args.layer),
             "anchor": args.anchor,
             "vector_semantics": "unit negative gradient of four-choice gold CE at cached h0 anchor",
+            "gradient_graph": "cached h0 intervention at selected block; backward through suffix only",
         },
     )
     atomic_jsonl(output["questions"], metadata)
@@ -445,6 +480,7 @@ def process_shard(
             "question_count": len(metadata),
             "layer": args.layer,
             "anchor": args.anchor,
+            "replay_batch_size": args.question_batch_size,
             "max_h0_replay_difference": max(row["h0_replay_max_abs"] for row in metadata),
             "minimum_h0_replay_cosine": min(row["h0_replay_cosine"] for row in metadata),
         },
@@ -471,7 +507,9 @@ def main() -> None:
             count = int(marker["question_count"])
             output = shard_paths(args.output_root, dataset, args.split, trace_dir.name)
             total += count
-            if args.resume and complete_valid(output, count, args.layer, args.anchor):
+            if args.resume and complete_valid(
+                output, count, args.layer, args.anchor, args.question_batch_size
+            ):
                 completed += count
             shard_plan.append((dataset, trace_dir, feature_dir, output, count))
     logging.info(
@@ -496,7 +534,9 @@ def main() -> None:
     try:
         newly_written = 0
         for dataset, trace_dir, feature_dir, output, count in shard_plan:
-            if args.resume and complete_valid(output, count, args.layer, args.anchor):
+            if args.resume and complete_valid(
+                output, count, args.layer, args.anchor, args.question_batch_size
+            ):
                 continue
             output["root"].mkdir(parents=True, exist_ok=True)
             newly_written += process_shard(
@@ -522,6 +562,7 @@ def main() -> None:
                 "newly_written": newly_written,
                 "layer": args.layer,
                 "anchor": args.anchor,
+                "replay_batch_size": args.question_batch_size,
                 "hidden_size": extractor.hidden_size,
                 "choice_token_ids": extractor.choice_token_ids,
                 "dtype": args.dtype,

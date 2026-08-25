@@ -19,7 +19,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Preparation stage 1/2: gold-answer directio
   --split train \
   --layer 28 \
   --anchor pre_choice \
-  --question-batch-size 16 \
+  --question-batch-size 32 \
   --max-input-tokens 8192 \
   --device cuda:0 \
   --dtype bfloat16 \
