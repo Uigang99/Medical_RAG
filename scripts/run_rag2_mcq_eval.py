@@ -1198,19 +1198,30 @@ def project_paper_balanced_candidates(
         inferred_source_ranks: Counter[str] = Counter()
         source_rank_by_stable_id: dict[str, int] = {}
         for document in initial_docs:
-            source_rank = document.metadata.get("source_retrieval_rank")
-            if source_rank is None:
-                # Legacy candidate caches stored the globally merged dense
-                # order but omitted the source-local rank. The global merge is
-                # score-sorted, so the occurrence index inside each source is
-                # exactly its local dense rank and can be recovered losslessly.
-                inferred_source_ranks[document.source] += 1
-                source_rank = inferred_source_ranks[document.source]
+            # ``initial_docs`` is the globally score-sorted merge of complete
+            # source-local Top-N lists. Therefore the occurrence index within
+            # each source is its exact dense rank (stable sorting preserves
+            # source order on score ties). Derive it from this authoritative
+            # order instead of trusting cached metadata: candidate caches made
+            # before 2026-08-25 could share the metadata dict returned by the
+            # metadata-store row cache, allowing later questions to overwrite
+            # ``source_retrieval_rank`` without changing document identities,
+            # retrieval scores, rerank scores, or filter decisions.
+            logical_source = str(document.metadata.get("retrieval_bucket") or document.source)
+            inferred_source_ranks[logical_source] += 1
+            source_rank = inferred_source_ranks[logical_source]
             source_rank_by_stable_id[document.stable_id] = int(source_rank)
             if int(source_rank) <= top_k:
-                dense_prefix.append(copy.copy(document))
+                projected_document = copy.copy(document)
+                projected_document.metadata = dict(document.metadata)
+                projected_document.metadata["retrieval_bucket"] = logical_source
+                projected_document.metadata["source_retrieval_rank"] = int(source_rank)
+                dense_prefix.append(projected_document)
 
-        actual_source_counts = Counter(document.source for document in dense_prefix)
+        actual_source_counts = Counter(
+            str(document.metadata.get("retrieval_bucket") or document.source)
+            for document in dense_prefix
+        )
         if dict(actual_source_counts) != expected_source_counts or len(dense_prefix) != expected_pool_size:
             raise RuntimeError(
                 "Paper-balanced dense-prefix invariant failed: "
@@ -1220,16 +1231,17 @@ def project_paper_balanced_candidates(
 
         eligible_reranked: list[RetrievedDocument] = []
         for document in reranked_docs:
-            source_rank = document.metadata.get("source_retrieval_rank")
-            if source_rank is None:
-                source_rank = source_rank_by_stable_id.get(document.stable_id)
+            source_rank = source_rank_by_stable_id.get(document.stable_id)
             if source_rank is None:
                 raise RuntimeError(
                     "Paper-balanced projection cannot align a reranked document to the dense pool: "
                     f"row={row_index} document={document.stable_id}"
                 )
             if int(source_rank) <= top_k:
-                eligible_reranked.append(copy.copy(document))
+                projected_document = copy.copy(document)
+                projected_document.metadata = dict(document.metadata)
+                projected_document.metadata["source_retrieval_rank"] = int(source_rank)
+                eligible_reranked.append(projected_document)
         if len(eligible_reranked) != expected_pool_size:
             raise RuntimeError(
                 "Paper-balanced rerank pool is incomplete. The master cache must retain scores/text for "

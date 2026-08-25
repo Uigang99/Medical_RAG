@@ -722,6 +722,12 @@ def materialize_initial_docs(
         docs: list[RetrievedDocument] = []
         for score, source, local_id, bucket_rank, bucket_id in hits[:top_k]:
             doc = retriever._indexes[source].get_document(local_id=local_id, score=score)
+            # MetadataStore may return a cached row whose nested metadata dict
+            # is reused by later get_document calls. Detach it before attaching
+            # query-specific retrieval ranks; otherwise another question that
+            # retrieves the same chunk can silently overwrite this question's
+            # rank while a batch is being materialised.
+            doc.metadata = dict(doc.metadata or {})
             doc.metadata["source_retrieval_rank"] = bucket_rank
             doc.metadata["retrieval_bucket"] = bucket_id
             docs.append(doc)

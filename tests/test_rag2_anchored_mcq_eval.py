@@ -6,8 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+from scripts.build_rag2_filter_candidates import materialize_initial_docs
 from medrag.core import BenchmarkSample, GenerationOutput, RetrievedDocument
 from medrag.rag2_anchored_trace import (
     FORMAT_INSTRUCTION,
@@ -61,6 +64,46 @@ def args() -> SimpleNamespace:
 
 
 class AnchoredMcqEvalTests(unittest.TestCase):
+    def test_candidate_materialization_detaches_query_specific_metadata(self) -> None:
+        shared_metadata: dict[str, object] = {"corpus": "pubmed"}
+
+        class FakeIndex:
+            def get_document(self, local_id: int, score: float) -> RetrievedDocument:
+                return RetrievedDocument(
+                    source="pubmed",
+                    local_id=local_id,
+                    db_id=f"pubmed:{local_id}",
+                    corpus_id=f"pubmed:{local_id}",
+                    chunk_id=None,
+                    doc_id=None,
+                    title=None,
+                    text=f"evidence {local_id}",
+                    retrieval_score=score,
+                    metadata=shared_metadata,
+                )
+
+        fake_retriever = SimpleNamespace(_indexes={"pubmed": FakeIndex()})
+        batches = materialize_initial_docs(
+            retriever=fake_retriever,
+            source_hits={
+                "pubmed": (
+                    np.asarray([[0.9, 0.8]], dtype="float32"),
+                    np.asarray([[1, 2]], dtype="int64"),
+                )
+            },
+            bucket_sources={"pubmed": "pubmed"},
+            bucket_order=["pubmed"],
+            hit_positions=[0],
+            top_k=2,
+        )
+
+        self.assertIsNot(batches[0][0].metadata, batches[0][1].metadata)
+        self.assertEqual(
+            [document.metadata["source_retrieval_rank"] for document in batches[0]],
+            [1, 2],
+        )
+        self.assertNotIn("source_retrieval_rank", shared_metadata)
+
     def test_candidate_cache_preserves_source_local_dense_rank(self) -> None:
         document = RetrievedDocument(
             source="pubmed",
@@ -100,7 +143,10 @@ class AnchoredMcqEvalTests(unittest.TestCase):
                         text=f"{source} evidence {source_rank}",
                         retrieval_score=10.0 - source_rank,
                         rerank_score=float(source_index * 10 + source_rank),
-                        metadata={"source_retrieval_rank": source_rank},
+                        # Simulate the corrupted metadata found in caches made
+                        # before metadata dicts were detached per query. The
+                        # authoritative initial dense order remains intact.
+                        metadata={"source_retrieval_rank": 1},
                     )
                 )
         fully_reranked = sorted(initial, key=lambda document: document.rerank_score, reverse=True)
