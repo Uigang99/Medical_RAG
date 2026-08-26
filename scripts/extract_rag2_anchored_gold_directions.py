@@ -504,11 +504,26 @@ def main() -> None:
     if args.question_batch_size <= 0 or args.max_input_tokens <= 0:
         raise ValueError("Batch size and token limit must be positive")
     manifest, layer_index, anchor_index = validate_contract(args)
+    # Training artifacts historically stored trace_shards and no_rag_features
+    # below one root.  External-test artifacts intentionally keep immutable
+    # generation traces in the run cache and derived tensors in a separate
+    # dataset root.  The feature manifest is the authoritative link between
+    # those locations.
+    trace_root_value = manifest.get("trace_root")
+    trace_root = (
+        Path(str(trace_root_value)).resolve()
+        if trace_root_value
+        else args.no_rag_root.resolve()
+    )
+    if not (trace_root / "generation_manifest.json").is_file():
+        raise FileNotFoundError(
+            f"No-RAG trace root from feature manifest is invalid: {trace_root}"
+        )
     shard_plan: list[tuple[str, Path, Path, dict[str, Path], int]] = []
     total = 0
     completed = 0
     for dataset in args.datasets:
-        trace_dirs = sorted((args.no_rag_root / "trace_shards" / dataset / args.split).glob("shard_*"))
+        trace_dirs = sorted((trace_root / "trace_shards" / dataset / args.split).glob("shard_*"))
         if not trace_dirs:
             raise FileNotFoundError(f"No no-RAG trace shards for {dataset}")
         for trace_dir in trace_dirs:
@@ -566,6 +581,7 @@ def main() -> None:
                 "run_version": RUN_VERSION,
                 "created_at": utc_now(),
                 "no_rag_root": str(args.no_rag_root.resolve()),
+                "trace_root": str(trace_root),
                 "model_name_or_path": str(args.model_name_or_path.resolve()),
                 "datasets": {dataset: int(manifest["datasets"][dataset]) for dataset in args.datasets},
                 "total_questions": total,
