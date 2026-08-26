@@ -44,6 +44,8 @@ prepare() {
 label_pending() {
   stage 2 'GPT-5.6 Terra-medium semantic annotation of pending pairs' 'shown by the live rolling ETA below; merge ETA becomes known in stage 3'
   printf '[%s] Note: semantic annotation uses the Codex service, not CUDA; CUDA_VISIBLE_DEVICES has no effect on this stage.\n' "$(timestamp)"
+  printf '[%s] Frozen original contract: prompt=%s model=%s reasoning=%s Top-8 questions/call=10 web=off workers=8 max_doc_chars=0\n' \
+    "$(timestamp)" 'rag2_codex_evidence_utility_prompt_v3_compact_item_index' 'gpt-5.6-terra' 'medium'
   "$PYTHON" "$REPO/scripts/run_rag2_codex_labeling_pilot.py" \
     --candidates-paths \
       "$PREPARED_ROOT/pending_candidates/medmcqa.jsonl" \

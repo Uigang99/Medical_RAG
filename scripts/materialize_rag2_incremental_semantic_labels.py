@@ -142,9 +142,14 @@ def validate_existing_manifest(path: Path) -> dict[str, Any]:
     expected = {
         "annotation_version": ANNOTATION_VERSION,
         "prompt_version": PROMPT_VERSION,
+        "docs_per_question": 8,
+        "questions_per_batch": 10,
+        "max_doc_chars": 0,
+        "codex_bin": "codex",
         "codex_model_request": "gpt-5.6-terra",
         "codex_reasoning_effort": "medium",
         "web_search_enabled": False,
+        "worker_count": 8,
     }
     mismatches = {
         key: {"expected": expected_value, "actual": value.get(key)}
@@ -155,6 +160,18 @@ def validate_existing_manifest(path: Path) -> dict[str, Any]:
         raise ValueError(f"Existing semantic-label manifest is incompatible: {mismatches}")
     if value.get("status") != "complete":
         raise ValueError(f"Existing semantic-label run is not complete: {path}")
+    logging.info(
+        "Validated original semantic-label contract: prompt=%s model=%s reasoning=%s Top-%d "
+        "questions/call=%d max_doc_chars=%d web=%s workers=%d",
+        value["prompt_version"],
+        value["codex_model_request"],
+        value["codex_reasoning_effort"],
+        value["docs_per_question"],
+        value["questions_per_batch"],
+        value["max_doc_chars"],
+        value["web_search_enabled"],
+        value["worker_count"],
+    )
     return value
 
 
