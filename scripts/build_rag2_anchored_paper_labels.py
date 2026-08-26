@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=base / "filter_training_inputs_rag2_paper_reproduction_v1",
     )
+    parser.add_argument(
+        "--training-label-mode",
+        choices=("binary", "three_class"),
+        default="binary",
+        help=(
+            "Labels materialized into train/val/test. binary reproduces the paper and keeps Discard "
+            "only in audit files; three_class additionally writes Discard as a trainable target."
+        ),
+    )
     parser.add_argument("--datasets", nargs="+", choices=("medmcqa", "medqa"), default=["medmcqa", "medqa"])
     parser.add_argument("--source-split", default="train")
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -529,6 +538,8 @@ def materialize(
                         delta,
                         tau,
                     )
+                    if args.training_label_mode == "three_class" and label == LABEL_DISCARD:
+                        use_for_training = True
                 record = compact_record(
                     row,
                     no_rag,
@@ -557,7 +568,8 @@ def materialize(
                     continue
                 if label == LABEL_DISCARD:
                     handles[dataset]["discarded"].write(json.dumps(record, ensure_ascii=False) + "\n")
-                    continue
+                    if args.training_label_mode == "binary":
+                        continue
                 document = row.get("document") if isinstance(row.get("document"), dict) else {}
                 input_text = build_official_filter_input(
                     question=clean_text(row.get("question")),
@@ -567,9 +579,17 @@ def materialize(
                 training_row = {
                     **record,
                     "input": input_text,
-                    "target": "helpful" if label == LABEL_HELPFUL else "not helpful",
+                    "target": {
+                        LABEL_HELPFUL: "helpful",
+                        LABEL_NOT_HELPFUL: "not helpful",
+                        LABEL_DISCARD: "discard",
+                    }[label],
                     "label": label,
-                    "answer": "[HELPFUL]" if label == LABEL_HELPFUL else "[NOT_HELPFUL]",
+                    "answer": {
+                        LABEL_HELPFUL: "[HELPFUL]",
+                        LABEL_NOT_HELPFUL: "[NOT_HELPFUL]",
+                        LABEL_DISCARD: "[DISCARD]",
+                    }[label],
                 }
                 handles[dataset][split].write(json.dumps(training_row, ensure_ascii=False) + "\n")
                 dataset_stats["training_sources"][split][str(document.get("source") or "unknown")] += 1
@@ -597,7 +617,11 @@ def materialize(
                 "questions": len(split_sets[split]),
                 "pairs": int(sum(counts.values())),
                 "label_counts": dict(counts),
-                "training_pairs": int(counts[LABEL_HELPFUL] + counts[LABEL_NOT_HELPFUL]),
+                "training_pairs": int(
+                    counts[LABEL_HELPFUL]
+                    + counts[LABEL_NOT_HELPFUL]
+                    + (counts[LABEL_DISCARD] if args.training_label_mode == "three_class" else 0)
+                ),
                 "answer_transitions": dict(values["transitions"][split]),
                 "training_sources": dict(values["training_sources"][split]),
             }
@@ -685,6 +709,12 @@ def main() -> None:
             "type": "rag2_paper_reproduction_filter_labels",
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "dataset": dataset,
+            "training_label_mode": args.training_label_mode,
+            "training_target_labels": (
+                ["helpful", "not helpful", "discard"]
+                if args.training_label_mode == "three_class"
+                else ["helpful", "not helpful"]
+            ),
             "source_artifacts": {
                 "no_rag_root": str(args.no_rag_root.resolve()),
                 "document_trace_root": str(args.document_trace_root.resolve()),
@@ -715,8 +745,18 @@ def main() -> None:
                     "correct_to_correct": "Helpful if Delta-PPL >= tau, else Discard",
                     "wrong_to_wrong": "Not Helpful if Delta-PPL >= tau, else Discard",
                 },
-                "training_labels": ["Helpful", "Not Helpful"],
-                "discard_is_not_trained": True,
+                "training_labels": (
+                    ["Helpful", "Not Helpful", "Discard"]
+                    if args.training_label_mode == "three_class"
+                    else ["Helpful", "Not Helpful"]
+                ),
+                "training_label_mode": args.training_label_mode,
+                "discard_is_not_trained": args.training_label_mode == "binary",
+                "discard_semantics": (
+                    "abstention/no-decision target; excluded from final answer-LLM context"
+                    if args.training_label_mode == "three_class"
+                    else "audit-only; excluded from classifier training"
+                ),
             },
             "trace_contract": {
                 "trace_version": EXPECTED_TRACE_VERSION,
@@ -732,7 +772,15 @@ def main() -> None:
             "filter_input": {
                 "format": "released RAG2 evidence-then-question template",
                 "features": "question + options + complete document text only",
-                "targets": {"Helpful": "[HELPFUL]", "Not Helpful": "[NOT_HELPFUL]"},
+                "targets": (
+                    {
+                        "Helpful": "[HELPFUL]",
+                        "Not Helpful": "[NOT_HELPFUL]",
+                        "Discard": "[DISCARD]",
+                    }
+                    if args.training_label_mode == "three_class"
+                    else {"Helpful": "[HELPFUL]", "Not Helpful": "[NOT_HELPFUL]"}
+                ),
             },
             "threshold_summary": threshold_summaries[dataset],
             "no_rag_quality_failures": dict(no_failure_counts[dataset]),

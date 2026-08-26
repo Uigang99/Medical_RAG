@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         default="binary",
         help=(
             "Classifier label space. The default reproduces the historical Helpful/Not Helpful "
-            "filter. 'three_class' additionally trains a Discard/neutral local-evidence class."
+            "filter. 'three_class' additionally trains Discard as an abstention/no-decision target."
         ),
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
@@ -774,7 +774,7 @@ def main() -> None:
             )
         if args.label_mode == "three_class" and "discard" not in observed:
             raise ValueError(
-                f"{split_name} has no Discard targets; use the three-class materialized sentence-label directory."
+                f"{split_name} has no Discard targets; materialize the split with --training-label-mode three_class."
             )
     label_dataset_manifest = read_filter_label_manifest(args)
     summaries = [
@@ -948,7 +948,7 @@ def main() -> None:
         "label_tokens": dict(zip(label_names, label_tokens)),
         "label_token_ids": label_ids,
         "method_status": (
-            "RAG2 local-evidence three-class extension; Discard is an internal neutral/no-clear-utility class"
+            "RAG2 three-class selective extension; Discard is an abstention/no-decision target and only Helpful is eligible for downstream inclusion"
             if args.label_mode == "three_class"
             else "released RAG2 binary filter label space"
         ),

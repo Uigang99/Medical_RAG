@@ -29,6 +29,7 @@ from build_rag2_anchored_paper_labels import (  # noqa: E402
     main,
 )
 from train_rag2_filter_model_paper import tokenize_split  # noqa: E402
+from medrag.filtering.rag2_official import resolve_configured_label_token_ids  # noqa: E402
 
 
 def base_trace(**overrides):
@@ -46,6 +47,29 @@ def base_trace(**overrides):
 
 
 class AnchoredPaperLabelTests(unittest.TestCase):
+    def test_checkpoint_config_selects_three_class_and_historical_binary_contracts(self) -> None:
+        class FakeTokenizer:
+            unk_token_id = 0
+
+            def encode(self, token, add_special_tokens=False):
+                del add_special_tokens
+                return {"[HELPFUL]": [10], "[NOT_HELPFUL]": [11], "[DISCARD]": [12]}[token]
+
+        class ThreeClassConfig:
+            rag2_filter_label_names = ["helpful", "not helpful", "discard"]
+            rag2_filter_label_tokens = ["[HELPFUL]", "[NOT_HELPFUL]", "[DISCARD]"]
+
+        names, token_ids = resolve_configured_label_token_ids(FakeTokenizer(), ThreeClassConfig())
+        self.assertEqual(names, ("helpful", "not helpful", "discard"))
+        self.assertEqual(token_ids, {"helpful": 10, "not helpful": 11, "discard": 12})
+
+        class HistoricalBinaryConfig:
+            rag2_filter_label_tokens = ["[HELPFUL]", "[NOT_HELPFUL]"]
+
+        names, token_ids = resolve_configured_label_token_ids(FakeTokenizer(), HistoricalBinaryConfig())
+        self.assertEqual(names, ("helpful", "not helpful"))
+        self.assertEqual(token_ids, {"helpful": 10, "not helpful": 11})
+
     def test_exact_rag2_decision_table(self) -> None:
         tau = 0.4
         self.assertEqual(assign_label(False, True, -99.0, tau), (LABEL_HELPFUL, True))
@@ -82,6 +106,7 @@ class AnchoredPaperLabelTests(unittest.TestCase):
             no_root = root / "no"
             doc_root = root / "doc"
             output_root = root / "out"
+            three_class_output_root = root / "out_three_class"
             no_shard = no_root / "trace_shards/medqa/train/shard_00000"
             doc_shard = doc_root / "trace_shards/medqa/train/shard_00000"
             no_shard.mkdir(parents=True)
@@ -97,7 +122,7 @@ class AnchoredPaperLabelTests(unittest.TestCase):
                         "sample_id": sample_id,
                     }
                 )
-                for rank, answer, ppl in ((1, "B", 1.0), (2, "A", 2.0)):
+                for rank, answer, ppl in ((1, "B", 1.0), (2, "A", 2.0), (3, "B", 2.0)):
                     doc_rows.append(
                         {
                             **base_trace(
@@ -129,7 +154,7 @@ class AnchoredPaperLabelTests(unittest.TestCase):
                 json.dumps(
                     {
                         "datasets": {"medqa": 10},
-                        "pairs_by_dataset": {"medqa": 20},
+                        "pairs_by_dataset": {"medqa": 30},
                     }
                 ),
                 encoding="utf-8",
@@ -145,7 +170,7 @@ class AnchoredPaperLabelTests(unittest.TestCase):
                 "--datasets",
                 "medqa",
                 "--max-doc-rank",
-                "2",
+                "3",
                 "--no-show-progress",
             ]
             with patch.object(sys, "argv", argv):
@@ -157,6 +182,31 @@ class AnchoredPaperLabelTests(unittest.TestCase):
             self.assertEqual(manifest["summary"]["splits"]["test"]["questions"], 1)
             with (output_root / "medqa/train.jsonl").open() as handle:
                 self.assertEqual(sum(1 for _ in handle), 16)
+
+            three_class_argv = [
+                *argv[: argv.index("--output-root") + 1],
+                str(three_class_output_root),
+                *argv[argv.index("--output-root") + 2 :],
+                "--training-label-mode",
+                "three_class",
+            ]
+            with patch.object(sys, "argv", three_class_argv):
+                main()
+            three_class_manifest = json.loads(
+                (three_class_output_root / "medqa/manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(three_class_manifest["label_protocol"]["training_label_mode"], "three_class")
+            self.assertEqual(
+                three_class_manifest["label_protocol"]["training_labels"],
+                ["Helpful", "Not Helpful", "Discard"],
+            )
+            with (three_class_output_root / "medqa/train.jsonl").open() as handle:
+                three_class_rows = [json.loads(line) for line in handle]
+            self.assertEqual(len(three_class_rows), 24)
+            self.assertEqual(
+                {row["target"] for row in three_class_rows},
+                {"helpful", "not helpful", "discard"},
+            )
 
     def test_released_overflow_preprocessing_repeats_each_pair_target(self) -> None:
         class FakeTokenizer:

@@ -5,8 +5,11 @@ from typing import Any, Mapping
 
 HELPFUL_TOKEN = "[HELPFUL]"
 NOT_HELPFUL_TOKEN = "[NOT_HELPFUL]"
+DISCARD_TOKEN = "[DISCARD]"
 LABEL_TOKENS = (HELPFUL_TOKEN, NOT_HELPFUL_TOKEN)
 LABEL_NAMES = ("helpful", "not helpful")
+THREE_CLASS_LABEL_TOKENS = (HELPFUL_TOKEN, NOT_HELPFUL_TOKEN, DISCARD_TOKEN)
+THREE_CLASS_LABEL_NAMES = ("helpful", "not helpful", "discard")
 OFFICIAL_INSTRUCTION = "Given the following evidence, determine whether it helps answer the provided question."
 RATIONALE_AWARE_INSTRUCTION = (
     "Given an initial rationale, the following evidence, and a question, determine whether "
@@ -145,11 +148,18 @@ def label_name(value: Any) -> str:
         return "helpful"
     if normalized in {"not helpful", "nothelpful", "unhelpful"}:
         return "not helpful"
+    if normalized in {"discard", "abstain", "no decision"}:
+        return "discard"
     raise ValueError(f"Unsupported RAG2 filter label: {value!r}")
 
 
 def label_token(value: Any) -> str:
-    return HELPFUL_TOKEN if label_name(value) == "helpful" else NOT_HELPFUL_TOKEN
+    name = label_name(value)
+    if name == "helpful":
+        return HELPFUL_TOKEN
+    if name == "not helpful":
+        return NOT_HELPFUL_TOKEN
+    return DISCARD_TOKEN
 
 
 def add_label_tokens(tokenizer: Any, model: Any) -> dict[str, int]:
@@ -160,6 +170,7 @@ def add_label_tokens(tokenizer: Any, model: Any) -> dict[str, int]:
     tokenizer.add_tokens(list(LABEL_TOKENS))
     model.resize_token_embeddings(len(tokenizer))
     token_ids = resolve_label_token_ids(tokenizer)
+    model.config.rag2_filter_label_names = list(LABEL_NAMES)
     model.config.rag2_filter_label_tokens = list(LABEL_TOKENS)
     model.config.rag2_filter_input_format = "rag2_official_evidence_question_v1"
     model.config.rag2_filter_decision_rule = "first_decoder_step_two_token_softmax"
@@ -177,3 +188,43 @@ def resolve_label_token_ids(tokenizer: Any) -> dict[str, int]:
             )
         token_ids[name] = int(ids[0])
     return token_ids
+
+
+def resolve_configured_label_token_ids(tokenizer: Any, config: Any) -> tuple[tuple[str, ...], dict[str, int]]:
+    """Resolve the label space recorded by a trained filter checkpoint.
+
+    Historical binary checkpoints do not carry ``rag2_filter_label_names``;
+    they intentionally fall back to the released two-label contract.  New
+    three-class checkpoints store both names and atomic tokens in config.json,
+    which lets every downstream scorer treat Discard as an abstention result
+    while retaining only Helpful documents.
+    """
+
+    configured_names = getattr(config, "rag2_filter_label_names", None)
+    configured_tokens = getattr(config, "rag2_filter_label_tokens", None)
+    if configured_names is None and configured_tokens is None:
+        return LABEL_NAMES, resolve_label_token_ids(tokenizer)
+    # Some historical checkpoints recorded only the token list.  Infer the
+    # canonical ordered names from its length so this extension remains fully
+    # backward compatible with those binary artifacts.
+    if configured_names is None and isinstance(configured_tokens, (list, tuple)):
+        configured_names = LABEL_NAMES if len(configured_tokens) == 2 else THREE_CLASS_LABEL_NAMES
+    if configured_tokens is None and isinstance(configured_names, (list, tuple)):
+        configured_tokens = LABEL_TOKENS if len(configured_names) == 2 else THREE_CLASS_LABEL_TOKENS
+    if not isinstance(configured_names, (list, tuple)) or not isinstance(configured_tokens, (list, tuple)):
+        raise ValueError("Filter config must provide a resolvable label-name/token contract.")
+    names = tuple(label_name(value) for value in configured_names)
+    tokens = tuple(str(value) for value in configured_tokens)
+    if len(names) != len(tokens) or len(set(names)) != len(names):
+        raise ValueError(f"Invalid configured filter label contract: names={names}, tokens={tokens}")
+    if names not in {LABEL_NAMES, THREE_CLASS_LABEL_NAMES}:
+        raise ValueError(f"Unsupported configured filter label order: {names}")
+
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    token_ids: dict[str, int] = {}
+    for name, token in zip(names, tokens):
+        ids = tokenizer.encode(token, add_special_tokens=False)
+        if len(ids) != 1 or (unk_id is not None and ids[0] == unk_id):
+            raise ValueError(f"RAG2 label {token!r} must resolve to one non-UNK token; got ids={ids}.")
+        token_ids[name] = int(ids[0])
+    return names, token_ids

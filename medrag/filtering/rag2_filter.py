@@ -11,10 +11,9 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from ..core import BenchmarkSample, RetrievedDocument
 from .rag2_official import (
-    LABEL_NAMES,
     build_official_filter_input,
     format_options,
-    resolve_label_token_ids,
+    resolve_configured_label_token_ids,
 )
 
 
@@ -94,6 +93,8 @@ def normalize_filter_label(text: Any) -> str:
     value = re.sub(r"[^a-z ]+", "", value).strip()
     if "not helpful" in value or value in {"nothelpful", "unhelpful"}:
         return "not helpful"
+    if "discard" in value or value in {"abstain", "no decision"}:
+        return "discard"
     if "helpful" in value:
         return "helpful"
     return "not helpful"
@@ -140,10 +141,12 @@ class Rag2FlanT5Filter:
         self.model = AutoModelForSeq2SeqLM.from_pretrained(model_path, local_files_only=True, torch_dtype=dtype)
         self.model.to(self.device)
         self.model.eval()
-        self.label_token_ids = (
-            resolve_label_token_ids(self.tokenizer) if self.scoring_method == "special_token" else None
+        self.label_names, configured_token_ids = resolve_configured_label_token_ids(
+            self.tokenizer,
+            self.model.config,
         )
-        logging.info("RAG2 filter model ready on %s", self.device)
+        self.label_token_ids = configured_token_ids if self.scoring_method == "special_token" else None
+        logging.info("RAG2 filter model ready on %s with labels=%s", self.device, self.label_names)
 
     @staticmethod
     def _resolve_device(device: str) -> torch.device:
@@ -185,7 +188,7 @@ class Rag2FlanT5Filter:
         return scores_by_label
 
     def _score_inputs(self, inputs: list[str], progress_callback: Any | None = None) -> list[dict[str, float | str]]:
-        labels = ["helpful", "not helpful"]
+        labels = list(self.label_names)
         scored: list[dict[str, float | str]] = []
         start = 0
         active_batch_size = self.batch_size
@@ -212,26 +215,26 @@ class Rag2FlanT5Filter:
                         if not generated.scores:
                             raise RuntimeError("RAG2 special-token generation returned no decoder scores.")
                         token_ids = self.label_token_ids or {}
-                        score_tensor = generated.scores[0].float()[:, [
-                            token_ids["helpful"],
-                            token_ids["not helpful"],
-                        ]]
+                        score_tensor = generated.scores[0].float()[:, [token_ids[name] for name in labels]]
                         probs = torch.softmax(score_tensor, dim=-1)
                         predictions = score_tensor.argmax(dim=-1)
                         margins = score_tensor[:, 0] - score_tensor[:, 1]
                         for idx in range(len(batch_inputs)):
                             pred_idx = int(predictions[idx].detach().cpu())
-                            prediction = LABEL_NAMES[pred_idx]
-                            scored.append(
-                                {
-                                    "prediction": prediction,
-                                    "raw_prediction": prediction,
-                                    "score_helpful": float(score_tensor[idx, 0].detach().cpu()),
-                                    "score_not_helpful": float(score_tensor[idx, 1].detach().cpu()),
-                                    "margin": float(margins[idx].detach().cpu()),
-                                    "prob_helpful": float(probs[idx, 0].detach().cpu()),
-                                }
-                            )
+                            prediction = labels[pred_idx]
+                            item: dict[str, float | str] = {
+                                "prediction": prediction,
+                                "raw_prediction": prediction,
+                                "score_helpful": float(score_tensor[idx, 0].detach().cpu()),
+                                "score_not_helpful": float(score_tensor[idx, 1].detach().cpu()),
+                                "margin": float(margins[idx].detach().cpu()),
+                                "prob_helpful": float(probs[idx, 0].detach().cpu()),
+                            }
+                            if "discard" in labels:
+                                discard_index = labels.index("discard")
+                                item["score_discard"] = float(score_tensor[idx, discard_index].detach().cpu())
+                                item["prob_discard"] = float(probs[idx, discard_index].detach().cpu())
+                            scored.append(item)
                     elif self.scoring_method == "generate":
                         generated = self.model.generate(
                             **encoded,
@@ -243,16 +246,18 @@ class Rag2FlanT5Filter:
                         predictions = [normalize_filter_label(raw_prediction) for raw_prediction in raw_predictions]
                         for prediction, raw_prediction in zip(predictions, raw_predictions):
                             is_helpful = prediction == "helpful"
-                            scored.append(
-                                {
-                                    "prediction": prediction,
-                                    "raw_prediction": raw_prediction,
-                                    "score_helpful": 1.0 if is_helpful else 0.0,
-                                    "score_not_helpful": 0.0 if is_helpful else 1.0,
-                                    "margin": 1.0 if is_helpful else -1.0,
-                                    "prob_helpful": 1.0 if is_helpful else 0.0,
-                                }
-                            )
+                            item = {
+                                "prediction": prediction,
+                                "raw_prediction": raw_prediction,
+                                "score_helpful": 1.0 if is_helpful else 0.0,
+                                "score_not_helpful": 1.0 if prediction == "not helpful" else 0.0,
+                                "margin": 1.0 if is_helpful else -1.0,
+                                "prob_helpful": 1.0 if is_helpful else 0.0,
+                            }
+                            if "discard" in labels:
+                                item["score_discard"] = 1.0 if prediction == "discard" else 0.0
+                                item["prob_discard"] = 1.0 if prediction == "discard" else 0.0
+                            scored.append(item)
                     else:
                         scores = self._candidate_scores(encoded, labels)
                         score_tensor = torch.stack([scores[label] for label in labels], dim=-1)
@@ -261,16 +266,19 @@ class Rag2FlanT5Filter:
                         margins = score_tensor[:, 0] - score_tensor[:, 1]
                         for idx in range(len(batch_inputs)):
                             pred_idx = int(predictions[idx].detach().cpu())
-                            scored.append(
-                                {
-                                    "prediction": labels[pred_idx],
-                                    "raw_prediction": labels[pred_idx],
-                                    "score_helpful": float(scores["helpful"][idx].detach().cpu()),
-                                    "score_not_helpful": float(scores["not helpful"][idx].detach().cpu()),
-                                    "margin": float(margins[idx].detach().cpu()),
-                                    "prob_helpful": float(probs[idx, 0].detach().cpu()),
-                                }
-                            )
+                            item = {
+                                "prediction": labels[pred_idx],
+                                "raw_prediction": labels[pred_idx],
+                                "score_helpful": float(scores["helpful"][idx].detach().cpu()),
+                                "score_not_helpful": float(scores["not helpful"][idx].detach().cpu()),
+                                "margin": float(margins[idx].detach().cpu()),
+                                "prob_helpful": float(probs[idx, 0].detach().cpu()),
+                            }
+                            if "discard" in labels:
+                                discard_index = labels.index("discard")
+                                item["score_discard"] = float(scores["discard"][idx].detach().cpu())
+                                item["prob_discard"] = float(probs[idx, discard_index].detach().cpu())
+                            scored.append(item)
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower() or active_batch_size <= 1:
                     raise
