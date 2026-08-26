@@ -114,6 +114,8 @@ venv/
 !/scripts/train_rag2_filter_model_two_head.py
 !/scripts/train_rag2_hidden_feature_filter.py
 !/scripts/materialize_rag2_anchored_external_oracle_labels.py
+!/scripts/materialize_rag2_semantic_label_delta.py
+!/scripts/run_rag2_anchored_semantic_label_delta.sh
 
 /tests/*
 !/tests/test_rag2_hidden_score_gold_margin.py
@@ -123,6 +125,7 @@ venv/
 !/tests/test_rag2_direct_choice_summary.py
 !/tests/test_rag2_preanswer_hidden_cache.py
 !/tests/test_rag2_anchored_trace.py
+!/tests/test_rag2_semantic_label_delta.py
 !/tests/test_rag2_anchored_no_rag.py
 !/tests/test_rag2_anchored_document_pipeline.py
 !/tests/test_rag2_two_head_filter.py
