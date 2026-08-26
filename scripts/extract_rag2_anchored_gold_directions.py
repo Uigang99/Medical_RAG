@@ -44,6 +44,16 @@ from medrag.rag2_anchored_trace import (  # noqa: E402
 
 
 RUN_VERSION = "rag2_anchored_gold_direction_selected_anchor_v1"
+MCQ_DATASETS = (
+    "medmcqa",
+    "medqa",
+    "mmlu_anatomy",
+    "mmlu_clinical_knowledge",
+    "mmlu_college_biology",
+    "mmlu_college_medicine",
+    "mmlu_medical_genetics",
+    "mmlu_professional_medicine",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=base / "hidden_utility_extreme_curriculum_v1/gold_directions",
     )
-    parser.add_argument("--datasets", nargs="+", choices=("medmcqa", "medqa"), default=["medmcqa", "medqa"])
+    parser.add_argument("--datasets", nargs="+", choices=MCQ_DATASETS, default=["medmcqa", "medqa"])
     parser.add_argument("--split", default="train")
     parser.add_argument("--layer", type=int, default=28)
     parser.add_argument("--anchor", choices=("pre_rationale", "post_rationale", "pre_choice"), default="pre_choice")

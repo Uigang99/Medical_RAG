@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--oracle-policy",
-        choices=["rag2", "hidden_tau_0", "hidden_tau_0p4"],
+        choices=["rag2", "hidden_tau_0", "hidden_tau_0p4", "hidden_three_class"],
         default=None,
         help="Label/score field to materialize as Helpful for --case oracle_rag.",
     )
@@ -3644,6 +3644,11 @@ def apply_oracle_labels(
             if args.oracle_policy == "rag2":
                 helpful = str(row.get("pseudo_label") or "") == "Helpful" and bool(row.get("quality_pass"))
                 score = row.get("delta_ppl")
+            elif args.oracle_policy == "hidden_three_class":
+                helpful = str(row.get("hidden_label") or "") == "Helpful" and bool(
+                    row.get("hidden_quality_pass")
+                )
+                score = row.get("projection_score")
             else:
                 threshold = 0.0 if args.oracle_policy == "hidden_tau_0" else 0.4
                 score = float(row["projection_score"])
@@ -3653,8 +3658,13 @@ def apply_oracle_labels(
             document.filter_prob_helpful = None
             document.metadata["oracle_filter"] = {
                 "policy": args.oracle_policy,
-                "gold_label": row.get("pseudo_label") if args.oracle_policy == "rag2" else None,
+                "gold_label": (
+                    row.get("pseudo_label")
+                    if args.oracle_policy == "rag2"
+                    else row.get("hidden_label")
+                ),
                 "projection_score": row.get("projection_score"),
+                "hidden_threshold": row.get("hidden_threshold"),
             }
         _rank_scored_documents(documents)
     if len(used) != sum(len(value) for value in reranked_docs):

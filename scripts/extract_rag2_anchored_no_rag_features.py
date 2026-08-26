@@ -43,6 +43,16 @@ from medrag.rag2_anchored_trace import (  # noqa: E402
 RUN_VERSION = "rag2_anchored_no_rag_selected_layer_features_v1"
 GENERATION_RUN_VERSION = "rag2_anchored_no_rag_train_generation_v1"
 DEFAULT_MODEL = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
+MCQ_DATASETS = (
+    "medmcqa",
+    "medqa",
+    "mmlu_anatomy",
+    "mmlu_clinical_knowledge",
+    "mmlu_college_biology",
+    "mmlu_college_medicine",
+    "mmlu_medical_genetics",
+    "mmlu_professional_medicine",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--model-name-or-path", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--datasets", nargs="+", choices=["medmcqa", "medqa"], default=["medmcqa", "medqa"])
+    parser.add_argument("--datasets", nargs="+", choices=MCQ_DATASETS, default=["medmcqa", "medqa"])
     parser.add_argument("--split", default="train")
     parser.add_argument("--layers", nargs="+", type=int, default=[4, 12, 20, 28, 31], help="Zero-based decoder block indices.")
     parser.add_argument("--batch-size", type=int, default=32)

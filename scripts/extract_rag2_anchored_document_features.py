@@ -59,6 +59,16 @@ DEFAULT_NO_RAG_FEATURE_ROOT = (
     / "datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
     / "train_no_rag_anchored_features_v1"
 )
+MCQ_DATASETS = (
+    "medmcqa",
+    "medqa",
+    "mmlu_anatomy",
+    "mmlu_clinical_knowledge",
+    "mmlu_college_biology",
+    "mmlu_college_medicine",
+    "mmlu_medical_genetics",
+    "mmlu_professional_medicine",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--no-rag-feature-root", type=Path, default=DEFAULT_NO_RAG_FEATURE_ROOT)
     parser.add_argument("--model-name-or-path", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--datasets", nargs="+", choices=["medmcqa", "medqa"], default=["medmcqa", "medqa"])
+    parser.add_argument("--datasets", nargs="+", choices=MCQ_DATASETS, default=["medmcqa", "medqa"])
     parser.add_argument("--split", default="train")
     parser.add_argument("--layers", nargs="+", type=int, default=[4, 12, 20, 28, 31])
     parser.add_argument("--batch-size", type=int, default=32)
