@@ -94,6 +94,7 @@ venv/
 !/scripts/run_rag2_anchored_paper_balanced_dynamic_oracle.sh
 !/scripts/run_rag2_anchored_paper_three_class_labeling.sh
 !/scripts/run_rag2_anchored_paper_three_class_filter_training.sh
+!/scripts/run_rag2_anchored_paper_two_head_filter_training.sh
 !/scripts/run_rag2_direct_choice_all_mcq_topk_sweep.sh
 !/scripts/run_rag2_hidden_tau0p4_all_mcq_answer_modes.sh
 !/scripts/run_rag2_mcq_eval.py
@@ -110,6 +111,7 @@ venv/
 !/scripts/summarize_rag2_direct_choice_all_mcq.py
 !/scripts/summarize_rag2_hidden_tau0p4_answer_modes.py
 !/scripts/train_rag2_filter_model_paper.py
+!/scripts/train_rag2_filter_model_two_head.py
 !/scripts/train_rag2_hidden_feature_filter.py
 !/scripts/materialize_rag2_anchored_external_oracle_labels.py
 
@@ -123,3 +125,4 @@ venv/
 !/tests/test_rag2_anchored_trace.py
 !/tests/test_rag2_anchored_no_rag.py
 !/tests/test_rag2_anchored_document_pipeline.py
+!/tests/test_rag2_two_head_filter.py
