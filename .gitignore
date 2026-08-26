@@ -80,6 +80,7 @@ venv/
 !/scripts/generate_rag2_no_rag_rationales.py
 !/scripts/label_rag2_candidates_with_codex.py
 !/scripts/materialize_rag2_preanswer_hidden_labels.py
+!/scripts/materialize_rag2_incremental_semantic_labels.py
 !/scripts/monitor_rag2_codex_labeling.py
 !/scripts/monitor_rag2_codex_semantic_labels.py
 !/scripts/precompute_rag2_rationale_embeddings.py
@@ -88,6 +89,7 @@ venv/
 !/scripts/prepare_rag2_rationale_candidates.py
 !/scripts/reparse_rag2_paper_exact_answers.py
 !/scripts/run_rag2_codex_labeling_pilot.py
+!/scripts/run_rag2_incremental_terra_semantic_labels_three_anchor_top8.sh
 !/scripts/run_rag2_anchored_train_no_rag_features.sh
 !/scripts/run_rag2_anchored_train_document_traces_features.sh
 !/scripts/run_rag2_anchored_train_retrieval_rerank.sh
@@ -120,6 +122,7 @@ venv/
 /tests/*
 !/tests/test_rag2_hidden_score_gold_margin.py
 !/tests/test_rag2_codex_labeling_resilience.py
+!/tests/test_rag2_incremental_semantic_labels.py
 !/tests/test_rag2_mcq.py
 !/tests/test_rag2_oracle.py
 !/tests/test_rag2_direct_choice_summary.py

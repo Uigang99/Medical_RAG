@@ -16,6 +16,20 @@ SPEC.loader.exec_module(MODULE)
 
 
 class Rag2CodexLabelingResilienceTest(unittest.TestCase):
+    def test_incremental_rows_allow_fewer_documents_without_reindexing(self) -> None:
+        row = {
+            "sample_id": "medqa:train:1",
+            "candidate_documents": [
+                {"rerank_rank": 3, "stable_id": "doc-c", "source": "pmc", "text": "third"},
+                {"rerank_rank": 1, "stable_id": "doc-a", "source": "cpg", "text": "first"},
+            ],
+        }
+        with self.assertRaises(ValueError):
+            MODULE.selected_documents(row, 8, 0, False)
+        selected = MODULE.selected_documents(row, 8, 0, True)
+        self.assertEqual([item["doc_rank"] for item in selected], [1, 3])
+        self.assertEqual([item["doc_stable_id"] for item in selected], ["doc-a", "doc-c"])
+
     def test_capacity_error_is_extracted_from_jsonl_stdout(self) -> None:
         stdout = "\n".join(
             [

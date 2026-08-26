@@ -79,6 +79,16 @@ def parse_args() -> argparse.Namespace:
         help="Take this many highest ranked reranked chunks per question (default: 10).",
     )
     parser.add_argument(
+        "--allow-fewer-documents",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Permit a candidate row to contain between one and --docs-per-question documents. "
+            "This is intended for incremental annotation after already-labelled pairs have been removed. "
+            "Off by default, preserving the original fixed-Top-k input contract."
+        ),
+    )
+    parser.add_argument(
         "--questions-per-batch",
         type=int,
         default=10,
@@ -275,7 +285,12 @@ def document_pair_id(sample_id: str, document: dict[str, Any], rank: int) -> str
     return f"{sample_id}::{rank}::{stable_id}"
 
 
-def selected_documents(row: dict[str, Any], docs_per_question: int, max_doc_chars: int) -> list[dict[str, Any]]:
+def selected_documents(
+    row: dict[str, Any],
+    docs_per_question: int,
+    max_doc_chars: int,
+    allow_fewer_documents: bool = False,
+) -> list[dict[str, Any]]:
     raw_documents = row.get("candidate_documents")
     if not isinstance(raw_documents, list):
         raise ValueError(f"Missing candidate_documents for {row.get('sample_id')}")
@@ -289,7 +304,9 @@ def selected_documents(row: dict[str, Any], docs_per_question: int, max_doc_char
         return rank, stable
 
     ordered = sorted((item for item in raw_documents if isinstance(item, dict)), key=rank_key)
-    if len(ordered) < docs_per_question:
+    if not ordered:
+        raise ValueError(f"Expected at least one reranked document for {row.get('sample_id')}")
+    if len(ordered) < docs_per_question and not allow_fewer_documents:
         raise ValueError(
             f"Expected at least {docs_per_question} reranked documents for {row.get('sample_id')}, found {len(ordered)}"
         )
@@ -324,7 +341,12 @@ def selected_documents(row: dict[str, Any], docs_per_question: int, max_doc_char
     return result
 
 
-def make_question_item(row: dict[str, Any], docs_per_question: int, max_doc_chars: int) -> dict[str, Any]:
+def make_question_item(
+    row: dict[str, Any],
+    docs_per_question: int,
+    max_doc_chars: int,
+    allow_fewer_documents: bool = False,
+) -> dict[str, Any]:
     sample_id = clean_text(row.get("sample_id"))
     dataset = clean_text(row.get("dataset")).lower()
     question = clean_text(row.get("question"))
@@ -332,7 +354,7 @@ def make_question_item(row: dict[str, Any], docs_per_question: int, max_doc_char
         raise ValueError(f"Candidate row missing sample_id/dataset/question: {row.get('sample_id')}")
     options = canonical_options(row)
     answers = canonical_answers(row, options)
-    documents = selected_documents(row, docs_per_question, max_doc_chars)
+    documents = selected_documents(row, docs_per_question, max_doc_chars, allow_fewer_documents)
     return {
         "dataset": dataset,
         "sample_id": sample_id,
@@ -348,7 +370,12 @@ def iter_question_items(path: Path, args: argparse.Namespace) -> Iterator[dict[s
     for index, row in enumerate(iter_jsonl(path)):
         if args.limit_questions and index >= args.limit_questions:
             break
-        item = make_question_item(row, args.docs_per_question, args.max_doc_chars)
+        item = make_question_item(
+            row,
+            args.docs_per_question,
+            args.max_doc_chars,
+            args.allow_fewer_documents,
+        )
         if expected_dataset is None:
             expected_dataset = item["dataset"]
         elif item["dataset"] != expected_dataset:
@@ -1062,6 +1089,7 @@ def write_pending_plan(
         "created_at": utc_now(),
         "candidates_paths": [str(path.resolve()) for path in args.candidates_paths],
         "docs_per_question": args.docs_per_question,
+        "allow_fewer_documents": bool(args.allow_fewer_documents),
         "questions_per_batch": args.questions_per_batch,
         "dataset_counts": dataset_counts,
         "reusable_pairs": reusable_pairs,
@@ -1090,6 +1118,8 @@ def load_pending_plan(args: argparse.Namespace) -> list[dict[str, Any]] | None:
         raise ValueError("Pending plan candidates paths do not match this run")
     if value.get("docs_per_question") != args.docs_per_question:
         raise ValueError("Pending plan docs-per-question does not match this run")
+    if bool(value.get("allow_fewer_documents", False)) != bool(args.allow_fewer_documents):
+        raise ValueError("Pending plan allow-fewer-documents setting does not match this run")
     if value.get("questions_per_batch") != args.questions_per_batch:
         raise ValueError("Pending plan questions-per-batch does not match this run")
     entries = value.get("pending_batches")
@@ -1126,6 +1156,7 @@ def write_run_manifest(
         "status": status,
         "candidates_paths": [str(path.resolve()) for path in args.candidates_paths],
         "docs_per_question": args.docs_per_question,
+        "allow_fewer_documents": bool(args.allow_fewer_documents),
         "questions_per_batch": args.questions_per_batch,
         "max_doc_chars": args.max_doc_chars,
         "codex_bin": args.codex_bin,
@@ -1236,14 +1267,15 @@ def run(args: argparse.Namespace) -> None:
         }
         assigned_pairs = sum(int(entry["pair_count"]) for entry in assigned_entries)
     elif not args.consolidate_only and args.worker_count > 1:
+        # Fixed Top-k runs can derive this count arithmetically, but an
+        # incremental run may contain 1..k pending documents per question.
+        # Count the actual batch metadata so each worker's progress/ETA remains
+        # exact in both modes.
         assigned_pairs = 0
-        for value in dataset_counts.values():
-            questions = value["questions"]
-            for batch_index in range(value["planned_batches"]):
-                if batch_index % args.worker_count != args.worker_index:
-                    continue
-                batch_questions = min(args.questions_per_batch, questions - batch_index * args.questions_per_batch)
-                assigned_pairs += batch_questions * args.docs_per_question
+        for path in args.candidates_paths:
+            for _dataset, batch_index, question_batch in expected_batches(path, args):
+                if batch_index % args.worker_count == args.worker_index:
+                    assigned_pairs += len(flatten_batch_metadata(question_batch))
     logging.info(
         "Planned Codex semantic labelling: datasets=%s questions=%d pairs=%d batches=%d (%d question(s)/batch, Top-%d)",
         ",".join(sorted(dataset_counts)),

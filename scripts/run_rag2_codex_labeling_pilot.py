@@ -65,6 +65,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional writable SQLite status DB, useful when resuming artifacts created by another Linux user.",
     )
     parser.add_argument("--docs-per-question", type=int, default=10)
+    parser.add_argument(
+        "--allow-fewer-documents",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow 1..docs-per-question documents in each row. Use this only for "
+            "incremental annotation candidates after reusable pairs were removed."
+        ),
+    )
     parser.add_argument("--questions-per-batch", type=int, default=10)
     parser.add_argument(
         "--limit-questions",
@@ -161,6 +170,7 @@ def worker_command(
         "--log-level",
         args.log_level,
     ]
+    command.append("--allow-fewer-documents" if args.allow_fewer_documents else "--no-allow-fewer-documents")
     if args.completed_batches_root is not None:
         command.extend(["--completed-batches-root", str(args.completed_batches_root)])
     command.append("--enable-web-search" if args.enable_web_search else "--no-enable-web-search")

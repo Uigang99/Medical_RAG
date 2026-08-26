@@ -302,7 +302,7 @@ def render(
         [
             "",
             f"Rate/ETA use only the latest {rate_window_batches} atomically completed batches; retained work from older/slow runs does not depress the estimate.",
-            "The four configurations are run sequentially, so an overall ETA would be misleading until each model has an observed rate.",
+            "Requested configurations run sequentially, so a multi-model overall ETA is unavailable until each model has an observed rate.",
         ]
     )
     return "\n".join(lines)
