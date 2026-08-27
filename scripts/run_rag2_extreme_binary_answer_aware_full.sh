@@ -14,6 +14,10 @@ INPUT_ROOT="${INPUT_ROOT:-${BASE}/extreme_utility_binary_answer_aware_tau0p2_v1}
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/user/Uiheon/models/RAG2-ExtremeUtilityBinaryAnswerAware-FlanT5-large}"
 RUN_TAG="${RUN_TAG:-tau0p2_four_group_full_v1}"
 EXTREME_THRESHOLD="${EXTREME_THRESHOLD:-0.2}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-1024}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -86,6 +90,7 @@ for DATASET in "${DATASETS[@]}"; do
     ETA_TEXT="unknown until the first training stage completes"
   fi
   echo "[$(date '+%F %T')] Overall ${COMPLETED_STAGES}/${TOTAL_STAGES}; stage=train ${DATASET} extreme Helpful/Harmful; overall ETA=${ETA_TEXT}"
+  echo "[$(date '+%F %T')] Training memory profile: train_batch=${TRAIN_BATCH_SIZE} eval_batch=${EVAL_BATCH_SIZE} gradient_accumulation=${GRADIENT_ACCUMULATION_STEPS} max_seq_length=${MAX_SEQ_LENGTH}"
 
   "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/train_rag2_filter_model_paper.py" \
     --dataset "${DATASET}" \
@@ -101,10 +106,10 @@ for DATASET in "${DATASETS[@]}"; do
     --max-doc-rank 0 \
     --num-train-epochs "${EPOCHS}" \
     --learning-rate 3e-5 \
-    --per-device-train-batch-size "${TRAIN_BATCH_SIZE:-32}" \
-    --per-device-eval-batch-size "${EVAL_BATCH_SIZE:-64}" \
-    --gradient-accumulation-steps 1 \
-    --max-seq-length 1024 \
+    --per-device-train-batch-size "${TRAIN_BATCH_SIZE}" \
+    --per-device-eval-batch-size "${EVAL_BATCH_SIZE}" \
+    --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
+    --max-seq-length "${MAX_SEQ_LENGTH}" \
     --overlength-policy drop \
     --max-target-length 8 \
     --weight-decay 0.01 \
