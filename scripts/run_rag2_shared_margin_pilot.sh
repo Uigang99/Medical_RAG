@@ -24,7 +24,19 @@ export TOKENIZERS_PARALLELISM=true
 
 TRAIN_QUESTIONS="${PILOT_TRAIN_QUESTIONS:-5000}"
 EVAL_QUESTIONS="${PILOT_EVAL_QUESTIONS:-1000}"
-EPOCHS="${PILOT_EPOCHS:-5}"
+TRAIN_QUESTIONS_PER_BATCH="${TRAIN_QUESTIONS_PER_BATCH:-16}"
+EVAL_QUESTIONS_PER_BATCH="${EVAL_QUESTIONS_PER_BATCH:-32}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+
+if [[ "${DATASET}" == "medmcqa" ]]; then
+  DEFAULT_EPOCHS=3
+  DEFAULT_EARLY_STOPPING_PATIENCE=1
+else
+  DEFAULT_EPOCHS=5
+  DEFAULT_EARLY_STOPPING_PATIENCE=2
+fi
+EPOCHS="${PILOT_EPOCHS:-${DEFAULT_EPOCHS}}"
+EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-${DEFAULT_EARLY_STOPPING_PATIENCE}}"
 
 RESUME_ARGS=()
 if [[ -n "${RESUME_FROM_CHECKPOINT:-}" ]]; then
@@ -37,13 +49,13 @@ exec "${PYTHON_BIN}" \
   --prepared-root "${PREPARED_ROOT}" \
   --model-name-or-path "/home/user/Uiheon/models/Flan-T5-large" \
   --output-root "${OUTPUT_ROOT}" \
-  --run-name "${DATASET}_shared_m0_md_pilot_q${TRAIN_QUESTIONS}_epoch${EPOCHS}" \
+  --run-name "${DATASET}_shared_m0_md_pilot_q${TRAIN_QUESTIONS}_batch${TRAIN_QUESTIONS_PER_BATCH}_epoch${EPOCHS}" \
   --num-train-epochs "${EPOCHS}" \
   --max-train-questions "${TRAIN_QUESTIONS}" \
   --max-eval-questions "${EVAL_QUESTIONS}" \
-  --train-questions-per-batch 4 \
-  --eval-questions-per-batch 8 \
-  --gradient-accumulation-steps 4 \
+  --train-questions-per-batch "${TRAIN_QUESTIONS_PER_BATCH}" \
+  --eval-questions-per-batch "${EVAL_QUESTIONS_PER_BATCH}" \
+  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
   --encoder-learning-rate 1e-5 \
   --head-learning-rate 2e-4 \
   --weight-decay 0.01 \
@@ -56,12 +68,12 @@ exec "${PYTHON_BIN}" \
   --dropout 0.1 \
   --trainable-encoder-layers 4 \
   --max-input-tokens 512 \
-  --early-stopping-patience 2 \
+  --early-stopping-patience "${EARLY_STOPPING_PATIENCE}" \
   --minimum-improvement 1e-4 \
   --trace-shard-cache-size 8 \
   --bf16 \
   --tf32 \
-  --gradient-checkpointing \
+  --no-gradient-checkpointing \
   --show-progress \
   --logging-steps 50 \
   --seed 42 \
