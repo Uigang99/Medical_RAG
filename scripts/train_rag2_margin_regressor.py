@@ -54,7 +54,7 @@ from medrag.filtering.rag2_official import build_official_filter_input, format_o
 from medrag.progress import PipelineProgress  # noqa: E402
 
 
-TRAINER_VERSION = "rag2_text_margin_regression_trainer_v2_threshold_audit"
+TRAINER_VERSION = "rag2_text_margin_regression_trainer_v3_pairwise_utility"
 PREPARED_VERSION = "rag2_margin_regression_pointer_splits_v1"
 ACTION_NAMES = ("helpful", "neutral", "harmful")
 
@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-train-epochs", type=int, required=True)
     parser.add_argument("--train-documents-per-batch", type=int, default=64)
     parser.add_argument("--eval-documents-per-batch", type=int, default=128)
+    parser.add_argument(
+        "--train-questions-per-batch",
+        type=int,
+        default=16,
+        help="Used when pairwise ranking is enabled so all documents for a question share a batch.",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
     parser.add_argument("--encoder-learning-rate", type=float, default=1e-5)
     parser.add_argument("--head-learning-rate", type=float, default=2e-4)
@@ -105,9 +111,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint-metric",
-        choices=("action_macro_f1", "spearman"),
+        choices=("action_macro_f1", "spearman", "within_question_spearman"),
         default="action_macro_f1",
     )
+    parser.add_argument("--pairwise-ranking", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pairwise-loss-weight", type=float, default=0.05)
+    parser.add_argument("--pairwise-min-target-gap", type=float, default=0.1)
+    parser.add_argument("--pairwise-temperature", type=float, default=0.1)
     parser.add_argument("--head-hidden-size", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--trainable-encoder-layers", type=int, default=4)
@@ -278,6 +288,61 @@ class ShardBatchSampler(Sampler[list[int]]):
             yield remainders
 
 
+class ShardQuestionBatchSampler(Sampler[list[int]]):
+    """Keep every document for a question together while retaining shard locality."""
+
+    def __init__(self, dataset: Dataset, questions_per_batch: int, seed: int, shuffle: bool) -> None:
+        self.questions_per_batch = int(questions_per_batch)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+        question_rows: dict[str, list[int]] = defaultdict(list)
+        question_shards: dict[str, str] = {}
+        for index, (sample_id, shard) in enumerate(zip(dataset["sample_id"], dataset["trace_shard"])):
+            sample = str(sample_id)
+            shard_name = str(shard)
+            previous = question_shards.setdefault(sample, shard_name)
+            if previous != shard_name:
+                raise RuntimeError(f"Question spans multiple trace shards: {sample}")
+            question_rows[sample].append(index)
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for sample, shard in question_shards.items():
+            grouped[shard].append(sample)
+        self.question_rows = question_rows
+        self.grouped = dict(grouped)
+        self.question_count = len(question_rows)
+        self.length = math.ceil(self.question_count / self.questions_per_batch)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        shards = list(self.grouped)
+        if self.shuffle:
+            generator.shuffle(shards)
+        remainders: list[str] = []
+        for shard in shards:
+            questions = list(self.grouped[shard])
+            if self.shuffle:
+                generator.shuffle(questions)
+            full_end = (len(questions) // self.questions_per_batch) * self.questions_per_batch
+            for start in range(0, full_end, self.questions_per_batch):
+                yield [
+                    index
+                    for sample in questions[start : start + self.questions_per_batch]
+                    for index in self.question_rows[sample]
+                ]
+            remainders.extend(questions[full_end:])
+            while len(remainders) >= self.questions_per_batch:
+                selected = remainders[: self.questions_per_batch]
+                del remainders[: self.questions_per_batch]
+                yield [index for sample in selected for index in self.question_rows[sample]]
+        if remainders:
+            yield [index for sample in remainders for index in self.question_rows[sample]]
+
+
 class MarginCollator:
     def __init__(self, tokenizer: Any, store: TraceTextStore, args: argparse.Namespace) -> None:
         self.tokenizer = tokenizer
@@ -286,6 +351,10 @@ class MarginCollator:
 
     def __call__(self, rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         inputs = [self.store.official_input(row) for row in rows]
+        sample_ids = [str(row["sample_id"]) for row in rows]
+        sample_to_index = {
+            sample: index for index, sample in enumerate(dict.fromkeys(sample_ids))
+        }
         tokens = self.tokenizer(
             inputs,
             padding=True,
@@ -301,8 +370,12 @@ class MarginCollator:
             "no_rag_correct": torch.tensor(
                 [bool(row["no_rag_correct_audit_only"]) for row in rows], dtype=torch.bool
             ),
-            "sample_ids": [str(row["sample_id"]) for row in rows],
+            "sample_ids": sample_ids,
             "pair_ids": [str(row["pair_id"]) for row in rows],
+            "question_index": torch.tensor(
+                [sample_to_index[sample] for sample in sample_ids],
+                dtype=torch.long,
+            ),
         }
 
 
@@ -320,6 +393,53 @@ def make_loader(
         num_workers=0,
         pin_memory=True,
     )
+
+
+def make_question_loader(
+    dataset: Dataset,
+    collator: MarginCollator,
+    questions_per_batch: int,
+    seed: int,
+    shuffle: bool,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_sampler=ShardQuestionBatchSampler(dataset, questions_per_batch, seed, shuffle),
+        collate_fn=collator,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+
+def within_question_pairwise_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    question_index: torch.Tensor,
+    *,
+    min_target_gap: float,
+    temperature: float,
+) -> tuple[torch.Tensor, int, int]:
+    """Logistic ranking loss over confidently ordered documents of each question."""
+
+    question_losses: list[torch.Tensor] = []
+    comparisons = 0
+    for group in torch.unique(question_index):
+        positions = question_index == group
+        group_prediction = prediction[positions]
+        group_target = target[positions]
+        target_difference = group_target[:, None] - group_target[None, :]
+        preferred = target_difference >= float(min_target_gap)
+        count = int(preferred.sum().item())
+        if count == 0:
+            continue
+        prediction_difference = group_prediction[:, None] - group_prediction[None, :]
+        question_losses.append(
+            F.softplus(-prediction_difference[preferred] / float(temperature)).mean()
+        )
+        comparisons += count
+    if not question_losses:
+        return prediction.sum() * 0.0, 0, 0
+    return torch.stack(question_losses).mean(), len(question_losses), comparisons
 
 
 def regression_metrics(target: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
@@ -533,6 +653,14 @@ def main() -> None:
         raise ValueError("utility-threshold must be in (0,1)")
     if args.extreme_sample_weight < 1:
         raise ValueError("extreme-sample-weight must be at least 1")
+    if args.train_questions_per_batch < 1:
+        raise ValueError("train-questions-per-batch must be positive")
+    if args.pairwise_ranking and (
+        args.pairwise_loss_weight <= 0
+        or args.pairwise_min_target_gap <= 0
+        or args.pairwise_temperature <= 0
+    ):
+        raise ValueError("Pairwise loss weight, target gap, and temperature must be positive")
     if args.early_stopping_patience < 1:
         raise ValueError("early-stopping-patience must be positive")
     set_seed(args.seed)
@@ -553,8 +681,17 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_name_or_path), use_fast=True)
     store = TraceTextStore(trace_root, args.dataset, source_split, args.trace_shard_cache_size)
     collator = MarginCollator(tokenizer, store, args)
+    train_loader = (
+        make_question_loader(
+            datasets["train"], collator, args.train_questions_per_batch, args.seed, True
+        )
+        if args.pairwise_ranking
+        else make_loader(
+            datasets["train"], collator, args.train_documents_per_batch, args.seed, True
+        )
+    )
     loaders = {
-        "train": make_loader(datasets["train"], collator, args.train_documents_per_batch, args.seed, True),
+        "train": train_loader,
         "validation": make_loader(datasets["validation"], collator, args.eval_documents_per_batch, args.seed, False),
         "test": make_loader(datasets["test"], collator, args.eval_documents_per_batch, args.seed, False),
     }
@@ -647,7 +784,9 @@ def main() -> None:
         "sole_supervision": "utility_target = sigmoid(m_D,T=1)-sigmoid(m_0,T=1)",
         "loss": (
             f"Huber regression(delta={args.huber_delta}); samples with "
-            f"|u|>={args.utility_threshold} receive weight {args.extreme_sample_weight}"
+            f"|u|>={args.utility_threshold} receive weight {args.extreme_sample_weight}; "
+            f"pairwise={args.pairwise_ranking} weight={args.pairwise_loss_weight} "
+            f"minimum_gap={args.pairwise_min_target_gap} temperature={args.pairwise_temperature}"
         ),
         "forbidden_model_inputs": [
             "gold answer", "teacher logits/margins", "No-RAG correctness", "answer transition", "hidden states", "RAG2 label"
@@ -678,6 +817,10 @@ def main() -> None:
                 f"2/3 train epoch {epoch}/{args.num_train_epochs}", total=len(datasets["train"])
             )
             rolling_loss = 0.0
+            rolling_pointwise = 0.0
+            rolling_pairwise = 0.0
+            rolling_pair_questions = 0
+            rolling_comparisons = 0
             rolling_batches = 0
             for batch_index, batch in enumerate(loaders["train"], 1):
                 target = batch["utility_target"].to(device, non_blocking=True)
@@ -697,7 +840,20 @@ def main() -> None:
                         torch.full_like(target, args.extreme_sample_weight),
                         torch.ones_like(target),
                     )
-                    loss = (per_sample_loss * sample_weight).sum() / sample_weight.sum().clamp_min(1)
+                    pointwise_loss = (per_sample_loss * sample_weight).sum() / sample_weight.sum().clamp_min(1)
+                    if args.pairwise_ranking:
+                        pairwise_loss, pair_questions, comparisons = within_question_pairwise_loss(
+                            output["utility_score"].float(),
+                            target.float(),
+                            batch["question_index"].to(device, non_blocking=True),
+                            min_target_gap=args.pairwise_min_target_gap,
+                            temperature=args.pairwise_temperature,
+                        )
+                    else:
+                        pairwise_loss = pointwise_loss * 0.0
+                        pair_questions = 0
+                        comparisons = 0
+                    loss = pointwise_loss + args.pairwise_loss_weight * pairwise_loss
                     scaled = loss / args.gradient_accumulation_steps
                 scaled.backward()
                 update = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(loaders["train"])
@@ -712,13 +868,24 @@ def main() -> None:
                     optimizer.zero_grad(set_to_none=True)
                     trainer_state["global_step"] += 1
                 rolling_loss += float(loss.detach().cpu())
+                rolling_pointwise += float(pointwise_loss.detach().cpu())
+                rolling_pairwise += float(pairwise_loss.detach().cpu())
+                rolling_pair_questions += int(pair_questions)
+                rolling_comparisons += int(comparisons)
                 rolling_batches += 1
                 progress.update(len(batch["pair_ids"]))
                 if batch_index % args.logging_steps == 0:
                     progress.set_detail(
-                        f"batch={batch_index}/{len(loaders['train'])} loss={rolling_loss/rolling_batches:.6f}"
+                        f"batch={batch_index}/{len(loaders['train'])} loss={rolling_loss/rolling_batches:.5f} "
+                        f"point/pair={rolling_pointwise/rolling_batches:.4f}/"
+                        f"{rolling_pairwise/rolling_batches:.4f} "
+                        f"pair_q/cmp={rolling_pair_questions}/{rolling_comparisons}"
                     )
                     rolling_loss = 0.0
+                    rolling_pointwise = 0.0
+                    rolling_pairwise = 0.0
+                    rolling_pair_questions = 0
+                    rolling_comparisons = 0
                     rolling_batches = 0
 
             validation = evaluate(
@@ -731,6 +898,8 @@ def main() -> None:
             )
             if args.checkpoint_metric == "action_macro_f1":
                 metric = float(validation["action"]["macro_f1"])
+            elif args.checkpoint_metric == "within_question_spearman":
+                metric = float(validation["within_question"]["mean_spearman"])
             else:
                 metric = float(validation["overall"]["spearman"])
             if not math.isfinite(metric):
@@ -749,11 +918,12 @@ def main() -> None:
             save_checkpoint(output_dir / "last_checkpoint", model, optimizer, scheduler, trainer_state)
             atomic_json(output_dir / "training_history.json", trainer_state)
             logging.info(
-                "Epoch %d: val macro-F1=%.5f Spearman=%.5f MAE=%.5f "
+                "Epoch %d: val macro-F1=%.5f Spearman=%.5f within-Q=%.5f MAE=%.5f "
                 "correct/wrong macro-F1=%.5f/%.5f best=%s",
                 epoch,
                 validation["action"]["macro_f1"],
                 validation["overall"]["spearman"],
+                validation["within_question"]["mean_spearman"],
                 validation["overall"]["mae"],
                 validation["action_no_rag_correct"]["macro_f1"],
                 validation["action_no_rag_wrong"]["macro_f1"],
