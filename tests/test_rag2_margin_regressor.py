@@ -9,12 +9,17 @@ from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+from datasets import Dataset
 
 from medrag.filtering.rag2_margin_regressor import (
     MarginRegressorConfig,
     SharedMarginRegressorConfig,
     SharedTextMarginRegressor,
     TextMarginRegressor,
+)
+from scripts.train_rag2_margin_regressor import (
+    curriculum_direction_weights,
+    select_curriculum_training_data,
 )
 
 
@@ -40,6 +45,52 @@ class FakeT5Encoder(nn.Module):
 
 
 class MarginRegressorTests(unittest.TestCase):
+    def test_extreme_curriculum_removes_neutral_and_balances_loss_mass(self) -> None:
+        dataset = Dataset.from_dict(
+            {
+                "utility_target": [-0.5, -0.4, -0.1, 0.0, 0.1, 0.3],
+                "sample_id": [f"q{index}" for index in range(6)],
+            }
+        )
+        args = SimpleNamespace(
+            curriculum_stage="extreme",
+            extreme_threshold=0.2,
+            calibration_extreme_fraction=0.5,
+            seed=42,
+        )
+        selected, summary = select_curriculum_training_data(dataset, args)
+        self.assertEqual(selected["utility_target"], [-0.5, -0.4, 0.3])
+        self.assertEqual(summary["neutral"], 0)
+        helpful_weight, harmful_weight = curriculum_direction_weights(selected, args)
+        self.assertAlmostEqual(helpful_weight, 1.5)
+        self.assertAlmostEqual(harmful_weight, 0.75)
+
+    def test_calibration_curriculum_uses_half_extreme_and_stratified_neutral(self) -> None:
+        values = [-0.4, -0.3, 0.3, 0.4, -0.19, -0.12, -0.08, -0.01, 0.01, 0.08, 0.12, 0.19]
+        dataset = Dataset.from_dict(
+            {
+                "utility_target": values,
+                "sample_id": [f"q{index}" for index in range(len(values))],
+            }
+        )
+        args = SimpleNamespace(
+            curriculum_stage="calibration",
+            extreme_threshold=0.2,
+            calibration_extreme_fraction=0.5,
+            seed=42,
+        )
+        selected, summary = select_curriculum_training_data(dataset, args)
+        self.assertEqual(len(selected), 8)
+        self.assertEqual(summary["helpful_extreme"], 2)
+        self.assertEqual(summary["harmful_extreme"], 2)
+        self.assertEqual(summary["neutral"], 4)
+        self.assertAlmostEqual(summary["selected_extreme_fraction"], 0.5)
+        neutral = [value for value in selected["utility_target"] if abs(value) < 0.2]
+        self.assertEqual(sum(-0.2 < value < -0.1 for value in neutral), 1)
+        self.assertEqual(sum(-0.1 <= value < 0.0 for value in neutral), 1)
+        self.assertEqual(sum(0.0 <= value < 0.1 for value in neutral), 1)
+        self.assertEqual(sum(0.1 <= value < 0.2 for value in neutral), 1)
+
     @patch("medrag.filtering.rag2_margin_regressor.T5EncoderModel.from_pretrained")
     def test_forward_is_bounded_and_text_only(self, mocked: unittest.mock.Mock) -> None:
         mocked.return_value = FakeT5Encoder()
