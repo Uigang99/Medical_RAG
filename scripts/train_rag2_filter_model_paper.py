@@ -11,7 +11,7 @@ import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PROJECT_ROOT.parent
@@ -19,9 +19,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import datasets as datasets_package
 import transformers as transformers_package
 from datasets import Dataset, load_dataset
+from sklearn.metrics import average_precision_score, roc_auc_score
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -34,6 +36,7 @@ from transformers import (
 )
 
 from medrag.filtering.rag2_official import (
+    ANSWER_AWARE_INSTRUCTION,
     build_rationale_aware_filter_input,
     clean_text,
     convert_legacy_filter_input,
@@ -61,6 +64,13 @@ DEFAULT_OUTPUT_ROOT = (
     / "RAG2-Filter-FlanT5-large-PaperExactFreeResponse"
 )
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "cache" / "hf_datasets_rag2_paper"
+TRAIN_BALANCE_MODES = ("natural", "four_group_loss")
+BALANCE_GROUPS = (
+    "no_rag_correct__helpful",
+    "no_rag_correct__not_helpful",
+    "no_rag_wrong__helpful",
+    "no_rag_wrong__not_helpful",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +92,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument(
+        "--preformatted-input",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Treat each row's input field as the final filter prompt. This is required for "
+            "answer-aware extreme-utility inputs, which must not be converted back to the "
+            "released evidence-question-only template."
+        ),
+    )
+    parser.add_argument(
+        "--train-balance-mode",
+        choices=TRAIN_BALANCE_MODES,
+        default="natural",
+        help=(
+            "four_group_loss gives equal total loss mass to No-RAG correct/wrong x "
+            "Helpful/Harmful without deleting or duplicating rows."
+        ),
+    )
+    parser.add_argument(
+        "--balanced-validation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Select checkpoints on a deterministic validation view containing the same "
+            "number of rows from all four No-RAG-state x label groups. Natural validation "
+            "and test metrics are still reported after training."
+        ),
+    )
     parser.add_argument("--max-doc-rank", type=int, default=10)
     parser.add_argument(
         "--include-no-rag-rationale",
@@ -234,6 +273,12 @@ def parse_args() -> argparse.Namespace:
         help="Recompute activations during backward pass to reduce VRAM use.",
     )
     parser.add_argument("--resume-from-checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Use a fixed resumable run directory instead of creating a timestamped child.",
+    )
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
     parser.add_argument("--log-level", default="INFO")
@@ -504,12 +549,85 @@ def summarize(dataset: Dataset, name: str) -> dict[str, Any]:
         "doc_rank",
         "parent_document_rank",
         "window_selection_role",
+        "balance_group",
     ):
         if column in dataset.column_names:
             value[column] = dict(Counter(str(item) for item in dataset[column]))
     if "sample_id" in dataset.column_names:
         value["sample_ids"] = len(set(str(item) for item in dataset["sample_id"]))
     return value
+
+
+def add_four_group_loss_weights(dataset: Dataset) -> tuple[Dataset, dict[str, Any]]:
+    """Keep every row while assigning equal expected loss mass to four audit groups."""
+
+    if "balance_group" not in dataset.column_names:
+        raise RuntimeError("four_group_loss requires a balance_group column in the split")
+    counts = Counter(str(value) for value in dataset["balance_group"])
+    missing = [name for name in BALANCE_GROUPS if counts[name] == 0]
+    if missing:
+        raise RuntimeError(f"Cannot balance training loss; empty groups: {missing}")
+    total = len(dataset)
+    weights = {name: total / (len(BALANCE_GROUPS) * counts[name]) for name in BALANCE_GROUPS}
+    weighted = dataset.add_column(
+        "_sample_weight",
+        [float(weights[str(group)]) for group in dataset["balance_group"]],
+    )
+    effective_mass = {name: float(counts[name] * weights[name]) for name in BALANCE_GROUPS}
+    total_mass = sum(effective_mass.values())
+    return weighted, {
+        "mode": "four_group_loss",
+        "group_counts": dict(counts),
+        "group_weights": weights,
+        "effective_group_loss_mass": effective_mass,
+        "effective_group_fraction": {
+            name: effective_mass[name] / total_mass for name in BALANCE_GROUPS
+        },
+        "row_count_unchanged": len(weighted) == total,
+    }
+
+
+def make_four_group_balanced_validation(
+    dataset: Dataset,
+    seed: int,
+) -> tuple[Dataset, dict[str, Any]]:
+    """Create an equal-four-group checkpoint-selection view without replacement."""
+
+    if "balance_group" not in dataset.column_names:
+        raise RuntimeError("Balanced validation requires a balance_group column")
+    indices: dict[str, list[int]] = {name: [] for name in BALANCE_GROUPS}
+    for index, group in enumerate(dataset["balance_group"]):
+        name = str(group)
+        if name not in indices:
+            raise RuntimeError(f"Unexpected validation balance group: {name}")
+        indices[name].append(index)
+    minimum = min(len(values) for values in indices.values())
+    if minimum == 0:
+        raise RuntimeError("Cannot balance validation; at least one group is empty")
+    selected: list[int] = []
+    for offset, name in enumerate(BALANCE_GROUPS):
+        generator = np.random.default_rng(int(seed) + offset * 1009)
+        values = np.asarray(indices[name], dtype=np.int64)
+        generator.shuffle(values)
+        selected.extend(int(value) for value in values[:minimum])
+    selected.sort()
+    balanced = dataset.select(selected)
+    return balanced, {
+        "mode": "deterministic_equal_four_group_without_replacement",
+        "source_group_counts": {name: len(indices[name]) for name in BALANCE_GROUPS},
+        "selected_per_group": minimum,
+        "selected_rows": len(balanced),
+        "seed": int(seed),
+    }
+
+
+def audit_state_id(value: Any) -> int:
+    normalized = str(value)
+    if normalized.startswith("no_rag_correct__"):
+        return 1
+    if normalized.startswith("no_rag_wrong__"):
+        return 0
+    raise ValueError(f"Unsupported balance group: {value!r}")
 
 
 def filter_overlength_inputs(
@@ -521,7 +639,15 @@ def filter_overlength_inputs(
     """Keep exactly one untruncated feature for each pair that fits the encoder budget."""
 
     def add_input_lengths(examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
-        if args.include_no_rag_rationale:
+        if args.preformatted_input:
+            inputs = [str(value).strip() for value in examples["input"]]
+            if any(not value for value in inputs):
+                raise ValueError("Preformatted filter inputs must be non-empty")
+            if any(not value.startswith(ANSWER_AWARE_INSTRUCTION) for value in inputs):
+                raise ValueError(
+                    "--preformatted-input currently requires the audited answer-aware prompt contract"
+                )
+        elif args.include_no_rag_rationale:
             inputs = [
                 build_rationale_aware_filter_input(value, rationale)
                 for value, rationale in zip(examples["input"], examples["_no_rag_rationale"])
@@ -628,6 +754,16 @@ def tokenize_split(
 ) -> Dataset:
     def preprocess(examples: dict[str, list[Any]]) -> dict[str, Any]:
         targets = [label_tokens_by_name[normalize_training_label(value)] for value in examples["target"]]
+        sample_weights = (
+            [float(value) for value in examples["_sample_weight"]]
+            if "_sample_weight" in examples
+            else None
+        )
+        audit_states = (
+            [audit_state_id(value) for value in examples["balance_group"]]
+            if "balance_group" in examples
+            else None
+        )
         if args.overlength_policy == "overflow":
             model_inputs = tokenizer(
                 examples["_filter_input"],
@@ -639,6 +775,10 @@ def tokenize_split(
             )
             sample_mapping = model_inputs.pop("overflow_to_sample_mapping")
             targets = [targets[int(sample_index)] for sample_index in sample_mapping]
+            if sample_weights is not None:
+                sample_weights = [sample_weights[int(sample_index)] for sample_index in sample_mapping]
+            if audit_states is not None:
+                audit_states = [audit_states[int(sample_index)] for sample_index in sample_mapping]
         else:
             # Length filtering has already guaranteed one complete pair per feature.
             model_inputs = tokenizer(examples["_filter_input"], truncation=False, padding=False)
@@ -649,6 +789,10 @@ def tokenize_split(
             padding=False,
         )["input_ids"]
         model_inputs["labels"] = target_tokens
+        if sample_weights is not None:
+            model_inputs["_sample_weight"] = sample_weights
+        if audit_states is not None:
+            model_inputs["_audit_state_id"] = audit_states
         return model_inputs
 
     map_kwargs: dict[str, Any] = {
@@ -689,6 +833,13 @@ def build_metric_functions(label_ids: dict[str, int], label_names: tuple[str, ..
             "accuracy": float(np.mean(predictions == targets)),
             "majority_baseline_accuracy": max(target_counts) / total if total else 0.0,
         }
+        if len(label_names) == 2 and np.unique(targets).size == 2:
+            helpful_score = scores[:, 0] - scores[:, 1]
+            helpful_target = (targets == 0).astype(np.int64)
+            metrics["helpful_auroc"] = float(roc_auc_score(helpful_target, helpful_score))
+            metrics["helpful_average_precision"] = float(
+                average_precision_score(helpful_target, helpful_score)
+            )
         recalls: list[float] = []
         f1s: list[float] = []
         for index, name in enumerate(label_names):
@@ -719,6 +870,69 @@ def build_metric_functions(label_ids: dict[str, int], label_names: tuple[str, ..
     return preprocess_logits_for_metrics, compute_metrics
 
 
+class AuditAwareSeq2SeqCollator:
+    """Pad model tensors while retaining loss weights and audit state IDs."""
+
+    def __init__(self, base: DataCollatorForSeq2Seq) -> None:
+        self.base = base
+
+    def __call__(self, features: Sequence[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        rows = [dict(value) for value in features]
+        sample_weights = [row.pop("_sample_weight", None) for row in rows]
+        audit_states = [row.pop("_audit_state_id", None) for row in rows]
+        batch = self.base(rows)
+        if all(value is not None for value in sample_weights):
+            batch["sample_weight"] = torch.tensor(sample_weights, dtype=torch.float32)
+        elif any(value is not None for value in sample_weights):
+            raise RuntimeError("A batch cannot mix weighted and unweighted rows")
+        if all(value is not None for value in audit_states):
+            batch["audit_state_id"] = torch.tensor(audit_states, dtype=torch.long)
+        elif any(value is not None for value in audit_states):
+            raise RuntimeError("A batch cannot mix rows with and without audit state IDs")
+        return batch
+
+
+class WeightedSeq2SeqTrainer(Seq2SeqTrainer):
+    """Apply per-row loss weights without changing inference or label logits."""
+
+    def __init__(self, *args: Any, sample_weighted_loss: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.sample_weighted_loss = bool(sample_weighted_loss)
+
+    def compute_loss(
+        self,
+        model: Any,
+        inputs: dict[str, Any],
+        return_outputs: bool = False,
+        num_items_in_batch: Any = None,
+    ) -> Any:
+        sample_weight = inputs.pop("sample_weight", None)
+        inputs.pop("audit_state_id", None)
+        if not self.sample_weighted_loss or not model.training:
+            parameters = inspect.signature(super().compute_loss).parameters
+            kwargs: dict[str, Any] = {"return_outputs": return_outputs}
+            if "num_items_in_batch" in parameters:
+                kwargs["num_items_in_batch"] = num_items_in_batch
+            return super().compute_loss(model, inputs, **kwargs)
+
+        if sample_weight is None:
+            raise RuntimeError("Weighted training batch is missing sample_weight")
+        labels = inputs["labels"]
+        outputs = model(**inputs)
+        logits = outputs.logits.float()
+        token_loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            labels.reshape(-1),
+            reduction="none",
+            ignore_index=-100,
+        ).reshape(labels.shape)
+        valid = labels.ne(-100)
+        per_example = (token_loss * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+        weights = sample_weight.to(per_example.device, dtype=per_example.dtype)
+        loss = (per_example * weights).sum() / weights.sum().clamp_min(1e-12)
+        return (loss, outputs) if return_outputs else loss
+
+
 class EpochLogCallback(TrainerCallback):
     def on_epoch_end(self, args, state, control, **kwargs):
         if state.is_local_process_zero:
@@ -730,6 +944,10 @@ def main() -> None:
     configure_logging(args.log_level)
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient-accumulation-steps must be at least 1")
+    if args.preformatted_input and args.include_no_rag_rationale:
+        raise ValueError("--preformatted-input and --include-no-rag-rationale are mutually exclusive")
+    if args.balanced_validation and args.train_balance_mode != "four_group_loss":
+        raise ValueError("--balanced-validation currently requires --train-balance-mode four_group_loss")
     if args.max_grad_norm < 0:
         raise ValueError("--max-grad-norm must be non-negative")
     if args.doc_stride < 0 or args.doc_stride >= args.max_seq_length:
@@ -753,8 +971,14 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = args.output_root / args.dataset / args.run_name / timestamp
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir = (
+        args.output_dir.resolve()
+        if args.output_dir is not None
+        else args.output_root / args.dataset / args.run_name / timestamp
+    )
+    output_dir.mkdir(parents=True, exist_ok=args.output_dir is not None)
+    if (output_dir / "final_model").is_dir():
+        raise RuntimeError(f"Output already contains a completed final_model: {output_dir}")
     logging.info("Output directory: %s", output_dir)
 
     logging.info("Workflow stage 1/5: loading paper-style train/validation/test splits")
@@ -793,6 +1017,9 @@ def main() -> None:
         model_kwargs["torch_dtype"] = torch.bfloat16
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path, **model_kwargs)
     label_ids = add_training_label_tokens(tokenizer, model, label_names, label_tokens)
+    if args.preformatted_input:
+        model.config.rag2_filter_input_format = "rag2_answer_aware_evidence_question_v1"
+        model.config.rag2_filter_requires_no_rag_answer = True
     label_tokens_by_name = dict(zip(label_names, label_tokens))
     if args.gradient_checkpointing:
         model.config.use_cache = False
@@ -826,6 +1053,18 @@ def main() -> None:
         args,
         "test",
     )
+    balance_report: dict[str, Any] = {"mode": args.train_balance_mode}
+    if args.train_balance_mode == "four_group_loss":
+        train_filtered, train_balance_report = add_four_group_loss_weights(train_filtered)
+        balance_report["training"] = train_balance_report
+    validation_checkpoint_filtered = validation_filtered
+    if args.balanced_validation:
+        validation_checkpoint_filtered, validation_balance_report = make_four_group_balanced_validation(
+            validation_filtered,
+            args.seed,
+        )
+        balance_report["checkpoint_validation"] = validation_balance_report
+    logging.info("Training/checkpoint balance: %s", json.dumps(balance_report, ensure_ascii=False))
 
     logging.info("Workflow stage 3/5: tokenizing classifier features (progress/ETA shown per split)")
     train = tokenize_split(
@@ -853,6 +1092,15 @@ def main() -> None:
             "test",
             label_tokens_by_name,
         )
+    validation_checkpoint = validation
+    if need_evaluation_features and args.balanced_validation:
+        validation_checkpoint = tokenize_split(
+            validation_checkpoint_filtered,
+            tokenizer,
+            args,
+            "validation_checkpoint_balanced",
+            label_tokens_by_name,
+        )
     logging.info(
         "Tokenized features: train=%s validation=%s test=%s",
         len(train),
@@ -860,11 +1108,13 @@ def main() -> None:
         len(test) if test is not None else "skipped",
     )
 
-    collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        label_pad_token_id=-100,
-        pad_to_multiple_of=8 if args.bf16 or args.tf32 else None,
+    collator = AuditAwareSeq2SeqCollator(
+        DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            label_pad_token_id=-100,
+            pad_to_multiple_of=8 if args.bf16 or args.tf32 else None,
+        )
     )
     preprocess_logits, compute_metrics = build_metric_functions(label_ids, label_names)
     validation_strategy = (
@@ -907,7 +1157,8 @@ def main() -> None:
         "report_to": "none",
         "seed": args.seed,
         "data_seed": args.seed,
-        "remove_unused_columns": True,
+        "remove_unused_columns": False,
+        "group_by_length": args.preformatted_input,
     }
     training_parameters = inspect.signature(Seq2SeqTrainingArguments).parameters
     evaluation_key = "eval_strategy" if "eval_strategy" in training_parameters else "evaluation_strategy"
@@ -944,6 +1195,8 @@ def main() -> None:
         "filter_label_dataset_manifest": label_dataset_manifest,
         "dataset_summaries": summaries,
         "no_rag_rationale_ablation": rationale_join,
+        "preformatted_input": args.preformatted_input,
+        "training_balance": balance_report,
         "label_mode": args.label_mode,
         "label_tokens": dict(zip(label_names, label_tokens)),
         "label_token_ids": label_ids,
@@ -978,7 +1231,9 @@ def main() -> None:
         },
         "local_evaluation_protocol": {
             "encoder_input": (
-                "official evidence-then-question template plus no-RAG rationale"
+                "preformatted answer-aware evidence-question template"
+                if args.preformatted_input
+                else "official evidence-then-question template plus no-RAG rationale"
                 if args.include_no_rag_rationale
                 else "official evidence-then-question template"
             ),
@@ -1043,15 +1298,16 @@ def main() -> None:
         "callbacks": callbacks,
     }
     if args.eval_each_epoch:
-        assert validation is not None
-        trainer_kwargs["eval_dataset"] = validation
+        assert validation_checkpoint is not None
+        trainer_kwargs["eval_dataset"] = validation_checkpoint
         trainer_kwargs["compute_metrics"] = compute_metrics
         trainer_kwargs["preprocess_logits_for_metrics"] = preprocess_logits
     if "processing_class" in inspect.signature(Seq2SeqTrainer).parameters:
         trainer_kwargs["processing_class"] = tokenizer
     else:
         trainer_kwargs["tokenizer"] = tokenizer
-    trainer = Seq2SeqTrainer(
+    trainer = WeightedSeq2SeqTrainer(
+        sample_weighted_loss=args.train_balance_mode == "four_group_loss",
         **trainer_kwargs,
     )
     logging.info(
@@ -1066,7 +1322,9 @@ def main() -> None:
 
     metrics = dict(train_result.metrics)
     validation_metrics: dict[str, Any] = {}
+    validation_checkpoint_metrics: dict[str, Any] = {}
     test_metrics: dict[str, Any] = {}
+    subgroup_metrics: dict[str, Any] = {}
     best_checkpoint = trainer.state.best_model_checkpoint
     if args.eval_each_epoch and not best_checkpoint:
         raise RuntimeError("No validation checkpoint was selected; cannot perform best-checkpoint test evaluation.")
@@ -1077,9 +1335,30 @@ def main() -> None:
         # ``trainer.model``.  Both final evaluations therefore use the exact
         # validation-selected model, not the final optimizer step.
         validation_metrics = trainer.evaluate(eval_dataset=validation, metric_key_prefix="validation")
+        if args.balanced_validation:
+            assert validation_checkpoint is not None
+            validation_checkpoint_metrics = trainer.evaluate(
+                eval_dataset=validation_checkpoint,
+                metric_key_prefix="validation_checkpoint_balanced",
+            )
         test_metrics = trainer.evaluate(eval_dataset=test, metric_key_prefix="test")
         metrics.update(validation_metrics)
+        metrics.update(validation_checkpoint_metrics)
         metrics.update(test_metrics)
+        if "_audit_state_id" in test.column_names:
+            for state_name, state_id in (("no_rag_correct", 1), ("no_rag_wrong", 0)):
+                indices = [
+                    index
+                    for index, value in enumerate(test["_audit_state_id"])
+                    if int(value) == state_id
+                ]
+                subset = test.select(indices)
+                values = trainer.evaluate(
+                    eval_dataset=subset,
+                    metric_key_prefix=f"test_{state_name}",
+                )
+                subgroup_metrics[state_name] = values
+                metrics.update(values)
     metrics.update(
         {
             "best_model_checkpoint": best_checkpoint,
@@ -1093,6 +1372,8 @@ def main() -> None:
             "train_features": len(train),
             "validation_features": len(validation) if validation is not None else None,
             "test_features": len(test) if test is not None else None,
+            "train_balance_mode": args.train_balance_mode,
+            "balanced_validation_for_checkpoint_selection": args.balanced_validation,
         }
     )
     write_json(output_dir / "final_metrics.json", metrics)
@@ -1102,7 +1383,9 @@ def main() -> None:
             "best_model_checkpoint": best_checkpoint,
             "best_validation_metric": trainer.state.best_metric,
             "validation_metrics": validation_metrics,
+            "validation_checkpoint_metrics": validation_checkpoint_metrics,
             "test_metrics": test_metrics,
+            "test_subgroup_metrics": subgroup_metrics,
             "final_model_dir": str(final_model_dir),
             "final_model_source": "validation-selected best checkpoint",
         },
@@ -1121,7 +1404,9 @@ def main() -> None:
             "best_validation_metric": trainer.state.best_metric,
             "final_model_dir": str(final_model_dir),
             "validation": validation_metrics,
+            "validation_checkpoint": validation_checkpoint_metrics,
             "test": test_metrics,
+            "test_subgroups": subgroup_metrics,
         },
     )
     trainer.save_state()
