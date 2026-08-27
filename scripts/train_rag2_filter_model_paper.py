@@ -1158,9 +1158,22 @@ def main() -> None:
         "seed": args.seed,
         "data_seed": args.seed,
         "remove_unused_columns": False,
-        "group_by_length": args.preformatted_input,
     }
     training_parameters = inspect.signature(Seq2SeqTrainingArguments).parameters
+    if "group_by_length" in training_parameters:
+        training_kwargs["group_by_length"] = args.preformatted_input
+    elif "train_sampling_strategy" in training_parameters:
+        training_kwargs["train_sampling_strategy"] = (
+            "group_by_length" if args.preformatted_input else "random"
+        )
+    elif args.preformatted_input:
+        LOGGER.warning(
+            "Installed transformers=%s does not expose "
+            "group_by_length or train_sampling_strategy; continuing with the "
+            "standard shuffled batch sampler. This changes batching order only, "
+            "not examples, targets, sample weights, or optimization steps.",
+            transformers_package.__version__,
+        )
     evaluation_key = "eval_strategy" if "eval_strategy" in training_parameters else "evaluation_strategy"
     training_kwargs[evaluation_key] = validation_strategy
     if args.validation_interval_steps is not None:
@@ -1174,6 +1187,12 @@ def main() -> None:
     if "dataloader_prefetch_factor" in training_parameters:
         training_kwargs["dataloader_prefetch_factor"] = (
             args.dataloader_prefetch_factor if args.dataloader_num_workers > 0 else None
+        )
+    unsupported_training_arguments = sorted(set(training_kwargs) - set(training_parameters))
+    if unsupported_training_arguments:
+        raise RuntimeError(
+            "Installed transformers does not support these training arguments: "
+            f"{unsupported_training_arguments}. transformers={transformers_package.__version__}"
         )
     training_args = Seq2SeqTrainingArguments(**training_kwargs)
 
