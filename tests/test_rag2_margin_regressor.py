@@ -17,7 +17,12 @@ from medrag.filtering.rag2_margin_regressor import (
     SharedTextMarginRegressor,
     TextMarginRegressor,
 )
+from medrag.filtering.rag2_official import (
+    build_answer_aware_filter_input,
+    build_official_filter_input,
+)
 from scripts.train_rag2_margin_regressor import (
+    NoRAGAnswerIndex,
     curriculum_direction_weights,
     select_curriculum_training_data,
 )
@@ -45,6 +50,50 @@ class FakeT5Encoder(nn.Module):
 
 
 class MarginRegressorTests(unittest.TestCase):
+    def test_answer_aware_input_adds_prediction_without_gold_metadata(self) -> None:
+        base = build_official_filter_input(
+            question="Which treatment?",
+            options="A) Alpha\nB) Beta",
+            evidence="Evidence text.",
+        )
+        value = build_answer_aware_filter_input(base, "(B) Beta")
+        self.assertIn("Initial answer generated without retrieved evidence: (B) Beta", value)
+        self.assertIn("Evidence: Evidence text.", value)
+        self.assertIn("Question: Which treatment?\nA) Alpha\nB) Beta", value)
+        self.assertNotIn("gold", value.lower())
+
+    def test_no_rag_answer_index_ignores_correctness_and_gold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "medqa" / "train"
+            directory.mkdir(parents=True)
+            (directory / "manifest.json").write_text(
+                json.dumps({"dataset": "medqa", "split": "train", "rows": 2}),
+                encoding="utf-8",
+            )
+            rows = [
+                {
+                    "sample_id": "q1",
+                    "answer": "B",
+                    "answer_text": "Beta",
+                    "gold_answer": "A",
+                    "answer_correct": False,
+                },
+                {
+                    "sample_id": "q2",
+                    "answer": "C",
+                    "answer_text": "Gamma",
+                    "gold_answer": "C",
+                    "answer_correct": True,
+                },
+            ]
+            (directory / "no_rag_generations.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            index = NoRAGAnswerIndex(Path(temporary), "medqa", "train", False)
+            self.assertEqual(index.answer_for("q1"), "(B) Beta")
+            self.assertEqual(index.answer_for("q2"), "(C) Gamma")
+
     def test_extreme_curriculum_removes_neutral_and_balances_loss_mass(self) -> None:
         dataset = Dataset.from_dict(
             {

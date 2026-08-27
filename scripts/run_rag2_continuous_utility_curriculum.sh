@@ -11,7 +11,19 @@ PROJECT_ROOT="/home/user/Uiheon/Medical_RAG"
 PYTHON_BIN="${PYTHON_BIN:-/home/user/Uiheon/.venv_vllm/bin/python}"
 BASE="${PROJECT_ROOT}/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
 PREPARED_ROOT="${BASE}/gold_margin_regression_v1/prepared"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/home/user/Uiheon/models/RAG2-ContinuousUtilityCurriculum-FlanT5-large}"
+INPUT_MODE="${INPUT_MODE:-text_only}"
+NO_RAG_GENERATION_ROOT="${NO_RAG_GENERATION_ROOT:-${BASE}/train_no_rag_anchored_features_v1/no_rag}"
+if [[ "${INPUT_MODE}" != "text_only" && "${INPUT_MODE}" != "text_no_rag_answer" ]]; then
+  echo "INPUT_MODE must be text_only or text_no_rag_answer" >&2
+  exit 2
+fi
+if [[ -z "${OUTPUT_ROOT:-}" ]]; then
+  if [[ "${INPUT_MODE}" == "text_no_rag_answer" ]]; then
+    OUTPUT_ROOT="/home/user/Uiheon/models/RAG2-ContinuousUtilityNoRAGAnswerCurriculum-FlanT5-large"
+  else
+    OUTPUT_ROOT="/home/user/Uiheon/models/RAG2-ContinuousUtilityCurriculum-FlanT5-large"
+  fi
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -24,6 +36,13 @@ STAGE1_EPOCHS_MEDQA="${STAGE1_EPOCHS_MEDQA:-8}"
 STAGE2_EPOCHS="${STAGE2_EPOCHS:-2}"
 TRAIN_QUESTIONS_PER_BATCH="${TRAIN_QUESTIONS_PER_BATCH:-16}"
 EVAL_DOCUMENTS_PER_BATCH="${EVAL_DOCUMENTS_PER_BATCH:-256}"
+if [[ -z "${MAX_INPUT_TOKENS:-}" ]]; then
+  if [[ "${INPUT_MODE}" == "text_no_rag_answer" ]]; then
+    MAX_INPUT_TOKENS=640
+  else
+    MAX_INPUT_TOKENS=512
+  fi
+fi
 CALIBRATION_EXTREME_FRACTION="${CALIBRATION_EXTREME_FRACTION:-0.5}"
 NEUTRAL_LOSS_WEIGHT="${NEUTRAL_LOSS_WEIGHT:-0.25}"
 NEUTRAL_TOLERANCE="${NEUTRAL_TOLERANCE:-0.03}"
@@ -34,7 +53,13 @@ PAIRWISE_MIN_TARGET_GAP="${PAIRWISE_MIN_TARGET_GAP:-0.1}"
 PAIRWISE_TEMPERATURE="${PAIRWISE_TEMPERATURE:-0.1}"
 MAX_TRAIN_QUESTIONS="${MAX_TRAIN_QUESTIONS:-}"
 MAX_EVAL_QUESTIONS="${MAX_EVAL_QUESTIONS:-}"
-RUN_TAG="${RUN_TAG:-tau0p2_extreme_replay50_neutral25_v1}"
+if [[ -z "${RUN_TAG:-}" ]]; then
+  if [[ "${INPUT_MODE}" == "text_no_rag_answer" ]]; then
+    RUN_TAG="tau0p2_no_rag_answer_extreme_replay50_neutral25_v1"
+  else
+    RUN_TAG="tau0p2_extreme_replay50_neutral25_v1"
+  fi
+fi
 
 if [[ "${TARGET}" == "all" ]]; then
   DATASETS=(medmcqa medqa)
@@ -75,7 +100,7 @@ fi
 PIPELINE_START="$(date +%s)"
 TOTAL_STAGES="$((1 + 2 * ${#DATASETS[@]}))"
 COMPLETED_STAGES=0
-echo "[$(date '+%F %T')] Overall curriculum 0/${TOTAL_STAGES}: prepared-data check; overall ETA unknown"
+echo "[$(date '+%F %T')] Overall curriculum 0/${TOTAL_STAGES}: prepared-data check; input_mode=${INPUT_MODE}; overall ETA unknown"
 
 if [[ ! -f "${PREPARED_ROOT}/manifest.json" ]]; then
   bash "${PROJECT_ROOT}/scripts/run_rag2_margin_regression_prepare.sh"
@@ -117,6 +142,8 @@ for DATASET in "${DATASETS[@]}"; do
       --dataset "${DATASET}" \
       --prepared-root "${PREPARED_ROOT}" \
       --model-name-or-path /home/user/Uiheon/models/Flan-T5-large \
+      --input-mode "${INPUT_MODE}" \
+      --no-rag-generation-root "${NO_RAG_GENERATION_ROOT}" \
       --output-root "${OUTPUT_ROOT}" \
       --output-dir "${STAGE1_DIR}" \
       --run-name "${RUN_TAG}_stage1_extreme" \
@@ -141,7 +168,7 @@ for DATASET in "${DATASETS[@]}"; do
       --head-hidden-size 256 \
       --dropout 0.1 \
       --trainable-encoder-layers 4 \
-      --max-input-tokens 512 \
+      --max-input-tokens "${MAX_INPUT_TOKENS}" \
       --early-stopping-patience 2 \
       --minimum-improvement 1e-4 \
       --trace-shard-cache-size 8 \
@@ -175,6 +202,8 @@ for DATASET in "${DATASETS[@]}"; do
       --dataset "${DATASET}" \
       --prepared-root "${PREPARED_ROOT}" \
       --model-name-or-path /home/user/Uiheon/models/Flan-T5-large \
+      --input-mode "${INPUT_MODE}" \
+      --no-rag-generation-root "${NO_RAG_GENERATION_ROOT}" \
       --output-root "${OUTPUT_ROOT}" \
       --output-dir "${STAGE2_DIR}" \
       --run-name "${RUN_TAG}_stage2_neutral" \
@@ -205,7 +234,7 @@ for DATASET in "${DATASETS[@]}"; do
       --head-hidden-size 256 \
       --dropout 0.1 \
       --trainable-encoder-layers 4 \
-      --max-input-tokens 512 \
+      --max-input-tokens "${MAX_INPUT_TOKENS}" \
       --early-stopping-patience 2 \
       --minimum-improvement 1e-4 \
       --trace-shard-cache-size 8 \

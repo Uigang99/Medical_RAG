@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Train Question+Options+Document -> one continuous utility score.
+"""Train text inputs -> one continuous target-model document-utility score.
 
 The only supervision consumed by the loss is ``utility_target``.  Gold
 answers, teacher margins/logits, transitions, No-RAG correctness, and hidden
-states are forbidden model inputs.  Audit metadata is used only after forward
-passes to report whether performance differs across No-RAG-correct/wrong
-questions.
+states are forbidden model inputs.  The answer-aware ablation may additionally
+provide the target model's cached No-RAG predicted answer, but never whether it
+was correct. Audit metadata is used only after forward passes to report whether
+performance differs across No-RAG-correct/wrong questions.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from torch.utils.data import DataLoader, Sampler
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 
@@ -50,7 +52,11 @@ from medrag.filtering.rag2_margin_regressor import (  # noqa: E402
     MarginRegressorConfig,
     TextMarginRegressor,
 )
-from medrag.filtering.rag2_official import build_official_filter_input, format_options  # noqa: E402
+from medrag.filtering.rag2_official import (  # noqa: E402
+    build_answer_aware_filter_input,
+    build_official_filter_input,
+    format_options,
+)
 from medrag.progress import PipelineProgress  # noqa: E402
 
 
@@ -79,6 +85,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=("medmcqa", "medqa"), required=True)
     parser.add_argument("--prepared-root", type=Path, default=base / "gold_margin_regression_v1/prepared")
     parser.add_argument("--model-name-or-path", type=Path, default=WORKSPACE_ROOT / "models/Flan-T5-large")
+    parser.add_argument(
+        "--input-mode",
+        choices=("text_only", "text_no_rag_answer"),
+        default="text_only",
+    )
+    parser.add_argument(
+        "--no-rag-generation-root",
+        type=Path,
+        default=base / "train_no_rag_anchored_features_v1/no_rag",
+    )
     parser.add_argument("--output-root", type=Path, default=WORKSPACE_ROOT / "models/RAG2-MarginRegressor-FlanT5-large")
     parser.add_argument("--run-name", required=True)
     parser.add_argument(
@@ -220,6 +236,13 @@ def load_contract(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("Prepared input contract is not text-only")
     if supervision != {"one continuous utility_target"}:
         raise RuntimeError("Prepared supervision contract is not single-target regression")
+    if args.input_mode == "text_no_rag_answer":
+        forbidden = set((manifest.get("model_input_contract") or {}).get("forbidden") or [])
+        if "No-RAG answer/correctness" not in forbidden:
+            raise RuntimeError(
+                "Expected the pointer data to exclude No-RAG answers; the answer-aware ablation "
+                "must join predictions only from the external deployment-time cache."
+            )
     return manifest
 
 
@@ -344,14 +367,74 @@ def curriculum_direction_weights(dataset: Dataset, args: argparse.Namespace) -> 
     return total / (2.0 * positive), total / (2.0 * negative)
 
 
+class NoRAGAnswerIndex:
+    """Compact, deployment-available index of model answers without evidence."""
+
+    def __init__(self, root: Path, dataset: str, split: str, show_progress: bool) -> None:
+        directory = root / dataset / split
+        manifest_path = directory / "manifest.json"
+        generations_path = directory / "no_rag_generations.jsonl"
+        if not manifest_path.is_file() or not generations_path.is_file():
+            raise FileNotFoundError(
+                f"No-RAG answer cache is incomplete: {manifest_path} / {generations_path}"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if str(manifest.get("dataset")) != dataset or str(manifest.get("split")) != split:
+            raise RuntimeError(f"No-RAG answer-cache contract mismatch: {manifest_path}")
+        total = int(manifest.get("rows") or 0)
+        answers: dict[str, str] = {}
+        with generations_path.open("rb", buffering=64 * 1024 * 1024) as handle:
+            progress = tqdm(
+                handle,
+                total=total or None,
+                desc=f"IndexNoRAGAnswers:{dataset}",
+                unit="question",
+                dynamic_ncols=True,
+                disable=not show_progress,
+            )
+            for line in progress:
+                if not line.strip():
+                    continue
+                row = decode_json(line)
+                sample_id = str(row.get("sample_id") or "")
+                choice = str(row.get("answer") or "").strip().upper()
+                answer_text = " ".join(str(row.get("answer_text") or "").split())
+                if not sample_id or not choice:
+                    raise RuntimeError(f"Invalid No-RAG answer row in {generations_path}")
+                rendered = f"({choice}) {answer_text}" if answer_text else f"({choice})"
+                previous = answers.setdefault(sample_id, rendered)
+                if previous != rendered:
+                    raise RuntimeError(f"Conflicting No-RAG answers for {sample_id}")
+        if total and len(answers) != total:
+            raise RuntimeError(
+                f"No-RAG answer count mismatch: indexed={len(answers)} manifest={total}"
+            )
+        self.answers = answers
+        self.manifest = manifest
+
+    def answer_for(self, sample_id: str) -> str:
+        try:
+            return self.answers[str(sample_id)]
+        except KeyError as error:
+            raise KeyError(f"No cached No-RAG answer for {sample_id}") from error
+
+
 class TraceTextStore:
     """Expose only question/options/document text from anchored trace shards."""
 
-    def __init__(self, trace_root: Path, dataset: str, source_split: str, capacity: int) -> None:
+    def __init__(
+        self,
+        trace_root: Path,
+        dataset: str,
+        source_split: str,
+        capacity: int,
+        no_rag_answers: NoRAGAnswerIndex | None = None,
+    ) -> None:
         self.trace_root = trace_root
         self.dataset = dataset
         self.source_split = source_split
         self.capacity = max(1, int(capacity))
+        self.no_rag_answers = no_rag_answers
         self.cache: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 
     def _rows(self, shard: str) -> list[dict[str, Any]]:
@@ -373,10 +456,16 @@ class TraceTextStore:
         evidence = str(trace.get("document_text_used") or "").strip()
         if not evidence:
             raise ValueError(f"Empty document text: {pointer['pair_id']}")
-        return build_official_filter_input(
+        base_input = build_official_filter_input(
             question=str(trace["question"]),
             options=format_options(trace.get("options") or {}),
             evidence=evidence,
+        )
+        if self.no_rag_answers is None:
+            return base_input
+        return build_answer_aware_filter_input(
+            base_input,
+            self.no_rag_answers.answer_for(str(pointer["sample_id"])),
         )
 
 
@@ -869,8 +958,24 @@ def main() -> None:
     )
     trace_root = Path(str(manifest["trace_root"]))
     source_split = str(manifest["source_split"])
+    no_rag_answers = (
+        NoRAGAnswerIndex(
+            args.no_rag_generation_root,
+            args.dataset,
+            source_split,
+            args.show_progress,
+        )
+        if args.input_mode == "text_no_rag_answer"
+        else None
+    )
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_name_or_path), use_fast=True)
-    store = TraceTextStore(trace_root, args.dataset, source_split, args.trace_shard_cache_size)
+    store = TraceTextStore(
+        trace_root,
+        args.dataset,
+        source_split,
+        args.trace_shard_cache_size,
+        no_rag_answers,
+    )
     collator = MarginCollator(tokenizer, store, args)
     train_loader = (
         make_question_loader(
@@ -987,7 +1092,31 @@ def main() -> None:
         "dataset": args.dataset,
         "prepared_manifest": manifest,
         "data_summary": data_summary,
-        "model_input": ["question text", "answer options when present", "one document text"],
+        "model_input": (
+            [
+                "question text",
+                "answer options when present",
+                "target model No-RAG predicted answer and option text",
+                "one document text",
+            ]
+            if args.input_mode == "text_no_rag_answer"
+            else ["question text", "answer options when present", "one document text"]
+        ),
+        "input_contract_override": (
+            {
+                "type": "deployment_available_no_rag_answer_ablation_v1",
+                "source_manifest": no_rag_answers.manifest,
+                "included": ["No-RAG predicted option label", "No-RAG predicted option text"],
+                "excluded": [
+                    "gold answer",
+                    "No-RAG answer correctness",
+                    "No-RAG confidence or logits",
+                    "No-RAG rationale",
+                ],
+            }
+            if no_rag_answers is not None
+            else None
+        ),
         "sole_supervision": "utility_target = sigmoid(m_D,T=1)-sigmoid(m_0,T=1)",
         "loss": (
             f"curriculum_stage={args.curriculum_stage}; Huber regression(delta={args.huber_delta}); "
@@ -998,7 +1127,7 @@ def main() -> None:
             f"minimum_gap={args.pairwise_min_target_gap} temperature={args.pairwise_temperature}"
         ),
         "forbidden_model_inputs": [
-            "gold answer", "teacher logits/margins", "No-RAG correctness", "answer transition", "hidden states", "RAG2 label"
+            "gold answer", "teacher logits/margins", "No-RAG correctness", "No-RAG rationale", "answer transition", "hidden states", "RAG2 label"
         ],
         "deployment_rule": (
             f"Helpful if predicted u>={args.utility_threshold}; Harmful if predicted "

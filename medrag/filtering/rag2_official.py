@@ -15,6 +15,10 @@ RATIONALE_AWARE_INSTRUCTION = (
     "Given an initial rationale, the following evidence, and a question, determine whether "
     "the evidence helps answer the question."
 )
+ANSWER_AWARE_INSTRUCTION = (
+    "Given an initial answer generated without retrieved evidence, the following evidence, "
+    "and a question, determine whether the evidence helps answer the question."
+)
 
 
 def clean_text(value: Any) -> str:
@@ -68,6 +72,28 @@ def build_rationale_aware_filter_input(base_input: str, no_rag_rationale: str) -
     return (
         f"{RATIONALE_AWARE_INSTRUCTION}\n\n"
         f"Initial rationale generated without retrieved evidence: {rationale}\n\n"
+        f"{suffix}"
+    )
+
+
+def build_answer_aware_filter_input(base_input: str, no_rag_answer: str) -> str:
+    """Add only the target model's cached No-RAG answer to the official input.
+
+    The answer is a model prediction available at deployment time.  Gold
+    answers, answer correctness, confidence, margins, and rationale text are
+    deliberately absent from this ablation.
+    """
+
+    normalized_input = convert_legacy_filter_input(base_input)
+    if not normalized_input.startswith(OFFICIAL_INSTRUCTION):
+        raise ValueError("Expected the normalized RAG2 evidence-question filter input.")
+    suffix = normalized_input[len(OFFICIAL_INSTRUCTION) :].lstrip()
+    answer = clean_text(no_rag_answer)
+    if not answer:
+        raise ValueError("No-RAG answer must be non-empty for answer-aware filtering.")
+    return (
+        f"{ANSWER_AWARE_INSTRUCTION}\n\n"
+        f"Initial answer generated without retrieved evidence: {answer}\n\n"
         f"{suffix}"
     )
 
