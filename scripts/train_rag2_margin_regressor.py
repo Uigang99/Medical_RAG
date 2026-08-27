@@ -29,7 +29,14 @@ import torch.nn.functional as F
 from datasets import Dataset, load_dataset
 from safetensors.torch import load_file
 from scipy.stats import spearmanr
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader, Sampler
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
@@ -47,8 +54,9 @@ from medrag.filtering.rag2_official import build_official_filter_input, format_o
 from medrag.progress import PipelineProgress  # noqa: E402
 
 
-TRAINER_VERSION = "rag2_text_margin_regression_trainer_v1"
+TRAINER_VERSION = "rag2_text_margin_regression_trainer_v2_threshold_audit"
 PREPARED_VERSION = "rag2_margin_regression_pointer_splits_v1"
+ACTION_NAMES = ("helpful", "neutral", "harmful")
 
 
 try:
@@ -83,6 +91,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--huber-delta", type=float, default=0.1)
+    parser.add_argument(
+        "--utility-threshold",
+        type=float,
+        default=0.1,
+        help="Deploy-time threshold: u>=tau Helpful, u<=-tau Harmful, otherwise Neutral.",
+    )
+    parser.add_argument(
+        "--extreme-sample-weight",
+        type=float,
+        default=2.0,
+        help="Huber-loss weight for |u|>=utility-threshold; Neutral remains weight 1.",
+    )
+    parser.add_argument(
+        "--checkpoint-metric",
+        choices=("action_macro_f1", "spearman"),
+        default="action_macro_f1",
+    )
     parser.add_argument("--head-hidden-size", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--trainable-encoder-layers", type=int, default=4)
@@ -166,18 +191,16 @@ def load_splits(args: argparse.Namespace) -> dict[str, Dataset]:
     return {key: loaded[key] for key in paths}
 
 
-def limit_questions(dataset: Dataset, limit: int | None) -> Dataset:
+def limit_questions(dataset: Dataset, limit: int | None, seed: int) -> Dataset:
     if limit is None:
         return dataset
-    selected: list[int] = []
-    seen: set[str] = set()
-    for index, sample_id in enumerate(dataset["sample_id"]):
-        value = str(sample_id)
-        if value not in seen and len(seen) >= int(limit):
-            break
-        seen.add(value)
-        selected.append(index)
-    return dataset.select(selected)
+    question_ids = list(dict.fromkeys(str(value) for value in dataset["sample_id"]))
+    if int(limit) >= len(question_ids):
+        return dataset
+    selected_questions = set(random.Random(int(seed)).sample(question_ids, int(limit)))
+    return dataset.select(
+        [index for index, sample_id in enumerate(dataset["sample_id"]) if str(sample_id) in selected_questions]
+    )
 
 
 class TraceTextStore:
@@ -227,11 +250,8 @@ class ShardBatchSampler(Sampler[list[int]]):
         grouped: dict[str, list[int]] = defaultdict(list)
         for index, shard in enumerate(dataset["trace_shard"]):
             grouped[str(shard)].append(index)
-        self.batches: dict[str, list[list[int]]] = {
-            shard: [indices[start : start + self.batch_size] for start in range(0, len(indices), self.batch_size)]
-            for shard, indices in grouped.items()
-        }
-        self.length = sum(len(value) for value in self.batches.values())
+        self.grouped = dict(grouped)
+        self.length = math.ceil(len(dataset) / self.batch_size)
 
     def __len__(self) -> int:
         return self.length
@@ -239,17 +259,23 @@ class ShardBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         generator = random.Random(self.seed + self.epoch)
         self.epoch += 1
-        shards = list(self.batches)
+        shards = list(self.grouped)
         if self.shuffle:
             generator.shuffle(shards)
+        remainders: list[int] = []
         for shard in shards:
-            batches = [list(value) for value in self.batches[shard]]
+            indices = list(self.grouped[shard])
             if self.shuffle:
-                generator.shuffle(batches)
-            for batch in batches:
-                if self.shuffle:
-                    generator.shuffle(batch)
-                yield batch
+                generator.shuffle(indices)
+            full_end = (len(indices) // self.batch_size) * self.batch_size
+            for start in range(0, full_end, self.batch_size):
+                yield indices[start : start + self.batch_size]
+            remainders.extend(indices[full_end:])
+            while len(remainders) >= self.batch_size:
+                yield remainders[: self.batch_size]
+                del remainders[: self.batch_size]
+        if remainders:
+            yield remainders
 
 
 class MarginCollator:
@@ -319,6 +345,59 @@ def regression_metrics(target: np.ndarray, prediction: np.ndarray) -> dict[str, 
     return result
 
 
+def utility_action_labels(values: np.ndarray, threshold: float) -> np.ndarray:
+    """Map a continuous utility score to the deployed three-way action."""
+
+    labels = np.full(values.shape, 1, dtype=np.int64)  # Neutral
+    labels[values >= float(threshold)] = 0  # Helpful/pass
+    labels[values <= -float(threshold)] = 2  # Harmful/block
+    return labels
+
+
+def action_metrics(target: np.ndarray, prediction: np.ndarray, threshold: float) -> dict[str, Any]:
+    true_labels = utility_action_labels(target, threshold)
+    predicted_labels = utility_action_labels(prediction, threshold)
+    precision, recall, f1, support = precision_recall_fscore_support(
+        true_labels,
+        predicted_labels,
+        labels=[0, 1, 2],
+        average=None,
+        zero_division=0,
+    )
+    result: dict[str, Any] = {
+        "threshold": float(threshold),
+        "accuracy": float(np.mean(true_labels == predicted_labels)),
+        "balanced_accuracy": float(balanced_accuracy_score(true_labels, predicted_labels)),
+        "macro_f1": float(f1_score(true_labels, predicted_labels, labels=[0, 1, 2], average="macro", zero_division=0)),
+        "confusion_matrix": confusion_matrix(true_labels, predicted_labels, labels=[0, 1, 2]).tolist(),
+        "true_rates": {
+            name: float(np.mean(true_labels == index)) for index, name in enumerate(ACTION_NAMES)
+        },
+        "predicted_rates": {
+            name: float(np.mean(predicted_labels == index)) for index, name in enumerate(ACTION_NAMES)
+        },
+        "per_class": {
+            name: {
+                "precision": float(precision[index]),
+                "recall": float(recall[index]),
+                "f1": float(f1[index]),
+                "support": int(support[index]),
+            }
+            for index, name in enumerate(ACTION_NAMES)
+        },
+    }
+    for name, binary_target, score in (
+        ("helpful", true_labels == 0, prediction),
+        ("harmful", true_labels == 2, -prediction),
+    ):
+        if np.unique(binary_target).size == 2:
+            result[f"{name}_auroc"] = float(roc_auc_score(binary_target.astype(np.int64), score))
+            result[f"{name}_average_precision"] = float(
+                average_precision_score(binary_target.astype(np.int64), score)
+            )
+    return result
+
+
 @torch.no_grad()
 def evaluate(
     model: TextMarginRegressor,
@@ -352,6 +431,13 @@ def evaluate(
         "overall": regression_metrics(target, prediction),
         "no_rag_correct": regression_metrics(target[no_rag_correct], prediction[no_rag_correct]),
         "no_rag_wrong": regression_metrics(target[~no_rag_correct], prediction[~no_rag_correct]),
+        "action": action_metrics(target, prediction, args.utility_threshold),
+        "action_no_rag_correct": action_metrics(
+            target[no_rag_correct], prediction[no_rag_correct], args.utility_threshold
+        ),
+        "action_no_rag_wrong": action_metrics(
+            target[~no_rag_correct], prediction[~no_rag_correct], args.utility_threshold
+        ),
     }
     grouped_indices: dict[str, list[int]] = defaultdict(list)
     for index, sample_id in enumerate(sample_ids):
@@ -443,6 +529,10 @@ def main() -> None:
         raise ValueError("Epochs and accumulation must be positive")
     if args.huber_delta <= 0 or args.max_input_tokens < 32:
         raise ValueError("Invalid Huber delta or token budget")
+    if not 0 < args.utility_threshold < 1:
+        raise ValueError("utility-threshold must be in (0,1)")
+    if args.extreme_sample_weight < 1:
+        raise ValueError("extreme-sample-weight must be at least 1")
     if args.early_stopping_patience < 1:
         raise ValueError("early-stopping-patience must be positive")
     set_seed(args.seed)
@@ -453,9 +543,11 @@ def main() -> None:
 
     manifest = load_contract(args)
     datasets = load_splits(args)
-    datasets["train"] = limit_questions(datasets["train"], args.max_train_questions)
-    datasets["validation"] = limit_questions(datasets["validation"], args.max_eval_questions)
-    datasets["test"] = limit_questions(datasets["test"], args.max_eval_questions)
+    datasets["train"] = limit_questions(datasets["train"], args.max_train_questions, args.seed)
+    datasets["validation"] = limit_questions(
+        datasets["validation"], args.max_eval_questions, args.seed + 1
+    )
+    datasets["test"] = limit_questions(datasets["test"], args.max_eval_questions, args.seed + 2)
     trace_root = Path(str(manifest["trace_root"]))
     source_split = str(manifest["source_split"])
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_name_or_path), use_fast=True)
@@ -470,10 +562,16 @@ def main() -> None:
         name: {
             "pairs": len(dataset),
             "questions": len(set(str(value) for value in dataset["sample_id"])),
-            "targets": {
-                "positive": int(sum(float(value) > 0 for value in dataset["utility_target"])),
-                "zero": int(sum(float(value) == 0 for value in dataset["utility_target"])),
-                "negative": int(sum(float(value) < 0 for value in dataset["utility_target"])),
+            "target_actions_at_threshold": {
+                "helpful": int(
+                    sum(float(value) >= args.utility_threshold for value in dataset["utility_target"])
+                ),
+                "neutral": int(
+                    sum(abs(float(value)) < args.utility_threshold for value in dataset["utility_target"])
+                ),
+                "harmful": int(
+                    sum(float(value) <= -args.utility_threshold for value in dataset["utility_target"])
+                ),
             },
             "batches": len(loaders[name]),
         }
@@ -547,11 +645,18 @@ def main() -> None:
         "data_summary": data_summary,
         "model_input": ["question text", "answer options when present", "one document text"],
         "sole_supervision": "utility_target = sigmoid(m_D,T=1)-sigmoid(m_0,T=1)",
-        "loss": f"unweighted Huber regression, delta={args.huber_delta}",
+        "loss": (
+            f"Huber regression(delta={args.huber_delta}); samples with "
+            f"|u|>={args.utility_threshold} receive weight {args.extreme_sample_weight}"
+        ),
         "forbidden_model_inputs": [
             "gold answer", "teacher logits/margins", "No-RAG correctness", "answer transition", "hidden states", "RAG2 label"
         ],
-        "checkpoint_selection": "maximum validation Spearman correlation",
+        "deployment_rule": (
+            f"Helpful if predicted u>={args.utility_threshold}; Harmful if predicted "
+            f"u<=-{args.utility_threshold}; otherwise Neutral"
+        ),
+        "checkpoint_selection": f"maximum validation {args.checkpoint_metric}",
         "config": {
             key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
         },
@@ -581,9 +686,18 @@ def main() -> None:
                         input_ids=batch["input_ids"].to(device, non_blocking=True),
                         attention_mask=batch["attention_mask"].to(device, non_blocking=True),
                     )
-                    loss = F.huber_loss(
-                        output["utility_score"].float(), target.float(), delta=args.huber_delta
+                    per_sample_loss = F.huber_loss(
+                        output["utility_score"].float(),
+                        target.float(),
+                        delta=args.huber_delta,
+                        reduction="none",
                     )
+                    sample_weight = torch.where(
+                        target.abs() >= args.utility_threshold,
+                        torch.full_like(target, args.extreme_sample_weight),
+                        torch.ones_like(target),
+                    )
+                    loss = (per_sample_loss * sample_weight).sum() / sample_weight.sum().clamp_min(1)
                     scaled = loss / args.gradient_accumulation_steps
                 scaled.backward()
                 update = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(loaders["train"])
@@ -615,7 +729,10 @@ def main() -> None:
                 progress,
                 f"2/3 validation epoch {epoch}/{args.num_train_epochs}",
             )
-            metric = float(validation["overall"]["spearman"])
+            if args.checkpoint_metric == "action_macro_f1":
+                metric = float(validation["action"]["macro_f1"])
+            else:
+                metric = float(validation["overall"]["spearman"])
             if not math.isfinite(metric):
                 metric = -float("inf")
             improved = metric > float(trainer_state["best_metric"]) + args.minimum_improvement
@@ -632,12 +749,14 @@ def main() -> None:
             save_checkpoint(output_dir / "last_checkpoint", model, optimizer, scheduler, trainer_state)
             atomic_json(output_dir / "training_history.json", trainer_state)
             logging.info(
-                "Epoch %d: val Spearman=%.5f MAE=%.5f correct/wrong Spearman=%.5f/%.5f best=%s",
+                "Epoch %d: val macro-F1=%.5f Spearman=%.5f MAE=%.5f "
+                "correct/wrong macro-F1=%.5f/%.5f best=%s",
                 epoch,
+                validation["action"]["macro_f1"],
                 validation["overall"]["spearman"],
                 validation["overall"]["mae"],
-                validation["no_rag_correct"]["spearman"],
-                validation["no_rag_wrong"]["spearman"],
+                validation["action_no_rag_correct"]["macro_f1"],
+                validation["action_no_rag_wrong"]["macro_f1"],
                 trainer_state["best_epoch"],
             )
             if trainer_state["epochs_without_improvement"] >= args.early_stopping_patience:
