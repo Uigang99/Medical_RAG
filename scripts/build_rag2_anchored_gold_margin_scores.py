@@ -91,10 +91,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--datasets",
         nargs="+",
-        choices=("medmcqa", "medqa"),
+        choices=(
+            "medmcqa",
+            "medqa",
+            "mmlu_anatomy",
+            "mmlu_clinical_knowledge",
+            "mmlu_college_biology",
+            "mmlu_college_medicine",
+            "mmlu_medical_genetics",
+            "mmlu_professional_medicine",
+        ),
         default=["medmcqa", "medqa"],
     )
     parser.add_argument("--source-split", default="train")
+    parser.add_argument(
+        "--candidate-contract",
+        choices=("source_balanced_top8", "dynamic_topk_union"),
+        default="source_balanced_top8",
+        help=(
+            "Validate either the training 4x8 -> rerank Top-8 candidates or the external-test "
+            "union of independently reconstructed 4k -> rerank Top-k conditions."
+        ),
+    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -210,19 +228,33 @@ def validate_candidate_contract(args: argparse.Namespace, dataset: str) -> dict[
         problems.append("dataset/split mismatch")
     if manifest.get("sources") != expected_sources:
         problems.append(f"sources={manifest.get('sources')!r}")
-    if int(manifest.get("per_source_top_k", -1)) != 8:
-        problems.append(f"per_source_top_k={manifest.get('per_source_top_k')!r}")
-    if int(manifest.get("candidate_pool_top_k", -1)) != 32:
-        problems.append(f"candidate_pool_top_k={manifest.get('candidate_pool_top_k')!r}")
-    if int(manifest.get("top_k", -1)) != 8:
-        problems.append(f"rerank top_k={manifest.get('top_k')!r}")
-    if actual_source_top_k != {source: 8 for source in expected_sources}:
-        problems.append(f"source_top_k={actual_source_top_k!r}")
     if manifest.get("candidate_layout") != "source_balanced":
         problems.append(f"candidate_layout={manifest.get('candidate_layout')!r}")
+    if args.candidate_contract == "source_balanced_top8":
+        if int(manifest.get("per_source_top_k", -1)) != 8:
+            problems.append(f"per_source_top_k={manifest.get('per_source_top_k')!r}")
+        if int(manifest.get("candidate_pool_top_k", -1)) != 32:
+            problems.append(f"candidate_pool_top_k={manifest.get('candidate_pool_top_k')!r}")
+        if int(manifest.get("top_k", -1)) != 8:
+            problems.append(f"rerank top_k={manifest.get('top_k')!r}")
+        if actual_source_top_k != {source: 8 for source in expected_sources}:
+            problems.append(f"source_top_k={actual_source_top_k!r}")
+    else:
+        if manifest.get("candidate_protocol") != "rag2_paper_balanced_dynamic_topk_union_v1":
+            problems.append(f"candidate_protocol={manifest.get('candidate_protocol')!r}")
+        if int(manifest.get("per_source_top_k", -1)) != 32:
+            problems.append(f"per_source_top_k={manifest.get('per_source_top_k')!r}")
+        if int(manifest.get("candidate_pool_top_k", -1)) != 128:
+            problems.append(f"candidate_pool_top_k={manifest.get('candidate_pool_top_k')!r}")
+        if not bool(manifest.get("variable_docs_per_question")):
+            problems.append("variable_docs_per_question is false")
+        if list(manifest.get("dynamic_top_k_values") or []) != [1, 2, 4, 8, 16, 32]:
+            problems.append(f"dynamic_top_k_values={manifest.get('dynamic_top_k_values')!r}")
+        if int(manifest.get("selected_pair_count", -1)) <= 0:
+            problems.append(f"selected_pair_count={manifest.get('selected_pair_count')!r}")
     if problems:
         raise RuntimeError(
-            f"Candidate contract is not 4-source balanced Top-8 -> rerank Top-8 for {dataset}: "
+            f"Candidate contract mismatch ({args.candidate_contract}) for {dataset}: "
             + "; ".join(problems)
         )
     return manifest
@@ -276,10 +308,15 @@ def discover_inputs(
         total_questions += int((no_manifest.get("datasets") or {}).get(dataset, 0))
         expected_pairs = int((doc_manifest.get("datasets") or {}).get(dataset, -1))
         selected = int(candidate.get("selected_question_count", -1))
-        if expected_pairs != selected * 8:
+        expected_from_candidate = (
+            selected * 8
+            if args.candidate_contract == "source_balanced_top8"
+            else int(candidate.get("selected_pair_count", -1))
+        )
+        if expected_pairs != expected_from_candidate:
             raise RuntimeError(
-                f"Top-8 pair count mismatch for {dataset}: document_manifest={expected_pairs}, "
-                f"selected_questions={selected}"
+                f"Candidate/feature pair count mismatch for {dataset}: "
+                f"document_manifest={expected_pairs}, candidate={expected_from_candidate}"
             )
         roots = sorted(
             (
@@ -741,9 +778,14 @@ def main() -> None:
     )
     for dataset in args.datasets:
         manifest = candidate_manifests[dataset]
+        if args.candidate_contract == "source_balanced_top8":
+            contract_text = "4 corpora x 8 dense = 32 -> MedCPT rerank Top-8"
+        else:
+            contract_text = "dynamic union of 4k -> MedCPT rerank Top-k, k=1/2/4/8/16/32"
         logging.info(
-            "[%s] retrieval contract: 4 corpora x 8 dense = 32 -> MedCPT rerank Top-8; questions=%d pairs=%d",
+            "[%s] retrieval contract: %s; questions=%d pairs=%d",
             dataset,
+            contract_text,
             int(manifest["selected_question_count"]),
             int((doc_manifest["datasets"])[dataset]),
         )
@@ -801,7 +843,12 @@ def main() -> None:
                 "model_name_or_path": no_manifest["model_name_or_path"],
                 "trace_version": TRACE_VERSION,
                 "prompt_version": PROMPT_VERSION,
-                "retrieval_contract": "4 corpora x 8 dense candidates = 32; MedCPT rerank Top-8",
+                "candidate_contract": args.candidate_contract,
+                "retrieval_contract": (
+                    "4 corpora x 8 dense candidates = 32; MedCPT rerank Top-8"
+                    if args.candidate_contract == "source_balanced_top8"
+                    else "dynamic union of independent 4k -> MedCPT rerank Top-k conditions for k=1/2/4/8/16/32"
+                ),
                 "gpu_forward_performed": False,
                 "score_shard_layout": "score_shards/{dataset}/{split}/{shard}/rows.jsonl + scores.safetensors",
                 "answer_transition_basis": "exact_hf_replay_four_choice_logits",

@@ -17,6 +17,7 @@ from scripts.materialize_rag2_external_hidden_oracle_labels import (
     h0_exceeds_numerical_tolerance,
     validate_feature_cache_contract,
 )
+from scripts.materialize_rag2_margin_utility_oracle_labels import label_for
 
 
 def sample() -> BenchmarkSample:
@@ -41,6 +42,24 @@ def test_apply_rag2_oracle_treats_only_quality_helpful_as_passing(tmp_path):
     docs = [[document(1), document(2)]]
     apply_oracle_labels(argparse.Namespace(oracle_labels_path=path, oracle_policy="rag2"), [sample()], docs)
     assert [value.filter_prediction for value in docs[0]] == ["helpful", "not helpful"]
+
+
+def test_apply_margin_oracle_passes_only_quality_helpful(tmp_path):
+    path = tmp_path / "labels.jsonl"
+    write_rows(path, [
+        {"sample_key": "medqa::test::id0::0", "doc_rank": 1, "doc_stable_id": "stable1", "pseudo_label": "Helpful", "quality_pass": True, "utility_score": 0.2},
+        {"sample_key": "medqa::test::id0::0", "doc_rank": 2, "doc_stable_id": "stable2", "pseudo_label": "Neutral", "quality_pass": True, "utility_score": 0.05},
+    ])
+    docs = [[document(1), document(2)]]
+    apply_oracle_labels(argparse.Namespace(oracle_labels_path=path, oracle_policy="margin_utility"), [sample()], docs)
+    assert [value.filter_prediction for value in docs[0]] == ["helpful", "not helpful"]
+    assert docs[0][0].filter_score == 0.2
+
+
+def test_margin_utility_label_boundaries_are_inclusive():
+    assert label_for(0.1, 0.1) == "Helpful"
+    assert label_for(-0.1, 0.1) == "Harmful"
+    assert label_for(0.099, 0.1) == "Neutral"
 
 
 def test_apply_hidden_oracle_uses_strict_threshold(tmp_path):

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from scripts.summarize_rag2_anchored_paper_reproduction_sweep import (
+    condition_specs,
     render_table,
     summarize_rows,
 )
@@ -82,6 +84,21 @@ class AnchoredSweepSummaryTests(unittest.TestCase):
         self.assertIn("Macro Avg (3 groups)", table)
         self.assertIn("MMLU pooled", table)
         self.assertIn("| 2 | RAG2 filtering | 1.25 |", table)
+
+    def test_generic_oracle_condition_naming(self) -> None:
+        specs = condition_specs(
+            Path("/reference"),
+            Path("/oracle"),
+            oracle_case_prefix="oracle_rag_margin_utility",
+            oracle_display_label="Margin utility Oracle",
+        )
+        oracle = [row for row in specs if row["case"] == "oracle_rag"]
+        self.assertEqual(len(oracle), 6)
+        self.assertEqual(oracle[0]["filtering"], "Margin utility Oracle")
+        self.assertEqual(
+            oracle[0]["case_root"],
+            Path("/oracle/oracle_rag_margin_utility_top1"),
+        )
 
 
 if __name__ == "__main__":

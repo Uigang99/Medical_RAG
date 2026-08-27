@@ -62,6 +62,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional dynamic Top-k RAG2 gold-label Oracle result root to append to every k.",
     )
+    parser.add_argument("--expected-oracle-policy", default="rag2")
+    parser.add_argument("--oracle-case-prefix", default="oracle_rag_rag2")
+    parser.add_argument("--oracle-display-label", default="RAG2 gold-label Oracle")
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--expected-prompt-profile", default="paper_compatible_three_anchor")
     parser.add_argument("--expected-answer-decision-mode", default="free_generation")
@@ -275,7 +278,13 @@ def summarize_rows(
     }
 
 
-def condition_specs(results_root: Path, oracle_results_root: Path | None = None) -> list[dict[str, Any]]:
+def condition_specs(
+    results_root: Path,
+    oracle_results_root: Path | None = None,
+    *,
+    oracle_case_prefix: str = "oracle_rag_rag2",
+    oracle_display_label: str = "RAG2 gold-label Oracle",
+) -> list[dict[str, Any]]:
     specs = [
         {
             "top_k": None,
@@ -305,9 +314,9 @@ def condition_specs(results_root: Path, oracle_results_root: Path | None = None)
             specs.append(
                 {
                     "top_k": top_k,
-                    "filtering": "RAG2 gold-label Oracle",
+                    "filtering": oracle_display_label,
                     "case": "oracle_rag",
-                    "case_root": oracle_results_root / f"oracle_rag_rag2_top{top_k}",
+                    "case_root": oracle_results_root / f"{oracle_case_prefix}_top{top_k}",
                 }
             )
     return specs
@@ -409,7 +418,12 @@ def write_csv(path: Path, summary: dict[str, Any]) -> None:
 
 def main() -> None:
     args = parse_args()
-    specs = condition_specs(args.results_root, args.oracle_results_root)
+    specs = condition_specs(
+        args.results_root,
+        args.oracle_results_root,
+        oracle_case_prefix=args.oracle_case_prefix,
+        oracle_display_label=args.oracle_display_label,
+    )
     total_rows = sum(EXPECTED_DATASET_COUNTS.values()) * len(specs)
     progress = PipelineProgress(
         overall_total=total_rows + 3,
@@ -435,9 +449,13 @@ def main() -> None:
                 expected_paper_balanced_projection=args.expected_paper_balanced_projection,
                 progress=progress,
             )
-            if spec["case"] == "oracle_rag" and config.get("oracle_policy") != "rag2":
+            if (
+                spec["case"] == "oracle_rag"
+                and config.get("oracle_policy") != args.expected_oracle_policy
+            ):
                 raise RuntimeError(
-                    f"Oracle policy mismatch in {run_dir}: {config.get('oracle_policy')!r} != 'rag2'"
+                    f"Oracle policy mismatch in {run_dir}: "
+                    f"{config.get('oracle_policy')!r} != {args.expected_oracle_policy!r}"
                 )
             keys = sample_keys(rows)
             if reference_keys is None:
@@ -473,6 +491,8 @@ def main() -> None:
             "oracle_results_root": (
                 str(args.oracle_results_root.resolve()) if args.oracle_results_root is not None else None
             ),
+            "oracle_policy": args.expected_oracle_policy,
+            "oracle_display_label": args.oracle_display_label,
             "prompt_profile": args.expected_prompt_profile,
             "answer_decision_mode": args.expected_answer_decision_mode,
             "paper_balanced_projection": args.expected_paper_balanced_projection,

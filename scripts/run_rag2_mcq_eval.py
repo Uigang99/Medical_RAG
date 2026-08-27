@@ -182,7 +182,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--oracle-policy",
-        choices=["rag2", "hidden_tau_0", "hidden_tau_0p4", "hidden_three_class"],
+        choices=[
+            "rag2",
+            "hidden_tau_0",
+            "hidden_tau_0p4",
+            "hidden_three_class",
+            "margin_utility",
+        ],
         default=None,
         help="Label/score field to materialize as Helpful for --case oracle_rag.",
     )
@@ -3644,6 +3650,11 @@ def apply_oracle_labels(
             if args.oracle_policy == "rag2":
                 helpful = str(row.get("pseudo_label") or "") == "Helpful" and bool(row.get("quality_pass"))
                 score = row.get("delta_ppl")
+            elif args.oracle_policy == "margin_utility":
+                helpful = str(row.get("pseudo_label") or "") == "Helpful" and bool(
+                    row.get("quality_pass")
+                )
+                score = row.get("utility_score")
             elif args.oracle_policy == "hidden_three_class":
                 helpful = str(row.get("hidden_label") or "") == "Helpful" and bool(
                     row.get("hidden_quality_pass")
@@ -3660,9 +3671,10 @@ def apply_oracle_labels(
                 "policy": args.oracle_policy,
                 "gold_label": (
                     row.get("pseudo_label")
-                    if args.oracle_policy == "rag2"
+                    if args.oracle_policy in {"rag2", "margin_utility"}
                     else row.get("hidden_label")
                 ),
+                "utility_score": row.get("utility_score"),
                 "projection_score": row.get("projection_score"),
                 "hidden_threshold": row.get("hidden_threshold"),
             }
