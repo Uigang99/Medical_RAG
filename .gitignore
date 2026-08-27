@@ -118,6 +118,12 @@ venv/
 !/scripts/materialize_rag2_anchored_external_oracle_labels.py
 !/scripts/materialize_rag2_semantic_label_delta.py
 !/scripts/run_rag2_anchored_semantic_label_delta.sh
+!/scripts/build_rag2_margin_regression_dataset.py
+!/scripts/train_rag2_margin_regressor.py
+!/scripts/run_rag2_margin_regression_prepare.sh
+!/scripts/run_rag2_margin_regression_training.sh
+
+!/medrag/filtering/rag2_margin_regressor.py
 
 /tests/*
 !/tests/test_rag2_hidden_score_gold_margin.py
@@ -132,3 +138,4 @@ venv/
 !/tests/test_rag2_anchored_no_rag.py
 !/tests/test_rag2_anchored_document_pipeline.py
 !/tests/test_rag2_two_head_filter.py
+!/tests/test_rag2_margin_regressor.py
