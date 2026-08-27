@@ -46,7 +46,7 @@ from medrag.filtering.rag2_official import clean_text, format_options  # noqa: E
 from medrag.progress import PipelineProgress  # noqa: E402
 
 
-TRAINER_VERSION = "rag2_shared_margin_regression_trainer_v1"
+TRAINER_VERSION = "rag2_shared_margin_regression_trainer_v2_packed_shard_remainders"
 PREPARED_VERSION = "rag2_shared_margin_question_splits_v1"
 ACTION_NAMES = ("helpful", "neutral", "harmful")
 
@@ -238,11 +238,11 @@ class ShardQuestionBatchSampler(Sampler[list[int]]):
         grouped: dict[str, list[int]] = defaultdict(list)
         for index, shard in enumerate(dataset["trace_shard"]):
             grouped[str(shard)].append(index)
-        self.batches = {
-            shard: [indices[start : start + self.batch_size] for start in range(0, len(indices), self.batch_size)]
-            for shard, indices in grouped.items()
-        }
-        self.length = sum(len(value) for value in self.batches.values())
+        self.grouped = dict(grouped)
+        # Full batches remain shard-local for trace-cache locality.  Residual
+        # questions are packed across shards at iteration time instead of
+        # becoming hundreds of tiny optimizer batches in a random pilot.
+        self.length = math.ceil(len(dataset) / self.batch_size)
 
     def __len__(self) -> int:
         return self.length
@@ -250,17 +250,25 @@ class ShardQuestionBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         generator = random.Random(self.seed + self.epoch)
         self.epoch += 1
-        shards = list(self.batches)
+        shards = list(self.grouped)
         if self.shuffle:
             generator.shuffle(shards)
+        remainders: list[int] = []
         for shard in shards:
-            batches = [list(batch) for batch in self.batches[shard]]
+            indices = list(self.grouped[shard])
             if self.shuffle:
-                generator.shuffle(batches)
-            for batch in batches:
-                if self.shuffle:
-                    generator.shuffle(batch)
-                yield batch
+                generator.shuffle(indices)
+            full_end = (len(indices) // self.batch_size) * self.batch_size
+            for start in range(0, full_end, self.batch_size):
+                yield indices[start : start + self.batch_size]
+            remainders.extend(indices[full_end:])
+            # Emit packed residuals immediately.  A mixed batch therefore
+            # touches only a few adjacent shards that are still trace-cached.
+            while len(remainders) >= self.batch_size:
+                yield remainders[: self.batch_size]
+                del remainders[: self.batch_size]
+        if remainders:
+            yield remainders
 
 
 class SharedMarginCollator:
@@ -569,6 +577,7 @@ def main() -> None:
             "documents": work_units(dataset) - len(dataset),
             "encoder_inputs": work_units(dataset),
             "batches": len(loaders[name]),
+            "mean_questions_per_batch": round(len(dataset) / max(1, len(loaders[name])), 3),
         }
         for name, dataset in datasets.items()
     }
