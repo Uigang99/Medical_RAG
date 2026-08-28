@@ -80,6 +80,7 @@ for CURRENT_MODE in "${MODES[@]}"; do
       --output-root "${OUTPUT_ROOT}"
       --document-pair-min-utility-gap "${PAIR_MIN_GAP:-0.1}"
       --max-input-tokens "${MAX_TOKENS}"
+      --max-semantic-pairs-per-forward "${MAX_SEMANTIC_PAIRS_PER_FORWARD:-4}"
       --minimum-document-tokens 16
       --trace-shard-cache-size 8
       --bf16

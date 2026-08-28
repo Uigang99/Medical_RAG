@@ -98,6 +98,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--document-pair-min-utility-gap", type=float, default=0.1)
+    parser.add_argument(
+        "--max-semantic-pairs-per-forward",
+        type=int,
+        default=4,
+        help=(
+            "GPU micro-chunk size. Each semantic pair produces two oriented inputs; "
+            "question-macro loss remains exact across chunks."
+        ),
+    )
     parser.add_argument("--max-input-tokens", type=int, default=512)
     parser.add_argument("--minimum-document-tokens", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=None)
@@ -513,9 +522,17 @@ def choice_logits(
     batch: dict[str, Any],
     device: torch.device,
     choice_token_ids: Sequence[int],
+    pair_start: int = 0,
+    pair_end: int | None = None,
 ) -> torch.Tensor:
-    input_ids = batch["input_ids"].to(device, non_blocking=True)
-    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+    pair_total = len(batch["sample_ids"])
+    end = pair_total if pair_end is None else min(int(pair_end), pair_total)
+    start = max(0, int(pair_start))
+    if start >= end:
+        raise ValueError(f"Empty semantic-pair forward slice: {start}:{end}")
+    orientation_slice = slice(2 * start, 2 * end)
+    input_ids = batch["input_ids"][orientation_slice].to(device, non_blocking=True)
+    attention_mask = batch["attention_mask"][orientation_slice].to(device, non_blocking=True)
     decoder_start = int(model.config.decoder_start_token_id)
     decoder_input_ids = torch.full(
         (input_ids.shape[0], 1), decoder_start, dtype=torch.long, device=device
@@ -527,6 +544,78 @@ def choice_logits(
         use_cache=False,
     )
     return outputs.logits[:, 0, list(choice_token_ids)]
+
+
+def question_macro_pair_weights(question_index: torch.Tensor) -> torch.Tensor:
+    """Weights whose sum is one and whose mass is equal for every question."""
+
+    if question_index.ndim != 1 or not question_index.numel():
+        raise ValueError("question_index must be a non-empty one-dimensional tensor")
+    unique, inverse, counts = torch.unique(
+        question_index, sorted=True, return_inverse=True, return_counts=True
+    )
+    return 1.0 / (float(unique.numel()) * counts[inverse].to(torch.float32))
+
+
+def backward_question_macro_loss_chunked(
+    model: Any,
+    batch: dict[str, Any],
+    device: torch.device,
+    choice_token_ids: Sequence[int],
+    *,
+    max_pairs_per_forward: int,
+    accumulation_divisor: int,
+) -> float:
+    """Backpropagate exact question-macro loss without retaining all pair graphs."""
+
+    pair_total = len(batch["sample_ids"])
+    weights = question_macro_pair_weights(batch["question_index"]).to(device)
+    total_loss = 0.0
+    for start in range(0, pair_total, int(max_pairs_per_forward)):
+        end = min(pair_total, start + int(max_pairs_per_forward))
+        logits = choice_logits(
+            model,
+            batch,
+            device,
+            choice_token_ids,
+            pair_start=start,
+            pair_end=end,
+        )
+        labels = batch["orientation_labels"][2 * start : 2 * end].to(
+            device, non_blocking=True
+        )
+        orientation_loss = F.cross_entropy(logits, labels, reduction="none")
+        pair_loss = orientation_loss.view(-1, 2).mean(dim=1)
+        chunk_loss = (pair_loss * weights[start:end]).sum()
+        (chunk_loss / float(accumulation_divisor)).backward()
+        total_loss += float(chunk_loss.detach().item())
+        del logits, labels, orientation_loss, pair_loss, chunk_loss
+    return total_loss
+
+
+@torch.no_grad()
+def choice_logits_chunked(
+    model: Any,
+    batch: dict[str, Any],
+    device: torch.device,
+    choice_token_ids: Sequence[int],
+    max_pairs_per_forward: int,
+) -> torch.Tensor:
+    chunks: list[torch.Tensor] = []
+    pair_total = len(batch["sample_ids"])
+    for start in range(0, pair_total, int(max_pairs_per_forward)):
+        end = min(pair_total, start + int(max_pairs_per_forward))
+        chunks.append(
+            choice_logits(
+                model,
+                batch,
+                device,
+                choice_token_ids,
+                pair_start=start,
+                pair_end=end,
+            )
+        )
+    return torch.cat(chunks, dim=0)
 
 
 def question_macro_loss(
@@ -611,6 +700,7 @@ def evaluate(
     choice_token_ids: Sequence[int],
     progress: PipelineProgress,
     stage: str,
+    max_pairs_per_forward: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     model.eval()
     progress.set_stage(stage, total=len(loader.dataset))
@@ -618,7 +708,13 @@ def evaluate(
     weighted_loss = 0.0
     pair_count = 0
     for batch in loader:
-        logits = choice_logits(model, batch, device, choice_token_ids)
+        logits = choice_logits_chunked(
+            model,
+            batch,
+            device,
+            choice_token_ids,
+            max_pairs_per_forward,
+        )
         labels = batch["orientation_labels"].to(device, non_blocking=True)
         question_index = batch["question_index"].to(device, non_blocking=True)
         loss = question_macro_loss(logits, labels, question_index)
@@ -726,6 +822,8 @@ def main() -> None:
         raise ValueError("Epoch and accumulation values must be positive")
     if not 0 < args.document_pair_min_utility_gap < 2:
         raise ValueError("document-pair-min-utility-gap must be in (0,2)")
+    if args.max_semantic_pairs_per_forward < 1:
+        raise ValueError("max-semantic-pairs-per-forward must be positive")
     if args.max_input_tokens < 128:
         raise ValueError("max-input-tokens is too small for a two-document prompt")
     if args.checkpoint_split == "train" and not args.evaluate_train:
@@ -817,6 +915,10 @@ def main() -> None:
         else args.model_name_or_path
     )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, local_files_only=True)
+    # T5 uses relative positions and accepts the explicitly configured longer
+    # context; prevent the tokenizer's legacy 512-token warning from claiming
+    # that 768-token inputs will cause positional indexing errors.
+    tokenizer.model_max_length = int(args.max_input_tokens)
     choice_ids = [
         tokenizer.encode("A", add_special_tokens=False),
         tokenizer.encode("B", add_special_tokens=False),
@@ -908,6 +1010,7 @@ def main() -> None:
             choice_token_ids,
             progress,
             "untrained validation baseline",
+            args.max_semantic_pairs_per_forward,
         )
         atomic_json(run_dir / "initial_validation_metrics.json", initial_metrics)
         logging.info(
@@ -926,13 +1029,23 @@ def main() -> None:
         epoch_loss = 0.0
         epoch_pairs = 0
         for batch_index, batch in enumerate(train_loader, 1):
-            logits = choice_logits(model, batch, device, choice_token_ids)
-            labels = batch["orientation_labels"].to(device, non_blocking=True)
-            question_index = batch["question_index"].to(device, non_blocking=True)
-            loss = question_macro_loss(logits, labels, question_index)
-            (loss / args.gradient_accumulation_steps).backward()
+            accumulation_group_start = (
+                (batch_index - 1) // args.gradient_accumulation_steps
+            ) * args.gradient_accumulation_steps
+            accumulation_divisor = min(
+                args.gradient_accumulation_steps,
+                len(train_loader) - accumulation_group_start,
+            )
+            loss_value = backward_question_macro_loss_chunked(
+                model,
+                batch,
+                device,
+                choice_token_ids,
+                max_pairs_per_forward=args.max_semantic_pairs_per_forward,
+                accumulation_divisor=accumulation_divisor,
+            )
             count = len(batch["sample_ids"])
-            epoch_loss += float(loss.item()) * count
+            epoch_loss += float(loss_value) * count
             epoch_pairs += count
             should_step = (
                 batch_index % args.gradient_accumulation_steps == 0
@@ -959,6 +1072,7 @@ def main() -> None:
                 choice_token_ids,
                 progress,
                 f"train-set memorization epoch {epoch}",
+                args.max_semantic_pairs_per_forward,
             )
         validation_metrics, _ = evaluate(
             model,
@@ -967,6 +1081,7 @@ def main() -> None:
             choice_token_ids,
             progress,
             f"validation epoch {epoch}",
+            args.max_semantic_pairs_per_forward,
         )
         selection_metrics = train_metrics if args.checkpoint_split == "train" else validation_metrics
         score = float(selection_metrics["question_macro_accuracy"])
@@ -1048,6 +1163,7 @@ def main() -> None:
         choice_token_ids,
         progress,
         "final best-checkpoint validation",
+        args.max_semantic_pairs_per_forward,
     )
     final_test, test_records = evaluate(
         model,
@@ -1056,6 +1172,7 @@ def main() -> None:
         choice_token_ids,
         progress,
         "final held-out test",
+        args.max_semantic_pairs_per_forward,
     )
     summary = {
         "trainer_version": TRAINER_VERSION,

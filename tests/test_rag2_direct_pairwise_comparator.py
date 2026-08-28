@@ -6,6 +6,7 @@ from scripts.train_rag2_direct_pairwise_comparator import (
     DirectPairDataset,
     SymmetricPairPacker,
     question_macro_loss,
+    question_macro_pair_weights,
 )
 
 
@@ -79,6 +80,12 @@ def test_question_macro_loss_does_not_overweight_question_with_more_pairs():
     hard = torch.nn.functional.cross_entropy(torch.tensor([[0.0, 3.0]]), torch.tensor([0]))
     expected = (easy + hard) / 2.0
     assert torch.allclose(loss, expected)
+
+
+def test_chunk_weights_preserve_exact_question_macro_mass():
+    weights = question_macro_pair_weights(torch.tensor([0, 0, 1]))
+    assert torch.allclose(weights, torch.tensor([0.25, 0.25, 0.50]))
+    assert torch.allclose(weights[:2].sum(), weights[2:].sum())
 
 
 def test_symmetric_pair_packer_never_exceeds_budget():
