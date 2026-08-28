@@ -47,6 +47,22 @@ BINARY_LABEL_NAMES = ("helpful", "not helpful")
 BINARY_LABEL_TOKENS = ("[HELPFUL]", "[NOT_HELPFUL]")
 THREE_CLASS_LABEL_NAMES = ("helpful", "not helpful", "discard")
 THREE_CLASS_LABEL_TOKENS = ("[HELPFUL]", "[NOT_HELPFUL]", "[DISCARD]")
+SEMANTIC_FIVE_LABEL_NAMES = (
+    "direct_support",
+    "supporting_evidence",
+    "no_evidence",
+    "misleading_evidence",
+    "indeterminate_or_mixed",
+)
+SEMANTIC_FIVE_LABEL_TOKENS = (
+    "[DIRECT_SUPPORT]",
+    "[SUPPORTING_EVIDENCE]",
+    "[NO_EVIDENCE]",
+    "[MISLEADING_EVIDENCE]",
+    "[INDETERMINATE_OR_MIXED]",
+)
+SEMANTIC_FOUR_LABEL_NAMES = SEMANTIC_FIVE_LABEL_NAMES[:4]
+SEMANTIC_FOUR_LABEL_TOKENS = SEMANTIC_FIVE_LABEL_TOKENS[:4]
 
 
 DEFAULT_SPLIT_ROOT = (
@@ -84,11 +100,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default="top10_epoch5_official_protocol")
     parser.add_argument(
         "--label-mode",
-        choices=("binary", "three_class"),
+        choices=("binary", "three_class", "semantic_four", "semantic_five"),
         default="binary",
         help=(
             "Classifier label space. The default reproduces the historical Helpful/Not Helpful "
-            "filter. 'three_class' additionally trains Discard as an abstention/no-decision target."
+            "filter. 'three_class' additionally trains Discard as an abstention/no-decision target. "
+            "'semantic_four' predicts direct/supporting/no/misleading evidence while excluding "
+            "indeterminate_or_mixed during materialization. "
+            "'semantic_five' predicts the five unmerged semantic evidence labels."
         ),
     )
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
@@ -302,16 +321,29 @@ def training_label_spec(label_mode: str) -> tuple[tuple[str, ...], tuple[str, ..
         return BINARY_LABEL_NAMES, BINARY_LABEL_TOKENS
     if label_mode == "three_class":
         return THREE_CLASS_LABEL_NAMES, THREE_CLASS_LABEL_TOKENS
+    if label_mode == "semantic_four":
+        return SEMANTIC_FOUR_LABEL_NAMES, SEMANTIC_FOUR_LABEL_TOKENS
+    if label_mode == "semantic_five":
+        return SEMANTIC_FIVE_LABEL_NAMES, SEMANTIC_FIVE_LABEL_TOKENS
     raise ValueError(f"Unsupported label mode: {label_mode}")
 
 
 def normalize_training_label(value: Any) -> str:
-    normalized = clean_text(value).lower().replace("_", " ").strip("[]")
+    normalized = clean_text(value).lower().strip("[]").replace("-", "_").replace(" ", "_")
+    semantic_aliases = {
+        "direct_support": "direct_support",
+        "supporting_evidence": "supporting_evidence",
+        "no_evidence": "no_evidence",
+        "misleading_evidence": "misleading_evidence",
+        "indeterminate_or_mixed": "indeterminate_or_mixed",
+    }
+    if normalized in semantic_aliases:
+        return semantic_aliases[normalized]
     if normalized == "helpful":
         return "helpful"
-    if normalized in {"not helpful", "nothelpful", "unhelpful"}:
+    if normalized in {"not_helpful", "nothelpful", "unhelpful"}:
         return "not helpful"
-    if normalized in {"discard", "neutral", "no clear local utility"}:
+    if normalized in {"discard", "neutral", "no_clear_local_utility"}:
         return "discard"
     raise ValueError(f"Unsupported filter training label: {value!r}")
 
@@ -321,6 +353,7 @@ def add_training_label_tokens(
     model: Any,
     label_names: tuple[str, ...],
     label_tokens: tuple[str, ...],
+    label_mode: str,
 ) -> dict[str, int]:
     """Add one atomic decoder token per class without changing binary defaults."""
     model.config.tie_word_embeddings = False
@@ -333,7 +366,7 @@ def add_training_label_tokens(
         if len(ids) != 1 or (unk_id is not None and ids[0] == unk_id):
             raise ValueError(f"Label {token!r} must resolve to one non-UNK token; got {ids}")
         token_ids[name] = int(ids[0])
-    model.config.rag2_filter_label_mode = "three_class" if len(label_names) == 3 else "binary"
+    model.config.rag2_filter_label_mode = label_mode
     model.config.rag2_filter_label_names = list(label_names)
     model.config.rag2_filter_label_tokens = list(label_tokens)
     model.config.rag2_filter_input_format = "rag2_official_evidence_question_v1"
@@ -1000,6 +1033,12 @@ def main() -> None:
             raise ValueError(
                 f"{split_name} has no Discard targets; materialize the split with --training-label-mode three_class."
             )
+        if args.label_mode in {"semantic_four", "semantic_five"}:
+            missing = allowed_labels - observed
+            if missing and split_name == "train":
+                raise ValueError(f"Training split is missing semantic classes: {sorted(missing)}")
+            if missing:
+                logging.warning("%s split is missing semantic classes: %s", split_name, sorted(missing))
     label_dataset_manifest = read_filter_label_manifest(args)
     summaries = [
         summarize(train_raw, "train"),
@@ -1016,7 +1055,7 @@ def main() -> None:
             raise RuntimeError("--load-model-in-bf16 requires CUDA")
         model_kwargs["torch_dtype"] = torch.bfloat16
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path, **model_kwargs)
-    label_ids = add_training_label_tokens(tokenizer, model, label_names, label_tokens)
+    label_ids = add_training_label_tokens(tokenizer, model, label_names, label_tokens, args.label_mode)
     if args.preformatted_input:
         model.config.rag2_filter_input_format = "rag2_answer_aware_evidence_question_v1"
         model.config.rag2_filter_requires_no_rag_answer = True
@@ -1222,6 +1261,10 @@ def main() -> None:
         "method_status": (
             "RAG2 three-class selective extension; Discard is an abstention/no-decision target and only Helpful is eligible for downstream inclusion"
             if args.label_mode == "three_class"
+            else "RAG2-input-compatible four-class semantic evidence classifier; indeterminate_or_mixed is excluded rather than merged"
+            if args.label_mode == "semantic_four"
+            else "RAG2-input-compatible five-class semantic evidence classifier; original semantic labels are not merged"
+            if args.label_mode == "semantic_five"
             else "released RAG2 binary filter label space"
         ),
         "public_protocol": {

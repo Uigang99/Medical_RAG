@@ -4,11 +4,15 @@ from __future__ import annotations
 """Materialize a controlled document-level RAG² filter dataset from Codex labels.
 
 The original question-level 8:1:1 assignments and the released RAG²
-evidence-then-question filter prompt are preserved.  The only supervision
-change is replacing PPL-derived labels with the semantic evidence labels:
+evidence-then-question filter prompt are preserved.  Two audited target spaces
+are supported without changing the input:
 
   Helpful     = direct_support or supporting_evidence
   Not Helpful = no_evidence, misleading_evidence, or indeterminate_or_mixed
+
+or the four coherent semantic labels exactly as annotated.  The rare
+``indeterminate_or_mixed`` abstention category is audited but excluded from
+four-class optimization instead of being conflated with ``no_evidence``.
 
 The production Codex annotation covers rerank Top-8 candidates.  This builder
 therefore intentionally never reads ranks 9 or 10 and never mixes PPL labels
@@ -38,8 +42,26 @@ from medrag.filtering.rag2_official import build_official_filter_input, clean_te
 SPLITS = ("train", "val", "test")
 SEMANTIC_HELPFUL = {"direct_support", "supporting_evidence"}
 SEMANTIC_NOT_HELPFUL = {"no_evidence", "misleading_evidence", "indeterminate_or_mixed"}
-VALID_SEMANTIC_LABELS = SEMANTIC_HELPFUL | SEMANTIC_NOT_HELPFUL
-MATERIALIZATION_VERSION = "rag2_codex_semantic_top8_binary_filter_input_v1"
+SEMANTIC_LABELS = (
+    "direct_support",
+    "supporting_evidence",
+    "no_evidence",
+    "misleading_evidence",
+    "indeterminate_or_mixed",
+)
+VALID_SEMANTIC_LABELS = set(SEMANTIC_LABELS)
+SEMANTIC_FOUR_LABELS = (
+    "direct_support",
+    "supporting_evidence",
+    "no_evidence",
+    "misleading_evidence",
+)
+TRAINING_LABEL_MODES = ("binary", "semantic_four", "semantic_five")
+MATERIALIZATION_VERSIONS = {
+    "binary": "rag2_codex_semantic_top8_binary_filter_input_v1",
+    "semantic_four": "rag2_codex_semantic_top8_four_class_filter_input_v1",
+    "semantic_five": "rag2_codex_semantic_top8_five_class_filter_input_v1",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +91,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--training-label-mode",
+        choices=TRAINING_LABEL_MODES,
+        default="binary",
+        help=(
+            "binary reproduces the previous semantic Helpful/Not Helpful merge. "
+            "semantic_four preserves the four coherent semantic labels and excludes the rare "
+            "indeterminate_or_mixed abstention category. "
+            "semantic_five preserves all five semantic labels as classifier targets."
+        ),
+    )
     parser.add_argument(
         "--top-k",
         type=int,
@@ -159,7 +192,14 @@ def create_label_index(connection: sqlite3.Connection) -> None:
     )
 
 
-def index_codex_labels(connection: sqlite3.Connection, path: Path, dataset: str) -> dict[str, Any]:
+def index_codex_labels(
+    connection: sqlite3.Connection,
+    path: Path,
+    dataset: str,
+    *,
+    expected_rows: int | None = None,
+    overall_progress: tqdm | None = None,
+) -> dict[str, Any]:
     statement = """
         INSERT INTO codex_labels (
             pair_id,semantic_label,topic_relation,confidence,evidence_sentence_indices,
@@ -169,7 +209,12 @@ def index_codex_labels(connection: sqlite3.Connection, path: Path, dataset: str)
     pending: list[tuple[Any, ...]] = []
     counts: Counter[str] = Counter()
     total = 0
-    for row in tqdm(iter_jsonl(path), desc=f"index-codex:{dataset}", unit="pair"):
+    for row in tqdm(
+        iter_jsonl(path),
+        total=expected_rows,
+        desc=f"index-codex:{dataset}",
+        unit="pair",
+    ):
         pair_id = str(row.get("pair_id") or row.get("id") or "")
         semantic_label = str(row.get("semantic_label") or "")
         if not pair_id or semantic_label not in VALID_SEMANTIC_LABELS:
@@ -202,6 +247,8 @@ def index_codex_labels(connection: sqlite3.Connection, path: Path, dataset: str)
         )
         total += 1
         counts[semantic_label] += 1
+        if overall_progress is not None:
+            overall_progress.update(1)
         if len(pending) >= 10_000:
             try:
                 connection.executemany(statement, pending)
@@ -217,7 +264,19 @@ def index_codex_labels(connection: sqlite3.Connection, path: Path, dataset: str)
     return {"rows": total, "semantic_label": dict(sorted(counts.items()))}
 
 
-def target_from_semantic_label(value: str) -> tuple[str, str]:
+def target_from_semantic_label(value: str, training_label_mode: str) -> tuple[str, str] | None:
+    if training_label_mode == "semantic_four":
+        if value == "indeterminate_or_mixed":
+            return None
+        if value not in SEMANTIC_FOUR_LABELS:
+            raise ValueError(f"Unexpected semantic label: {value}")
+        return value, value
+    if training_label_mode == "semantic_five":
+        if value not in VALID_SEMANTIC_LABELS:
+            raise ValueError(f"Unexpected semantic label: {value}")
+        return value, value
+    if training_label_mode != "binary":
+        raise ValueError(f"Unsupported training label mode: {training_label_mode}")
     if value in SEMANTIC_HELPFUL:
         return "helpful", "Helpful"
     if value in SEMANTIC_NOT_HELPFUL:
@@ -245,15 +304,20 @@ def make_output_row(
     split: str,
     label_row: sqlite3.Row,
     max_doc_chars: int,
-) -> dict[str, Any]:
+    training_label_mode: str,
+) -> dict[str, Any] | None:
     sample_id = str(candidate_row["sample_id"])
     stable_id = str(document.get("stable_id") or "")
     source = str(document.get("source") or "")
     if source != label_row["source"] or stable_id != label_row["doc_stable_id"] or rank != int(label_row["doc_rank"]):
         raise ValueError(f"Codex/candidate provenance mismatch: {label_row['pair_id']}")
-    target, public_label = target_from_semantic_label(str(label_row["semantic_label"]))
+    semantic_label = str(label_row["semantic_label"])
+    target_and_label = target_from_semantic_label(semantic_label, training_label_mode)
+    if target_and_label is None:
+        return None
+    target, public_label = target_and_label
     return {
-        "materialization_version": MATERIALIZATION_VERSION,
+        "materialization_version": MATERIALIZATION_VERSIONS[training_label_mode],
         "id": str(label_row["pair_id"]),
         "pair_id": str(label_row["pair_id"]),
         "dataset": candidate_row.get("dataset"),
@@ -272,7 +336,7 @@ def make_output_row(
         "label": public_label,
         "pseudo_label": public_label,
         "label_origin": "codex_semantic_evidence_utility_v2",
-        "codex_semantic_label": str(label_row["semantic_label"]),
+        "codex_semantic_label": semantic_label,
         "codex_topic_relation": label_row["topic_relation"],
         "codex_confidence": float(label_row["confidence"]),
         "codex_evidence_sentence_indices": json.loads(label_row["evidence_sentence_indices"]),
@@ -288,6 +352,7 @@ def empty_split_counter() -> dict[str, Any]:
         "sample_ids": set(),
         "target": Counter(),
         "semantic_label": Counter(),
+        "excluded_semantic_label": Counter(),
         "source": Counter(),
         "doc_rank": Counter(),
     }
@@ -299,12 +364,20 @@ def serialize_split_counter(counter: dict[str, Any]) -> dict[str, Any]:
         "sample_ids": len(counter["sample_ids"]),
         "target": dict(sorted(counter["target"].items())),
         "semantic_label": dict(sorted(counter["semantic_label"].items())),
+        "excluded_semantic_label": dict(sorted(counter["excluded_semantic_label"].items())),
         "source": dict(sorted(counter["source"].items())),
         "doc_rank": dict(sorted(counter["doc_rank"].items(), key=lambda item: int(item[0]))),
     }
 
 
-def materialize(args: argparse.Namespace, connection: sqlite3.Connection, assignments: dict[str, str]) -> dict[str, Any]:
+def materialize(
+    args: argparse.Namespace,
+    connection: sqlite3.Connection,
+    assignments: dict[str, str],
+    *,
+    expected_questions: int | None = None,
+    overall_progress: tqdm | None = None,
+) -> dict[str, Any]:
     output_dir = args.output_root / args.dataset
     handles: dict[str, Any] = {}
     if not args.dry_run:
@@ -320,7 +393,12 @@ def materialize(args: argparse.Namespace, connection: sqlite3.Connection, assign
     candidate_questions = 0
     candidate_pairs = 0
     try:
-        for row in tqdm(iter_jsonl(args.candidates_path), desc=f"materialize-codex:{args.dataset}", unit="question"):
+        for row in tqdm(
+            iter_jsonl(args.candidates_path),
+            total=expected_questions,
+            desc=f"materialize-codex:{args.dataset}",
+            unit="question",
+        ):
             if str(row.get("dataset") or "") != args.dataset:
                 raise ValueError(f"Candidate dataset mismatch: {row.get('sample_id')}")
             sample_id = str(row.get("sample_id") or "")
@@ -343,10 +421,23 @@ def materialize(args: argparse.Namespace, connection: sqlite3.Connection, assign
                     raise ValueError(f"Missing Codex label for candidate pair: {pair_id}")
                 if int(label_row["used"]):
                     raise ValueError(f"Candidate pair occurs more than once: {pair_id}")
-                output = make_output_row(row, document, rank, split, label_row, args.max_doc_chars)
+                output = make_output_row(
+                    row,
+                    document,
+                    rank,
+                    split,
+                    label_row,
+                    args.max_doc_chars,
+                    args.training_label_mode,
+                )
                 connection.execute("UPDATE codex_labels SET used = 1 WHERE pair_id = ?", (pair_id,))
                 candidate_pairs += 1
                 counter = counters[split]
+                if output is None:
+                    counter["excluded_semantic_label"][str(label_row["semantic_label"])] += 1
+                    if overall_progress is not None:
+                        overall_progress.update(1)
+                    continue
                 counter["rows"] += 1
                 counter["sample_ids"].add(sample_id)
                 counter["target"][output["target"]] += 1
@@ -355,6 +446,8 @@ def materialize(args: argparse.Namespace, connection: sqlite3.Connection, assign
                 counter["doc_rank"][str(rank)] += 1
                 if not args.dry_run:
                     handles[split].write(json.dumps(output, ensure_ascii=False) + "\n")
+                if overall_progress is not None:
+                    overall_progress.update(1)
         connection.commit()
     finally:
         for handle in handles.values():
@@ -374,6 +467,26 @@ def materialize(args: argparse.Namespace, connection: sqlite3.Connection, assign
     }
 
 
+def expected_counts_from_annotation_manifest(
+    labels_path: Path,
+    dataset: str,
+) -> tuple[int | None, int | None, str | None]:
+    """Read exact progress totals from the completed annotation manifest when available."""
+
+    manifest_path = labels_path.parent.parent / "manifest.json"
+    if not manifest_path.is_file():
+        return None, None, None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        dataset_summary = manifest.get("datasets", {}).get(dataset, {})
+        pairs = int(dataset_summary["final_pairs"])
+        questions = int(dataset_summary["final_questions"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logging.warning("Could not read progress totals from annotation manifest: %s", manifest_path)
+        return None, None, str(manifest_path)
+    return pairs, questions, str(manifest_path)
+
+
 def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
@@ -389,6 +502,17 @@ def main() -> None:
         raise FileNotFoundError(f"SQLite work directory does not exist: {args.sqlite_work_dir}")
 
     assignments = load_question_split_assignments(args.reference_split_root, args.dataset)
+    expected_pairs, expected_questions, annotation_manifest_path = expected_counts_from_annotation_manifest(
+        args.codex_labels_path,
+        args.dataset,
+    )
+    overall_total = expected_pairs * 2 if expected_pairs is not None else None
+    overall_progress = tqdm(
+        total=overall_total,
+        desc=f"SemanticInputPipeline:{args.dataset}",
+        unit="pair",
+    )
+    overall_progress.set_postfix_str("stage=1/2 index semantic labels")
     with tempfile.TemporaryDirectory(prefix=f"rag2_codex_{args.dataset}_", dir=args.sqlite_work_dir) as temporary_dir:
         db_path = Path(temporary_dir) / "codex_labels.sqlite"
         connection = sqlite3.connect(db_path)
@@ -398,25 +522,77 @@ def main() -> None:
         connection.execute("PRAGMA temp_store=FILE")
         try:
             create_label_index(connection)
-            label_summary = index_codex_labels(connection, args.codex_labels_path, args.dataset)
-            materialized = materialize(args, connection, assignments)
+            label_summary = index_codex_labels(
+                connection,
+                args.codex_labels_path,
+                args.dataset,
+                expected_rows=expected_pairs,
+                overall_progress=overall_progress,
+            )
+            if expected_pairs is not None and label_summary["rows"] != expected_pairs:
+                raise RuntimeError(
+                    f"Annotation manifest/JSONL row mismatch: expected={expected_pairs}, "
+                    f"actual={label_summary['rows']}"
+                )
+            if expected_pairs is None:
+                expected_pairs = int(label_summary["rows"])
+                expected_questions = expected_pairs // args.top_k
+                overall_progress.total = expected_pairs * 2
+                overall_progress.refresh()
+            overall_progress.set_postfix_str("stage=2/2 join candidates and write splits")
+            materialized = materialize(
+                args,
+                connection,
+                assignments,
+                expected_questions=expected_questions,
+                overall_progress=overall_progress,
+            )
         finally:
             connection.close()
+            overall_progress.close()
 
+    is_four_class = args.training_label_mode == "semantic_four"
+    is_five_class = args.training_label_mode == "semantic_five"
     manifest = {
-        "type": "rag2_codex_semantic_binary_filter_inputs",
-        "materialization_version": MATERIALIZATION_VERSION,
+        "type": (
+            "rag2_codex_semantic_four_class_filter_inputs"
+            if is_four_class
+            else
+            "rag2_codex_semantic_five_class_filter_inputs"
+            if is_five_class
+            else "rag2_codex_semantic_binary_filter_inputs"
+        ),
+        "materialization_version": MATERIALIZATION_VERSIONS[args.training_label_mode],
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "dataset": args.dataset,
         "top_k": args.top_k,
-        "training_label_mode": "binary",
-        "training_target_labels": ["helpful", "not helpful"],
-        "label_mapping": {
-            "helpful": sorted(SEMANTIC_HELPFUL),
-            "not_helpful": sorted(SEMANTIC_NOT_HELPFUL),
-        },
+        "training_label_mode": args.training_label_mode,
+        "training_target_labels": (
+            list(SEMANTIC_FOUR_LABELS)
+            if is_four_class
+            else list(SEMANTIC_LABELS)
+            if is_five_class
+            else ["helpful", "not helpful"]
+        ),
+        "label_mapping": (
+            {label: [label] for label in SEMANTIC_FOUR_LABELS}
+            if is_four_class
+            else
+            {label: [label] for label in SEMANTIC_LABELS}
+            if is_five_class
+            else {
+                "helpful": sorted(SEMANTIC_HELPFUL),
+                "not_helpful": sorted(SEMANTIC_NOT_HELPFUL),
+            }
+        ),
+        "excluded_from_training": (
+            {"indeterminate_or_mixed": "rare abstention/mixed category without a coherent semantic target"}
+            if is_four_class
+            else {}
+        ),
         "label_protocol": "Codex semantic evidence-utility annotation; no PPL labels or ranks 9/10 are used.",
         "codex_labels_path": str(args.codex_labels_path),
+        "codex_annotation_manifest_path": annotation_manifest_path,
         "candidates_path": str(args.candidates_path),
         "reference_split_root": str(args.reference_split_root),
         "question_split_source": "reference sample_ids/{train,val,test}.txt copied logically without re-splitting",
