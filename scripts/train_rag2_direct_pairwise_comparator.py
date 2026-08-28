@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Diagnose behavioral-utility ranking with direct document-pair comparison.
 
-This experiment intentionally isolates the learning formulation while keeping
-the Flan-T5-large base checkpoint fixed.  It removes the previous independent
-scalar scorer, mean pooling, and NULL-document objective.  For each question,
-two evidence documents are shown in one prompt and the full encoder-decoder
-predicts whether Candidate A or Candidate B has the larger cached utility.
+This experiment removes the previous independent scalar scorer, mean pooling,
+and NULL-document objective.  For each question, two evidence documents are
+shown in one prompt and either a full encoder-decoder or a native two-class
+sequence classifier predicts whether Candidate A or Candidate B has the larger
+cached utility.
 
 Both candidate orders are always trained and evaluated.  Loss is first
 averaged over the two orders of a semantic pair, then over pairs in a question,
@@ -37,6 +37,7 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset as TorchDataset, Sampler
 from transformers import (
     AutoModelForSeq2SeqLM,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
     get_linear_schedule_with_warmup,
     set_seed,
@@ -60,7 +61,7 @@ from scripts.train_rag2_margin_regressor import (  # noqa: E402
 )
 
 
-TRAINER_VERSION = "rag2_direct_pairwise_comparator_v1"
+TRAINER_VERSION = "rag2_direct_pairwise_comparator_v2_multibackend"
 PAIR_PROMPT_VERSION = "question_options_a0_two_documents_predict_ab_v1"
 
 
@@ -73,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-name-or-path", type=Path, default=WORKSPACE_ROOT / "models/Flan-T5-large"
+    )
+    parser.add_argument(
+        "--model-backend",
+        choices=("seq2seq", "sequence_classification"),
+        default="seq2seq",
+        help="Keep seq2seq for Flan-T5 or use a native two-class encoder head.",
     )
     parser.add_argument(
         "--no-rag-generation-root",
@@ -348,7 +355,7 @@ class SymmetricPairPacker:
         question_tokens = self._encode(" ".join(str(question).split()))
         option_tokens = self._encode(str(options).strip())
         answer_tokens = self._encode(" ".join(str(no_rag_answer).split()))
-        eos = [int(self.tokenizer.eos_token_id)]
+        special_tokens = int(self.tokenizer.num_special_tokens_to_add(pair=False))
         structural = (
             prefix
             + option_marker
@@ -360,7 +367,7 @@ class SymmetricPairPacker:
         context_budget = (
             self.max_tokens
             - len(structural)
-            - len(eos)
+            - special_tokens
             - 2 * self.minimum_document_tokens
         )
         if context_budget < 32:
@@ -390,7 +397,13 @@ class SymmetricPairPacker:
             + answer_tokens[:answer_take]
             + candidate_a_marker
         )
-        available = self.max_tokens - len(header) - len(middle) - len(ending) - len(eos)
+        available = (
+            self.max_tokens
+            - len(header)
+            - len(middle)
+            - len(ending)
+            - special_tokens
+        )
         if available < 2 * self.minimum_document_tokens:
             raise AssertionError("Context allocation violated the minimum document budget")
         a_tokens = self._encode(" ".join(str(document_a).split()))
@@ -405,14 +418,14 @@ class SymmetricPairPacker:
             spare -= extra
         if spare and b_take < len(b_tokens):
             b_take += min(spare, len(b_tokens) - b_take)
-        ids = (
+        content_ids = (
             header
             + a_tokens[:a_take]
             + middle
             + b_tokens[:b_take]
             + ending
-            + eos
         )
+        ids = list(self.tokenizer.build_inputs_with_special_tokens(content_ids))
         if len(ids) > self.max_tokens:
             raise AssertionError(f"Symmetric packing overflow: {len(ids)}>{self.max_tokens}")
         return ids
@@ -521,7 +534,8 @@ def choice_logits(
     model: Any,
     batch: dict[str, Any],
     device: torch.device,
-    choice_token_ids: Sequence[int],
+    choice_token_ids: Sequence[int] | None,
+    model_backend: str,
     pair_start: int = 0,
     pair_end: int | None = None,
 ) -> torch.Tensor:
@@ -533,6 +547,18 @@ def choice_logits(
     orientation_slice = slice(2 * start, 2 * end)
     input_ids = batch["input_ids"][orientation_slice].to(device, non_blocking=True)
     attention_mask = batch["attention_mask"][orientation_slice].to(device, non_blocking=True)
+    if model_backend == "sequence_classification":
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        if outputs.logits.shape[-1] != 2:
+            raise RuntimeError(
+                f"Expected a two-class sequence classifier, got {outputs.logits.shape}"
+            )
+        return outputs.logits
+    if choice_token_ids is None:
+        raise RuntimeError("seq2seq backend requires A/B choice token IDs")
     decoder_start = int(model.config.decoder_start_token_id)
     decoder_input_ids = torch.full(
         (input_ids.shape[0], 1), decoder_start, dtype=torch.long, device=device
@@ -561,7 +587,8 @@ def backward_question_macro_loss_chunked(
     model: Any,
     batch: dict[str, Any],
     device: torch.device,
-    choice_token_ids: Sequence[int],
+    choice_token_ids: Sequence[int] | None,
+    model_backend: str,
     *,
     max_pairs_per_forward: int,
     accumulation_divisor: int,
@@ -578,6 +605,7 @@ def backward_question_macro_loss_chunked(
             batch,
             device,
             choice_token_ids,
+            model_backend,
             pair_start=start,
             pair_end=end,
         )
@@ -598,7 +626,8 @@ def choice_logits_chunked(
     model: Any,
     batch: dict[str, Any],
     device: torch.device,
-    choice_token_ids: Sequence[int],
+    choice_token_ids: Sequence[int] | None,
+    model_backend: str,
     max_pairs_per_forward: int,
 ) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
@@ -611,6 +640,7 @@ def choice_logits_chunked(
                 batch,
                 device,
                 choice_token_ids,
+                model_backend,
                 pair_start=start,
                 pair_end=end,
             )
@@ -697,7 +727,8 @@ def evaluate(
     model: Any,
     loader: DataLoader,
     device: torch.device,
-    choice_token_ids: Sequence[int],
+    choice_token_ids: Sequence[int] | None,
+    model_backend: str,
     progress: PipelineProgress,
     stage: str,
     max_pairs_per_forward: int,
@@ -713,6 +744,7 @@ def evaluate(
             batch,
             device,
             choice_token_ids,
+            model_backend,
             max_pairs_per_forward,
         )
         labels = batch["orientation_labels"].to(device, non_blocking=True)
@@ -804,6 +836,54 @@ def write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
+
+
+def load_pair_model(
+    source: Path,
+    model_backend: str,
+    dtype: torch.dtype,
+    dropout: float | None,
+) -> Any:
+    """Load either the generative A/B model or a native two-class encoder."""
+
+    if model_backend == "sequence_classification":
+        logging.info("Loading two-class sequence classifier from %s", source)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            source,
+            local_files_only=True,
+            dtype=dtype,
+            num_labels=2,
+            id2label={0: "A", 1: "B"},
+            label2id={"A": 0, "B": 1},
+            ignore_mismatched_sizes=True,
+        )
+    elif model_backend == "seq2seq":
+        logging.info("Loading full encoder-decoder from %s", source)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            source,
+            local_files_only=True,
+            dtype=dtype,
+        )
+    else:
+        raise ValueError(f"Unsupported model backend: {model_backend}")
+
+    if dropout is not None:
+        dropout_value = float(dropout)
+        for attribute in (
+            "dropout_rate",
+            "hidden_dropout_prob",
+            "attention_probs_dropout_prob",
+            "classifier_dropout",
+            "cls_dropout",
+        ):
+            if hasattr(model.config, attribute):
+                setattr(model.config, attribute, dropout_value)
+        for module in model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.p = dropout_value
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    return model
 
 
 def extend_progress(progress: PipelineProgress, additional: int) -> None:
@@ -915,34 +995,29 @@ def main() -> None:
         else args.model_name_or_path
     )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, local_files_only=True)
-    # T5 uses relative positions and accepts the explicitly configured longer
-    # context; prevent the tokenizer's legacy 512-token warning from claiming
-    # that 768-token inputs will cause positional indexing errors.
+    # Packing enforces this bound before tensors reach either model backend.
     tokenizer.model_max_length = int(args.max_input_tokens)
-    choice_ids = [
-        tokenizer.encode("A", add_special_tokens=False),
-        tokenizer.encode("B", add_special_tokens=False),
-    ]
-    if any(len(value) != 1 for value in choice_ids) or choice_ids[0] == choice_ids[1]:
-        raise RuntimeError(f"A/B must be distinct single tokens: {choice_ids}")
-    choice_token_ids = [value[0] for value in choice_ids]
+    choice_token_ids: Sequence[int] | None = None
+    if args.model_backend == "seq2seq":
+        choice_ids = [
+            tokenizer.encode("A", add_special_tokens=False),
+            tokenizer.encode("B", add_special_tokens=False),
+        ]
+        if any(len(value) != 1 for value in choice_ids) or choice_ids[0] == choice_ids[1]:
+            raise RuntimeError(f"A/B must be distinct single tokens: {choice_ids}")
+        choice_token_ids = [value[0] for value in choice_ids]
     model_source = tokenizer_source
     dtype = torch.bfloat16 if args.bf16 else torch.float32
-    logging.info("Loading full Flan-T5 encoder-decoder from %s", model_source)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
+    model = load_pair_model(
         model_source,
-        local_files_only=True,
-        dtype=dtype,
+        args.model_backend,
+        dtype,
+        args.dropout,
     )
-    if args.dropout is not None:
-        model.config.dropout_rate = float(args.dropout)
-        for module in model.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.p = float(args.dropout)
-    model.config.use_cache = False
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
     device = torch.device("cuda:0")
     model.to(device)
 
@@ -1008,6 +1083,7 @@ def main() -> None:
             validation_loader,
             device,
             choice_token_ids,
+            args.model_backend,
             progress,
             "untrained validation baseline",
             args.max_semantic_pairs_per_forward,
@@ -1041,6 +1117,7 @@ def main() -> None:
                 batch,
                 device,
                 choice_token_ids,
+                args.model_backend,
                 max_pairs_per_forward=args.max_semantic_pairs_per_forward,
                 accumulation_divisor=accumulation_divisor,
             )
@@ -1070,6 +1147,7 @@ def main() -> None:
                 train_eval_loader,
                 device,
                 choice_token_ids,
+                args.model_backend,
                 progress,
                 f"train-set memorization epoch {epoch}",
                 args.max_semantic_pairs_per_forward,
@@ -1079,6 +1157,7 @@ def main() -> None:
             validation_loader,
             device,
             choice_token_ids,
+            args.model_backend,
             progress,
             f"validation epoch {epoch}",
             args.max_semantic_pairs_per_forward,
@@ -1151,16 +1230,19 @@ def main() -> None:
     progress.set_stage("load best model", total=1)
     del model
     torch.cuda.empty_cache()
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        best_path, local_files_only=True, dtype=dtype
+    model = load_pair_model(
+        best_path,
+        args.model_backend,
+        dtype,
+        args.dropout,
     ).to(device)
-    model.config.use_cache = False
     progress.update(1)
     final_validation, validation_records = evaluate(
         model,
         validation_loader,
         device,
         choice_token_ids,
+        args.model_backend,
         progress,
         "final best-checkpoint validation",
         args.max_semantic_pairs_per_forward,
@@ -1170,6 +1252,7 @@ def main() -> None:
         test_loader,
         device,
         choice_token_ids,
+        args.model_backend,
         progress,
         "final held-out test",
         args.max_semantic_pairs_per_forward,

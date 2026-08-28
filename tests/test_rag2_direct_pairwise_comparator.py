@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from scripts.train_rag2_direct_pairwise_comparator import (
     DirectPairDataset,
     SymmetricPairPacker,
+    choice_logits,
     question_macro_loss,
     question_macro_pair_weights,
 )
@@ -37,6 +40,21 @@ class _Tokenizer:
     def encode(self, text, add_special_tokens=False):
         del add_special_tokens
         return [2 + (ord(char) % 251) for char in text]
+
+    def num_special_tokens_to_add(self, pair=False):
+        assert pair is False
+        return 1
+
+    def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
+        assert token_ids_1 is None
+        return list(token_ids_0) + [self.eos_token_id]
+
+
+class _SequenceClassifier(torch.nn.Module):
+    def forward(self, input_ids, attention_mask):
+        del attention_mask
+        score = input_ids.float().sum(dim=1)
+        return SimpleNamespace(logits=torch.stack((score, -score), dim=1))
 
 
 def test_direct_pair_dataset_keeps_only_decisive_ordered_pairs():
@@ -99,3 +117,22 @@ def test_symmetric_pair_packer_never_exceeds_budget():
     )
     assert len(ids) == 512
     assert ids[-1] == 1
+
+
+def test_sequence_classifier_backend_returns_two_choice_logits():
+    batch = {
+        "input_ids": torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]]),
+        "attention_mask": torch.ones(4, 2, dtype=torch.long),
+        "sample_ids": ["q1", "q2"],
+    }
+    logits = choice_logits(
+        _SequenceClassifier(),
+        batch,
+        torch.device("cpu"),
+        None,
+        "sequence_classification",
+        pair_start=1,
+        pair_end=2,
+    )
+    assert logits.shape == (2, 2)
+    assert torch.equal(logits[:, 0], torch.tensor([11.0, 15.0]))
