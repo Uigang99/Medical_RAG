@@ -17,6 +17,12 @@ PYTHON_BIN="${PYTHON_BIN:-/home/user/Uiheon/.venv_vllm/bin/python}"
 BASE="${PROJECT_ROOT}/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
 PREPARED_ROOT="${BASE}/gold_margin_regression_v1/prepared"
 OUTPUT_ROOT="/home/user/Uiheon/models/RAG2-DirectPairComparator-FlanT5-large"
+MAX_TOKENS="${MAX_INPUT_TOKENS:-512}"
+if [[ "${MAX_TOKENS}" == "512" ]]; then
+  LENGTH_TAG=""
+else
+  LENGTH_TAG="_len${MAX_TOKENS}"
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -73,7 +79,7 @@ for CURRENT_MODE in "${MODES[@]}"; do
       --no-rag-generation-root "${BASE}/train_no_rag_anchored_features_v1/no_rag"
       --output-root "${OUTPUT_ROOT}"
       --document-pair-min-utility-gap "${PAIR_MIN_GAP:-0.1}"
-      --max-input-tokens "${MAX_INPUT_TOKENS:-512}"
+      --max-input-tokens "${MAX_TOKENS}"
       --minimum-document-tokens 16
       --trace-shard-cache-size 8
       --bf16
@@ -88,7 +94,7 @@ for CURRENT_MODE in "${MODES[@]}"; do
       TRAIN_QUESTIONS="${OVERFIT_TRAIN_QUESTIONS:-100}"
       EVAL_QUESTIONS="${OVERFIT_EVAL_QUESTIONS:-100}"
       EPOCHS="${OVERFIT_EPOCHS:-30}"
-      RUN_NAME="${DATASET}_direct_pair_overfit_q${TRAIN_QUESTIONS}_epoch${EPOCHS}"
+      RUN_NAME="${DATASET}_direct_pair_overfit_q${TRAIN_QUESTIONS}${LENGTH_TAG}_epoch${EPOCHS}"
       OUTPUT_DIR="${OUTPUT_ROOT}/${DATASET}/${RUN_NAME}"
       MODE_ARGS=(
         --run-name "${RUN_NAME}"
@@ -114,7 +120,7 @@ for CURRENT_MODE in "${MODES[@]}"; do
       TRAIN_QUESTIONS="${PILOT_TRAIN_QUESTIONS:-5000}"
       EVAL_QUESTIONS="${PILOT_EVAL_QUESTIONS:-1000}"
       EPOCHS="${PILOT_EPOCHS:-3}"
-      RUN_NAME="${DATASET}_direct_pair_pilot_q${TRAIN_QUESTIONS}_epoch${EPOCHS}"
+      RUN_NAME="${DATASET}_direct_pair_pilot_q${TRAIN_QUESTIONS}${LENGTH_TAG}_epoch${EPOCHS}"
       OUTPUT_DIR="${OUTPUT_ROOT}/${DATASET}/${RUN_NAME}"
       MODE_ARGS=(
         --run-name "${RUN_NAME}"
