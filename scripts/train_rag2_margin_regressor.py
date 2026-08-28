@@ -592,6 +592,9 @@ class MarginCollator:
             ),
             "sample_ids": sample_ids,
             "pair_ids": [str(row["pair_id"]) for row in rows],
+            "document_ranks": torch.tensor(
+                [int(row["doc_rank"]) for row in rows], dtype=torch.long
+            ),
             "question_index": torch.tensor(
                 [sample_to_index[sample] for sample in sample_ids],
                 dtype=torch.long,

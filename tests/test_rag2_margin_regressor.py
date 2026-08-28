@@ -26,6 +26,10 @@ from scripts.train_rag2_margin_regressor import (
     curriculum_direction_weights,
     select_curriculum_training_data,
 )
+from scripts.train_rag2_pairwise_utility_ranker import (
+    pairwise_null_preference_loss,
+    preference_metrics,
+)
 
 
 class FakeT5Encoder(nn.Module):
@@ -50,6 +54,52 @@ class FakeT5Encoder(nn.Module):
 
 
 class MarginRegressorTests(unittest.TestCase):
+    def test_pairwise_null_loss_prefers_better_documents_and_anchors_zero(self) -> None:
+        target = torch.tensor([0.6, 0.2, -0.5, 0.04])
+        question_index = torch.tensor([0, 0, 0, 0])
+        no_rag_correct = torch.tensor([False, False, False, False])
+        good_prediction = torch.tensor([0.8, 0.3, -0.7, 0.0], requires_grad=True)
+        bad_prediction = -good_prediction.detach()
+        good_document, good_null, counters = pairwise_null_preference_loss(
+            good_prediction,
+            target,
+            question_index,
+            no_rag_correct,
+            document_min_gap=0.1,
+            null_min_gap=0.1,
+            temperature=0.1,
+        )
+        bad_document, bad_null, _ = pairwise_null_preference_loss(
+            bad_prediction,
+            target,
+            question_index,
+            no_rag_correct,
+            document_min_gap=0.1,
+            null_min_gap=0.1,
+            temperature=0.1,
+        )
+        self.assertLess(float(good_document.detach()), float(bad_document.detach()))
+        self.assertLess(float(good_null.detach()), float(bad_null.detach()))
+        self.assertEqual(counters["null_comparisons"], 3)
+        (good_document + good_null).backward()
+        self.assertIsNotNone(good_prediction.grad)
+
+    def test_preference_metrics_include_document_null_and_no_rag_groups(self) -> None:
+        metrics = preference_metrics(
+            target=torch.tensor([0.6, -0.4, 0.3, -0.5]).numpy(),
+            prediction=torch.tensor([0.8, -0.2, 0.1, -0.7]).numpy(),
+            sample_ids=["q1", "q1", "q2", "q2"],
+            no_rag_correct=torch.tensor([True, True, False, False]).numpy(),
+            document_ranks=torch.tensor([1, 2, 1, 2]).numpy(),
+            document_min_gap=0.1,
+            null_min_gap=0.1,
+        )
+        self.assertEqual(metrics["document_pair"]["micro_accuracy"], 1.0)
+        self.assertEqual(metrics["null_pair"]["micro_accuracy"], 1.0)
+        self.assertEqual(metrics["combined_question_macro_accuracy"], 1.0)
+        self.assertEqual(metrics["by_no_rag_state"]["no_rag_correct"]["questions"], 1)
+        self.assertEqual(metrics["by_no_rag_state"]["no_rag_wrong"]["questions"], 1)
+
     def test_answer_aware_input_adds_prediction_without_gold_metadata(self) -> None:
         base = build_official_filter_input(
             question="Which treatment?",

@@ -122,6 +122,8 @@ venv/
 !/scripts/train_rag2_margin_regressor.py
 !/scripts/run_rag2_margin_regression_prepare.sh
 !/scripts/run_rag2_margin_regression_training.sh
+!/scripts/train_rag2_pairwise_utility_ranker.py
+!/scripts/run_rag2_pairwise_utility_ranking.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 
