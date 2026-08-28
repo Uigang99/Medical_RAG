@@ -24,6 +24,14 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TOKENIZERS_PARALLELISM=true
 
+# Torch 2.11 is built against CUDA 13 in this environment.  The matching
+# NVRTC package is installed inside the vLLM virtualenv, but its cu13 library
+# directory is not added to the process search path automatically.
+NVRTC_CU13_LIB="${NVRTC_CU13_LIB:-/home/user/Uiheon/.venv_vllm/lib/python3.10/site-packages/nvidia/cu13/lib}"
+if [[ -f "${NVRTC_CU13_LIB}/libnvrtc-builtins.so.13.0" ]]; then
+  export LD_LIBRARY_PATH="${NVRTC_CU13_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 if [[ "${MODE}" == "both" ]]; then
   MODES=(overfit pilot)
 else
