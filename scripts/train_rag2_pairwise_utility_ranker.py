@@ -923,6 +923,7 @@ def main() -> None:
             "3/3 save held-out predictions",
         )
         final_metrics = {
+            "initial_validation": trainer_state["initial_validation"],
             "best_epoch": trainer_state["best_epoch"],
             "validation": best_validation,
             "test": test,
