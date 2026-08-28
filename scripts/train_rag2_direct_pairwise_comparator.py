@@ -332,6 +332,29 @@ class SymmetricPairPacker:
     def _encode(self, text: str) -> list[int]:
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
+    def _add_special_tokens(self, content_ids: list[int]) -> list[int]:
+        """Wrap one packed sequence across legacy and backend tokenizers."""
+
+        try:
+            builder = self.tokenizer.build_inputs_with_special_tokens
+        except AttributeError:
+            builder = None
+        if builder is not None:
+            return list(builder(content_ids))
+
+        special_count = int(self.tokenizer.num_special_tokens_to_add(pair=False))
+        cls_token_id = getattr(self.tokenizer, "cls_token_id", None)
+        sep_token_id = getattr(self.tokenizer, "sep_token_id", None)
+        if special_count == 2 and cls_token_id is not None and sep_token_id is not None:
+            return [int(cls_token_id), *content_ids, int(sep_token_id)]
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if special_count == 1 and eos_token_id is not None:
+            return [*content_ids, int(eos_token_id)]
+        raise RuntimeError(
+            "Tokenizer cannot add special tokens to an already packed sequence: "
+            f"type={type(self.tokenizer).__name__} special_count={special_count}"
+        )
+
     def pack(
         self,
         *,
@@ -425,7 +448,7 @@ class SymmetricPairPacker:
             + b_tokens[:b_take]
             + ending
         )
-        ids = list(self.tokenizer.build_inputs_with_special_tokens(content_ids))
+        ids = self._add_special_tokens(content_ids)
         if len(ids) > self.max_tokens:
             raise AssertionError(f"Symmetric packing overflow: {len(ids)}>{self.max_tokens}")
         return ids
@@ -994,7 +1017,12 @@ def main() -> None:
         if args.resume_from_checkpoint is not None
         else args.model_name_or_path
     )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, local_files_only=True)
+    tokenizer_kwargs: dict[str, Any] = {"local_files_only": True}
+    if args.model_backend == "sequence_classification":
+        # Required by the current Transformers backend for the published
+        # DeBERTa-v3 tokenizer; harmless for already-correct tokenizer files.
+        tokenizer_kwargs["fix_mistral_regex"] = True
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, **tokenizer_kwargs)
     # Packing enforces this bound before tensors reach either model backend.
     tokenizer.model_max_length = int(args.max_input_tokens)
     choice_token_ids: Sequence[int] | None = None

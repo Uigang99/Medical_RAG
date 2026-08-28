@@ -57,6 +57,19 @@ class _SequenceClassifier(torch.nn.Module):
         return SimpleNamespace(logits=torch.stack((score, -score), dim=1))
 
 
+class _LegacyDebertaTokenizer(_Tokenizer):
+    cls_token_id = 1
+    sep_token_id = 2
+
+    def num_special_tokens_to_add(self, pair=False):
+        assert pair is False
+        return 2
+
+    @property
+    def build_inputs_with_special_tokens(self):
+        raise AttributeError("legacy backend does not expose this method")
+
+
 def test_direct_pair_dataset_keeps_only_decisive_ordered_pairs():
     rows = [
         {
@@ -136,3 +149,19 @@ def test_sequence_classifier_backend_returns_two_choice_logits():
     )
     assert logits.shape == (2, 2)
     assert torch.equal(logits[:, 0], torch.tensor([11.0, 15.0]))
+
+
+def test_legacy_deberta_packer_adds_cls_and_sep_without_backend_builder():
+    packer = SymmetricPairPacker(
+        _LegacyDebertaTokenizer(), max_tokens=512, minimum_document_tokens=16
+    )
+    ids = packer.pack(
+        question="short question",
+        options="A) one\nB) two",
+        no_rag_answer="(A) one",
+        document_a="document a",
+        document_b="document b",
+    )
+    assert ids[0] == 1
+    assert ids[-1] == 2
+    assert len(ids) <= 512
