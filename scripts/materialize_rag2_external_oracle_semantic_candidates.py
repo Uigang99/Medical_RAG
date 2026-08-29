@@ -84,6 +84,16 @@ def parse_args() -> argparse.Namespace:
     verify.add_argument("--label-root", type=Path, required=True)
     verify.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     verify.add_argument("--output-path", type=Path, default=None)
+
+    export_oracle = subparsers.add_parser(
+        "export-oracle",
+        help="Join verified semantic labels to exact evaluator sample keys.",
+    )
+    export_oracle.add_argument("--prepared-root", type=Path, required=True)
+    export_oracle.add_argument("--label-root", type=Path, required=True)
+    export_oracle.add_argument("--output-path", type=Path, required=True)
+    export_oracle.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    export_oracle.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -623,6 +633,200 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def oracle_export_manifest_path(output_path: Path) -> Path:
+    return output_path.with_name(output_path.stem + "_manifest.json")
+
+
+def export_oracle(args: argparse.Namespace) -> dict[str, Any]:
+    """Export semantic decisions with the exact sample/document join used by MCQ evaluation."""
+
+    prepared_path = args.prepared_root / "prepare_manifest.json"
+    label_manifest_path = args.label_root / "manifest.json"
+    verification_path = args.label_root / "external_oracle_top32_verification_report.json"
+    for path in (prepared_path, label_manifest_path, verification_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+    verification = json.loads(verification_path.read_text(encoding="utf-8"))
+    if prepared.get("status") != "complete" or verification.get("status") != "complete":
+        raise ValueError("Prepared candidates and semantic verification must both be complete")
+    label_manifest = validate_label_manifest(label_manifest_path, prepared, args.datasets)
+    expected_pairs = sum(int(prepared["datasets"][dataset]["pairs"]) for dataset in args.datasets)
+    expected_questions = sum(int(prepared["datasets"][dataset]["questions"]) for dataset in args.datasets)
+    if int(verification.get("pairs", -1)) != expected_pairs:
+        raise ValueError(
+            f"Verification pair count mismatch: {verification.get('pairs')} != {expected_pairs}"
+        )
+
+    contract = {
+        "export_version": "rag2_external_semantic_oracle_export_v1",
+        "prepared_manifest": path_identity(prepared_path),
+        "label_manifest": path_identity(label_manifest_path),
+        "verification_report": path_identity(verification_path),
+        "datasets": list(args.datasets),
+        "expected_questions": expected_questions,
+        "expected_pairs": expected_pairs,
+    }
+    input_fingerprint = fingerprint(contract)
+    manifest_path = oracle_export_manifest_path(args.output_path)
+    if args.resume and manifest_path.is_file() and args.output_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        output_identity = path_identity(args.output_path)
+        if (
+            existing.get("status") == "complete"
+            and existing.get("input_fingerprint") == input_fingerprint
+            and existing.get("output", {}).get("size") == output_identity["size"]
+            and existing.get("output", {}).get("mtime_ns") == output_identity["mtime_ns"]
+        ):
+            progress = tqdm(
+                total=expected_pairs * 2,
+                initial=expected_pairs * 2,
+                desc="ExternalSemanticOracleExportOverall (cached)",
+                unit="pair",
+                dynamic_ncols=True,
+            )
+            progress.close()
+            logging.info(
+                "Semantic oracle export already complete: questions=%d pairs=%d path=%s",
+                expected_questions,
+                expected_pairs,
+                args.output_path,
+            )
+            return existing
+
+    # The evaluator's sample key includes row_idx. Semantic annotations use the
+    # stable benchmark sample ID, so join through the immutable prepared rows
+    # instead of trying to reconstruct this key heuristically.
+    expected: dict[tuple[str, str, int], tuple[str, str]] = {}
+    overall = tqdm(
+        total=expected_pairs * 2,
+        desc="ExternalSemanticOracleExportOverall",
+        unit="pair",
+        position=0,
+        dynamic_ncols=True,
+    )
+    stage = tqdm(
+        total=expected_pairs,
+        desc="Stage 1/2 index exact evaluator identities",
+        unit="pair",
+        position=1,
+        dynamic_ncols=True,
+    )
+    for dataset in args.datasets:
+        candidate_path = args.prepared_root / "candidates" / f"{dataset}.jsonl"
+        if not candidate_path.is_file():
+            raise FileNotFoundError(candidate_path)
+        for row in iter_jsonl(candidate_path):
+            sample_id = str(row.get("sample_id") or "")
+            sample_key = str(row.get("candidate_cache_key") or "")
+            if not sample_id or not sample_key:
+                raise ValueError(f"Prepared row has an incomplete sample identity: dataset={dataset}")
+            documents = row.get("candidate_documents")
+            if not isinstance(documents, list):
+                raise ValueError(f"Invalid prepared documents for {sample_id}")
+            for document in documents:
+                rank = int(document.get("rerank_rank") or 0)
+                key = (dataset, sample_id, rank)
+                value = (stable_document_id(document), sample_key)
+                if key in expected:
+                    raise ValueError(f"Duplicate prepared oracle identity: {key}")
+                expected[key] = value
+                stage.update(1)
+                overall.update(1)
+    stage.close()
+    if len(expected) != expected_pairs:
+        raise ValueError(f"Prepared oracle identity count mismatch: {len(expected)} != {expected_pairs}")
+
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = args.output_path.with_name(args.output_path.name + ".partial")
+    seen: set[tuple[str, str, int]] = set()
+    label_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    stage = tqdm(
+        total=expected_pairs,
+        desc="Stage 2/2 join and export semantic decisions",
+        unit="pair",
+        position=1,
+        dynamic_ncols=True,
+    )
+    try:
+        with temporary.open("w", encoding="utf-8") as output_handle:
+            for dataset in args.datasets:
+                label_path = args.label_root / dataset / "codex_semantic_labels.jsonl"
+                if not label_path.is_file():
+                    raise FileNotFoundError(label_path)
+                for row in iter_jsonl(label_path):
+                    row_dataset = str(row.get("dataset") or "").lower()
+                    sample_id = str(row.get("sample_id") or "")
+                    rank = int(row.get("doc_rank") or 0)
+                    key = (row_dataset, sample_id, rank)
+                    if row_dataset != dataset:
+                        raise ValueError(
+                            f"Semantic label dataset mismatch: expected={dataset} actual={row_dataset}"
+                        )
+                    if key in seen:
+                        raise ValueError(f"Duplicate semantic oracle decision: {key}")
+                    wanted = expected.get(key)
+                    if wanted is None:
+                        raise ValueError(f"Unexpected semantic oracle decision: {key}")
+                    stable_id, evaluator_sample_key = wanted
+                    if str(row.get("doc_stable_id") or "") != stable_id:
+                        raise ValueError(f"Semantic oracle document mismatch for {key}")
+                    semantic_label = str(row.get("semantic_label") or "")
+                    if semantic_label not in VALID_LABELS:
+                        raise ValueError(f"Invalid semantic oracle label for {key}: {semantic_label}")
+                    output_row = {
+                        **row,
+                        "sample_key": evaluator_sample_key,
+                        "doc_rank": rank,
+                        "doc_stable_id": stable_id,
+                        "semantic_oracle_export_version": "rag2_external_semantic_oracle_export_v1",
+                    }
+                    output_handle.write(
+                        json.dumps(output_row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    )
+                    seen.add(key)
+                    label_counts[dataset][semantic_label] += 1
+                    stage.update(1)
+                    overall.update(1)
+        if seen != set(expected):
+            missing = sorted(set(expected) - seen)
+            raise ValueError(
+                f"Semantic oracle export omitted {len(missing)} pairs; first={missing[0] if missing else None}"
+            )
+        os.replace(temporary, args.output_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+        stage.close()
+        overall.close()
+
+    manifest = {
+        "export_version": "rag2_external_semantic_oracle_export_v1",
+        "created_at": utc_now(),
+        "status": "complete",
+        "input_fingerprint": input_fingerprint,
+        "input_contract": contract,
+        "questions": expected_questions,
+        "pairs": expected_pairs,
+        "annotation_version": label_manifest["annotation_version"],
+        "prompt_version": label_manifest["prompt_version"],
+        "model": label_manifest["codex_model_request"],
+        "reasoning_effort": label_manifest["codex_reasoning_effort"],
+        "label_distribution": {
+            dataset: dict(sorted(label_counts[dataset].items())) for dataset in args.datasets
+        },
+        "output": path_identity(args.output_path),
+    }
+    atomic_json(manifest_path, manifest)
+    logging.info(
+        "Semantic oracle decisions exported: questions=%d pairs=%d path=%s",
+        expected_questions,
+        expected_pairs,
+        args.output_path,
+    )
+    return manifest
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -633,6 +837,8 @@ def main() -> None:
         prepare(args)
     elif args.command == "verify":
         verify(args)
+    elif args.command == "export-oracle":
+        export_oracle(args)
     else:
         raise ValueError(args.command)
 

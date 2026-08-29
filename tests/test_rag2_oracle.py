@@ -231,6 +231,95 @@ class Rag2OracleTests(unittest.TestCase):
             self.assertEqual(result[0][0].filter_prediction, "helpful")
             self.assertEqual(result[0][0].filter_score, 0.5)
 
+    def test_semantic_oracle_direct_and_supporting_policies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            labels_path = Path(directory) / "semantic_labels.jsonl"
+            documents = []
+            label_rows = []
+            for rank, (stable_id, semantic_label) in enumerate(
+                (("direct", "direct_support"), ("supporting", "supporting_evidence"), ("noise", "no_evidence")),
+                start=1,
+            ):
+                document = RetrievedDocument(
+                    source="pubmed",
+                    local_id=rank,
+                    db_id=stable_id,
+                    corpus_id=None,
+                    chunk_id=None,
+                    doc_id=None,
+                    title=None,
+                    text="Evidence",
+                    retrieval_score=1.0,
+                    rerank_score=2.0,
+                    rerank_rank=rank,
+                )
+                documents.append(document)
+                label_rows.append(
+                    {
+                        "sample_key": sample_key(sample()),
+                        "doc_rank": rank,
+                        "doc_stable_id": document.stable_id,
+                        "semantic_label": semantic_label,
+                        "confidence": 0.9,
+                        "topic_relation": "related",
+                    }
+                )
+            labels_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in label_rows),
+                encoding="utf-8",
+            )
+
+            direct_args = Namespace(oracle_labels_path=labels_path, oracle_policy="semantic_direct")
+            direct_result = apply_oracle_labels(direct_args, [sample()], [[*documents]])[0]
+            self.assertEqual(
+                [document.filter_prediction for document in direct_result],
+                ["helpful", "not helpful", "not helpful"],
+            )
+            self.assertIsNone(direct_result[0].filter_score)
+            self.assertEqual(direct_result[0].metadata["oracle_filter"]["semantic_confidence"], 0.9)
+
+            broad_args = Namespace(
+                oracle_labels_path=labels_path,
+                oracle_policy="semantic_direct_supporting",
+            )
+            broad_result = apply_oracle_labels(broad_args, [sample()], [[*documents]])[0]
+            self.assertEqual(
+                [document.filter_prediction for document in broad_result],
+                ["helpful", "helpful", "not helpful"],
+            )
+
+    def test_semantic_oracle_rejects_unknown_label(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            labels_path = Path(directory) / "semantic_labels.jsonl"
+            document = RetrievedDocument(
+                source="pubmed",
+                local_id=1,
+                db_id="doc-1",
+                corpus_id=None,
+                chunk_id=None,
+                doc_id=None,
+                title=None,
+                text="Evidence",
+                retrieval_score=1.0,
+                rerank_score=2.0,
+                rerank_rank=1,
+            )
+            labels_path.write_text(
+                json.dumps(
+                    {
+                        "sample_key": sample_key(sample()),
+                        "doc_rank": 1,
+                        "doc_stable_id": document.stable_id,
+                        "semantic_label": "unknown",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = Namespace(oracle_labels_path=labels_path, oracle_policy="semantic_direct")
+            with self.assertRaisesRegex(ValueError, "Invalid semantic oracle label"):
+                apply_oracle_labels(args, [sample()], [[document]])
+
 
 if __name__ == "__main__":
     unittest.main()

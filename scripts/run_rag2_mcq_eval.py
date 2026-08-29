@@ -188,6 +188,8 @@ def parse_args() -> argparse.Namespace:
             "hidden_tau_0p4",
             "hidden_three_class",
             "margin_utility",
+            "semantic_direct",
+            "semantic_direct_supporting",
         ],
         default=None,
         help="Label/score field to materialize as Helpful for --case oracle_rag.",
@@ -3660,6 +3662,25 @@ def apply_oracle_labels(
                     row.get("hidden_quality_pass")
                 )
                 score = row.get("projection_score")
+            elif args.oracle_policy in {"semantic_direct", "semantic_direct_supporting"}:
+                semantic_label = str(row.get("semantic_label") or "")
+                valid_semantic_labels = {
+                    "direct_support",
+                    "supporting_evidence",
+                    "no_evidence",
+                    "misleading_evidence",
+                    "indeterminate_or_mixed",
+                }
+                if semantic_label not in valid_semantic_labels:
+                    raise ValueError(f"Invalid semantic oracle label for {key}: {semantic_label!r}")
+                accepted_labels = {"direct_support"}
+                if args.oracle_policy == "semantic_direct_supporting":
+                    accepted_labels.add("supporting_evidence")
+                helpful = semantic_label in accepted_labels
+                # Semantic confidence is confidence in the assigned five-way
+                # class, not P(Helpful). Keep it in metadata instead of
+                # misrepresenting it as a signed/continuous filter score.
+                score = None
             else:
                 threshold = 0.0 if args.oracle_policy == "hidden_tau_0" else 0.4
                 score = float(row["projection_score"])
@@ -3672,11 +3693,16 @@ def apply_oracle_labels(
                 "gold_label": (
                     row.get("pseudo_label")
                     if args.oracle_policy in {"rag2", "margin_utility"}
+                    else row.get("semantic_label")
+                    if args.oracle_policy in {"semantic_direct", "semantic_direct_supporting"}
                     else row.get("hidden_label")
                 ),
                 "utility_score": row.get("utility_score"),
                 "projection_score": row.get("projection_score"),
                 "hidden_threshold": row.get("hidden_threshold"),
+                "semantic_label": row.get("semantic_label"),
+                "semantic_confidence": row.get("confidence"),
+                "semantic_topic_relation": row.get("topic_relation"),
             }
         _rank_scored_documents(documents)
     if len(used) != sum(len(value) for value in reranked_docs):
@@ -4639,11 +4665,18 @@ def main() -> None:
                 for docs in reranked_docs
             ]
         else:
-            reranked_docs = apply_oracle_labels(args, samples, reranked_docs)
             eligible_top_k = args.filter_rerank_top_k or args.rerank_top_k
+            # Prefix Oracle conditions require labels only for documents that
+            # can actually enter this condition. Keep the full reranked list
+            # for audit output, but do not require or silently interpret labels
+            # outside the eligible prefix. The sliced lists share document
+            # objects with ``reranked_docs``, so applied metadata remains
+            # visible in the serialized audit trail.
+            eligible_docs = [docs[:eligible_top_k] for docs in reranked_docs]
+            apply_oracle_labels(args, samples, eligible_docs)
             context_docs = [
-                [copy.copy(document) for document in docs[:eligible_top_k] if document.filter_prediction == "helpful"]
-                for docs in reranked_docs
+                [copy.copy(document) for document in docs if document.filter_prediction == "helpful"]
+                for docs in eligible_docs
             ]
     results, details = generate_rag_answers(
         args,
