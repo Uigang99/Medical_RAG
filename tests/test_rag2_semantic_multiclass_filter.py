@@ -15,6 +15,8 @@ from build_rag2_codex_semantic_filter_inputs import (  # noqa: E402
     target_from_semantic_label,
 )
 from train_rag2_filter_model_paper import (  # noqa: E402
+    BINARY_LABEL_NAMES,
+    BINARY_LABEL_TOKENS,
     SEMANTIC_FOUR_LABEL_NAMES,
     SEMANTIC_FOUR_LABEL_TOKENS,
     normalize_training_label,
@@ -42,6 +44,17 @@ class SemanticMulticlassFilterTests(unittest.TestCase):
         self.assertEqual(names, SEMANTIC_FOUR_LABEL_NAMES)
         self.assertEqual(tokens, SEMANTIC_FOUR_LABEL_TOKENS)
         self.assertEqual(len(set(tokens)), 4)
+
+    def test_trainer_collapses_four_semantic_classes_for_binary_support_gate(self) -> None:
+        names, tokens = training_label_spec("semantic_binary")
+        self.assertEqual(names, BINARY_LABEL_NAMES)
+        self.assertEqual(tokens, BINARY_LABEL_TOKENS)
+        for label in ("direct_support", "supporting_evidence"):
+            self.assertEqual(normalize_training_label(label, "semantic_binary"), "helpful")
+        for label in ("no_evidence", "misleading_evidence"):
+            self.assertEqual(normalize_training_label(label, "semantic_binary"), "not helpful")
+        with self.assertRaisesRegex(ValueError, "excludes indeterminate_or_mixed"):
+            normalize_training_label("indeterminate_or_mixed", "semantic_binary")
 
     def test_semantic_label_normalization_accepts_spaces_and_underscores(self) -> None:
         for label in SEMANTIC_LABELS:

@@ -63,6 +63,12 @@ SEMANTIC_FIVE_LABEL_TOKENS = (
 )
 SEMANTIC_FOUR_LABEL_NAMES = SEMANTIC_FIVE_LABEL_NAMES[:4]
 SEMANTIC_FOUR_LABEL_TOKENS = SEMANTIC_FIVE_LABEL_TOKENS[:4]
+SEMANTIC_BINARY_LABEL_MAPPING = {
+    "direct_support": "helpful",
+    "supporting_evidence": "helpful",
+    "no_evidence": "not helpful",
+    "misleading_evidence": "not helpful",
+}
 
 
 DEFAULT_SPLIT_ROOT = (
@@ -100,11 +106,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default="top10_epoch5_official_protocol")
     parser.add_argument(
         "--label-mode",
-        choices=("binary", "three_class", "semantic_four", "semantic_five"),
+        choices=("binary", "three_class", "semantic_binary", "semantic_four", "semantic_five"),
         default="binary",
         help=(
             "Classifier label space. The default reproduces the historical Helpful/Not Helpful "
             "filter. 'three_class' additionally trains Discard as an abstention/no-decision target. "
+            "'semantic_binary' collapses direct/supporting semantic evidence to Helpful and "
+            "no/misleading evidence to Not Helpful while rejecting indeterminate_or_mixed. "
             "'semantic_four' predicts direct/supporting/no/misleading evidence while excluding "
             "indeterminate_or_mixed during materialization. "
             "'semantic_five' predicts the five unmerged semantic evidence labels."
@@ -317,7 +325,7 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def training_label_spec(label_mode: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    if label_mode == "binary":
+    if label_mode in {"binary", "semantic_binary"}:
         return BINARY_LABEL_NAMES, BINARY_LABEL_TOKENS
     if label_mode == "three_class":
         return THREE_CLASS_LABEL_NAMES, THREE_CLASS_LABEL_TOKENS
@@ -328,8 +336,17 @@ def training_label_spec(label_mode: str) -> tuple[tuple[str, ...], tuple[str, ..
     raise ValueError(f"Unsupported label mode: {label_mode}")
 
 
-def normalize_training_label(value: Any) -> str:
+def normalize_training_label(value: Any, label_mode: str | None = None) -> str:
     normalized = clean_text(value).lower().strip("[]").replace("-", "_").replace(" ", "_")
+    if label_mode == "semantic_binary":
+        if normalized == "indeterminate_or_mixed":
+            raise ValueError(
+                "semantic_binary excludes indeterminate_or_mixed; use a semantic_four "
+                "materialization or remove mixed rows before training"
+            )
+        mapped = SEMANTIC_BINARY_LABEL_MAPPING.get(normalized)
+        if mapped is not None:
+            return mapped
     semantic_aliases = {
         "direct_support": "direct_support",
         "supporting_evidence": "supporting_evidence",
@@ -786,7 +803,10 @@ def tokenize_split(
     label_tokens_by_name: dict[str, str],
 ) -> Dataset:
     def preprocess(examples: dict[str, list[Any]]) -> dict[str, Any]:
-        targets = [label_tokens_by_name[normalize_training_label(value)] for value in examples["target"]]
+        targets = [
+            label_tokens_by_name[normalize_training_label(value, args.label_mode)]
+            for value in examples["target"]
+        ]
         sample_weights = (
             [float(value) for value in examples["_sample_weight"]]
             if "_sample_weight" in examples
@@ -1023,7 +1043,9 @@ def main() -> None:
         ("validation", validation_raw),
         ("test", test_raw),
     ):
-        observed = {normalize_training_label(value) for value in split_dataset["target"]}
+        observed = {
+            normalize_training_label(value, args.label_mode) for value in split_dataset["target"]
+        }
         unexpected = observed - allowed_labels
         if unexpected:
             raise ValueError(
@@ -1256,11 +1278,16 @@ def main() -> None:
         "preformatted_input": args.preformatted_input,
         "training_balance": balance_report,
         "label_mode": args.label_mode,
+        "semantic_binary_label_mapping": (
+            SEMANTIC_BINARY_LABEL_MAPPING if args.label_mode == "semantic_binary" else None
+        ),
         "label_tokens": dict(zip(label_names, label_tokens)),
         "label_token_ids": label_ids,
         "method_status": (
             "RAG2 three-class selective extension; Discard is an abstention/no-decision target and only Helpful is eligible for downstream inclusion"
             if args.label_mode == "three_class"
+            else "RAG2-input-compatible semantic support gate; direct/supporting are Helpful, no/misleading are Not Helpful, and indeterminate_or_mixed is excluded"
+            if args.label_mode == "semantic_binary"
             else "RAG2-input-compatible four-class semantic evidence classifier; indeterminate_or_mixed is excluded rather than merged"
             if args.label_mode == "semantic_four"
             else "RAG2-input-compatible five-class semantic evidence classifier; original semantic labels are not merged"
