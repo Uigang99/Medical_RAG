@@ -66,6 +66,16 @@ def parse_args() -> argparse.Namespace:
     merge.add_argument("--output-root", type=Path, required=True)
     merge.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     merge.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+
+    export_oracle = subparsers.add_parser(
+        "export-oracle",
+        help="Join the exact dynamic-k semantic union to evaluator sample keys.",
+    )
+    export_oracle.add_argument("--candidate-union-root", type=Path, required=True)
+    export_oracle.add_argument("--semantic-label-root", type=Path, required=True)
+    export_oracle.add_argument("--output-path", type=Path, required=True)
+    export_oracle.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    export_oracle.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -703,6 +713,269 @@ def merge(args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
+def oracle_export_manifest_path(output_path: Path) -> Path:
+    return output_path.with_name(output_path.stem + "_manifest.json")
+
+
+def validate_merged_union_manifest(path: Path, union_manifest: dict[str, Any], datasets: list[str]) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "merge_version": MERGE_VERSION,
+        "status": "complete",
+        "questions": int(union_manifest["questions"]),
+        "pairs": int(union_manifest["pairs"]),
+        "dynamic_top_k_values": [1, 2, 4, 8, 16, 32],
+        "annotation_version": ANNOTATION_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "medium",
+        "web_search_enabled": False,
+    }
+    mismatches = {
+        key: {"expected": wanted, "actual": value.get(key)}
+        for key, wanted in expected.items()
+        if value.get(key) != wanted
+    }
+    outputs = value.get("outputs") if isinstance(value.get("outputs"), dict) else {}
+    dataset_values = value.get("datasets") if isinstance(value.get("datasets"), dict) else {}
+    for dataset in datasets:
+        label_path = path.parent / dataset / "codex_semantic_labels.jsonl"
+        expected_output = outputs.get(dataset)
+        if not label_path.is_file() or not isinstance(expected_output, dict):
+            mismatches[f"outputs.{dataset}"] = {"expected": "complete file", "actual": expected_output}
+            continue
+        actual_output = path_identity(label_path)
+        if any(actual_output[field] != expected_output.get(field) for field in ("size", "mtime_ns")):
+            mismatches[f"outputs.{dataset}.identity"] = {
+                "expected": expected_output,
+                "actual": actual_output,
+            }
+        expected_pairs = int(union_manifest["pairs_by_dataset"][dataset])
+        if int(dataset_values.get(dataset, {}).get("pairs", -1)) != expected_pairs:
+            mismatches[f"datasets.{dataset}.pairs"] = {
+                "expected": expected_pairs,
+                "actual": dataset_values.get(dataset, {}).get("pairs"),
+            }
+    if mismatches:
+        raise ValueError(f"Merged dynamic semantic union is incompatible: {mismatches}")
+    return value
+
+
+def export_oracle(args: argparse.Namespace) -> dict[str, Any]:
+    """Export the 211,875-pair dynamic union in the evaluator's exact identity contract."""
+
+    union_manifest_path = args.candidate_union_root / "manifest.json"
+    semantic_manifest_path = args.semantic_label_root / "manifest.json"
+    union_manifest = validate_union_manifest(union_manifest_path, args.datasets)
+    semantic_manifest = validate_merged_union_manifest(
+        semantic_manifest_path, union_manifest, args.datasets
+    )
+    candidate_paths = union_candidate_paths(args.candidate_union_root, args.datasets)
+    label_paths = existing_label_paths(args.semantic_label_root, args.datasets)
+    expected_pairs = sum(int(union_manifest["pairs_by_dataset"][dataset]) for dataset in args.datasets)
+    expected_questions = sum(
+        int(union_manifest["questions_by_dataset"][dataset]) for dataset in args.datasets
+    )
+    contract = {
+        "export_version": "rag2_external_dynamic_semantic_oracle_export_v1",
+        "candidate_union_manifest": path_identity(union_manifest_path),
+        "semantic_union_manifest": path_identity(semantic_manifest_path),
+        "candidate_files": {
+            dataset: path_identity(candidate_paths[dataset]) for dataset in args.datasets
+        },
+        "semantic_label_files": {
+            dataset: path_identity(label_paths[dataset]) for dataset in args.datasets
+        },
+        "datasets": list(args.datasets),
+        "expected_questions": expected_questions,
+        "expected_pairs": expected_pairs,
+        "dynamic_top_k_values": [1, 2, 4, 8, 16, 32],
+    }
+    input_fingerprint = fingerprint(contract)
+    manifest_path = oracle_export_manifest_path(args.output_path)
+    if args.resume and manifest_path.is_file() and args.output_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        actual_output = path_identity(args.output_path)
+        if (
+            existing.get("status") == "complete"
+            and existing.get("input_fingerprint") == input_fingerprint
+            and existing.get("output", {}).get("size") == actual_output["size"]
+            and existing.get("output", {}).get("mtime_ns") == actual_output["mtime_ns"]
+        ):
+            progress = tqdm(
+                total=expected_pairs * 2,
+                initial=expected_pairs * 2,
+                desc="DynamicSemanticOracleExportOverall (cached)",
+                unit="pair",
+                dynamic_ncols=True,
+            )
+            progress.close()
+            logging.info(
+                "Dynamic semantic oracle export already complete: questions=%d pairs=%d path=%s",
+                expected_questions,
+                expected_pairs,
+                args.output_path,
+            )
+            return existing
+
+    overall = tqdm(
+        total=expected_pairs * 2,
+        desc="DynamicSemanticOracleExportOverall",
+        unit="pair",
+        position=0,
+        dynamic_ncols=True,
+    )
+    stage = tqdm(
+        total=expected_pairs,
+        desc="Stage 1/2 index merged semantic union",
+        unit="pair",
+        position=1,
+        dynamic_ncols=True,
+    )
+    labels: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for dataset in args.datasets:
+        for row in iter_jsonl(label_paths[dataset]):
+            sample_id = str(row.get("sample_id") or "")
+            stable_id = str(row.get("doc_stable_id") or "")
+            key = semantic_key(dataset, sample_id, stable_id)
+            label = str(row.get("semantic_label") or "")
+            if not sample_id or not stable_id or key in labels:
+                raise ValueError(f"Invalid or duplicate merged semantic pair: {key}")
+            if label not in VALID_LABELS:
+                raise ValueError(f"Invalid merged semantic label for {key}: {label}")
+            labels[key] = row
+            stage.update(1)
+            overall.update(1)
+    stage.close()
+    if len(labels) != expected_pairs:
+        raise ValueError(f"Merged semantic pair count mismatch: {len(labels)} != {expected_pairs}")
+
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = args.output_path.with_name(args.output_path.name + ".partial")
+    seen: set[tuple[str, str, str]] = set()
+    pair_counts = Counter()
+    question_counts = Counter()
+    label_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    membership_counts: dict[str, Counter[int]] = defaultdict(Counter)
+    stage = tqdm(
+        total=expected_pairs,
+        desc="Stage 2/2 join exact dynamic-k evaluator identities",
+        unit="pair",
+        position=1,
+        dynamic_ncols=True,
+    )
+    try:
+        with temporary.open("w", encoding="utf-8") as output_handle:
+            for dataset in args.datasets:
+                for candidate_row in iter_jsonl(candidate_paths[dataset]):
+                    sample_id = str(candidate_row.get("sample_id") or "")
+                    evaluator_sample_key = str(candidate_row.get("key") or "")
+                    if not sample_id or not evaluator_sample_key:
+                        raise ValueError(f"Dynamic-union row has incomplete evaluator identity: {sample_id}")
+                    question_counts[dataset] += 1
+                    documents = candidate_row.get("candidate_documents")
+                    if not isinstance(documents, list) or not documents:
+                        raise ValueError(f"Dynamic-union row has no documents: {sample_id}")
+                    for document in documents:
+                        stable_id = stable_document_id(document)
+                        key = semantic_key(dataset, sample_id, stable_id)
+                        row = labels.get(key)
+                        if row is None or key in seen:
+                            raise ValueError(f"Missing or duplicate semantic oracle pair: {key}")
+                        rank = union_rank(document)
+                        metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+                        memberships = metadata.get("oracle_dynamic_top_k_membership")
+                        rank_by_top_k = metadata.get("oracle_dynamic_rerank_rank_by_top_k")
+                        if row.get("dynamic_top_k_membership") != memberships:
+                            raise ValueError(f"Dynamic Top-k membership mismatch for {key}")
+                        if row.get("dynamic_rerank_rank_by_top_k") != rank_by_top_k:
+                            raise ValueError(f"Dynamic rerank-rank mismatch for {key}")
+                        output_row = {
+                            **row,
+                            "sample_key": evaluator_sample_key,
+                            "doc_rank": rank,
+                            "doc_stable_id": stable_id,
+                            "semantic_oracle_export_version": (
+                                "rag2_external_dynamic_semantic_oracle_export_v1"
+                            ),
+                        }
+                        output_handle.write(
+                            json.dumps(output_row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                        )
+                        seen.add(key)
+                        pair_counts[dataset] += 1
+                        label_counts[dataset][str(row["semantic_label"])] += 1
+                        for top_k in memberships or []:
+                            membership_counts[dataset][int(top_k)] += 1
+                        stage.update(1)
+                        overall.update(1)
+        if seen != set(labels):
+            missing = sorted(set(labels) - seen)
+            raise ValueError(
+                f"Dynamic semantic oracle export omitted {len(missing)} pairs; first={missing[:1]}"
+            )
+        for dataset in args.datasets:
+            wanted_questions = int(union_manifest["questions_by_dataset"][dataset])
+            wanted_pairs = int(union_manifest["pairs_by_dataset"][dataset])
+            if question_counts[dataset] != wanted_questions or pair_counts[dataset] != wanted_pairs:
+                raise ValueError(
+                    f"Dynamic semantic export count mismatch for {dataset}: "
+                    f"questions={question_counts[dataset]}/{wanted_questions} "
+                    f"pairs={pair_counts[dataset]}/{wanted_pairs}"
+                )
+            for top_k in (1, 2, 4, 8, 16, 32):
+                wanted_memberships = wanted_questions * top_k
+                if membership_counts[dataset][top_k] != wanted_memberships:
+                    raise ValueError(
+                        f"Top-{top_k} membership coverage mismatch for {dataset}: "
+                        f"{membership_counts[dataset][top_k]} != {wanted_memberships}"
+                    )
+        os.replace(temporary, args.output_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+        stage.close()
+        overall.close()
+
+    manifest = {
+        "export_version": "rag2_external_dynamic_semantic_oracle_export_v1",
+        "created_at": utc_now(),
+        "status": "complete",
+        "input_fingerprint": input_fingerprint,
+        "input_contract": contract,
+        "questions": expected_questions,
+        "pairs": expected_pairs,
+        "dynamic_top_k_values": [1, 2, 4, 8, 16, 32],
+        "annotation_version": semantic_manifest["annotation_version"],
+        "prompt_version": semantic_manifest["prompt_version"],
+        "model": semantic_manifest["model"],
+        "reasoning_effort": semantic_manifest["reasoning_effort"],
+        "datasets": {
+            dataset: {
+                "questions": question_counts[dataset],
+                "pairs": pair_counts[dataset],
+                "label_distribution": dict(sorted(label_counts[dataset].items())),
+                "top_k_membership_counts": {
+                    str(top_k): membership_counts[dataset][top_k]
+                    for top_k in (1, 2, 4, 8, 16, 32)
+                },
+            }
+            for dataset in args.datasets
+        },
+        "output": path_identity(args.output_path),
+    }
+    atomic_json(manifest_path, manifest)
+    logging.info(
+        "Dynamic semantic oracle decisions exported: questions=%d pairs=%d path=%s",
+        expected_questions,
+        expected_pairs,
+        args.output_path,
+    )
+    return manifest
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -713,6 +986,8 @@ def main() -> None:
         prepare(args)
     elif args.command == "merge":
         merge(args)
+    elif args.command == "export-oracle":
+        export_oracle(args)
     else:
         raise ValueError(args.command)
 

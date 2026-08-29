@@ -34,6 +34,7 @@ POLICIES = (
     ("semantic_direct_supporting", "Direct + supporting evidence"),
 )
 SUMMARY_VERSION = "rag2_external_semantic_oracle_topk_summary_v1"
+EXPECTED_DYNAMIC_UNION_PAIRS = 211_875
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-per-source-top-k", type=int, default=32)
     parser.add_argument("--expected-candidate-pool-top-k", type=int, default=128)
     parser.add_argument("--expected-rerank-top-k", type=int, default=128)
+    parser.add_argument(
+        "--expected-paper-balanced-projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require each k to use four source-local dense Top-k lists followed by MedCPT rerank Top-k.",
+    )
     return parser.parse_args()
 
 
@@ -71,12 +78,19 @@ def render(summary: dict[str, Any]) -> str:
         "Macro Avg (8)",
         "Macro Avg (3 groups)",
     ]
+    protocol_description = (
+        "For each k, dense Top-k is selected independently from PubMed, PMC, CPG, and Textbooks "
+        "(4k documents), then MedCPT reranks that exact pool to Top-k. There is no backfill: a question "
+        "with no accepted semantic document receives an empty document context."
+        if summary["paper_balanced_projection"]
+        else "For each k, only the rank-1..k prefix of the cached global MedCPT rerank Top-32 is eligible. "
+        "There is no backfill: a question with no accepted document receives an empty document context."
+    )
     lines = [
         "# GPT-5.6-Terra semantic-label gold-oracle Top-k sweep",
         "",
-        "Both policies use the same 6,545 questions and the same cached global MedCPT rerank Top-32. "
-        "For each k, only the rank-1..k prefix is eligible. There is no backfill: a question with no "
-        "accepted document receives an empty document context.",
+        "Both policies use the same 6,545 questions and the same cached retrieval/reranking scores. "
+        + protocol_description,
         "",
         "| " + " | ".join(headers) + " |",
         "|" + "|".join(["---:", "---", "---:"] + ["---:"] * (len(headers) - 3)) + "|",
@@ -175,8 +189,17 @@ def main() -> None:
         raise RuntimeError(
             f"Semantic oracle export covers {label_manifest.get('questions')} questions, expected {expected_questions}"
         )
-    if int(label_manifest.get("pairs", -1)) != expected_questions * 32:
-        raise RuntimeError("Semantic oracle export does not cover exact Top-32 for every question")
+    expected_label_pairs = (
+        EXPECTED_DYNAMIC_UNION_PAIRS
+        if args.expected_paper_balanced_projection
+        else expected_questions * 32
+    )
+    if int(label_manifest.get("pairs", -1)) != expected_label_pairs:
+        raise RuntimeError(
+            f"Semantic oracle export pair mismatch: {label_manifest.get('pairs')} != {expected_label_pairs}"
+        )
+    if args.expected_paper_balanced_projection and label_manifest.get("dynamic_top_k_values") != list(TOP_K_VALUES):
+        raise RuntimeError("Semantic oracle export omits the exact dynamic Top-k membership contract")
 
     condition_count = len(POLICIES) * len(TOP_K_VALUES)
     progress = PipelineProgress(
@@ -204,7 +227,7 @@ def main() -> None:
                     expected_per_source_top_k=args.expected_per_source_top_k,
                     expected_candidate_pool_top_k=args.expected_candidate_pool_top_k,
                     expected_rerank_top_k=args.expected_rerank_top_k,
-                    expected_paper_balanced_projection=False,
+                    expected_paper_balanced_projection=args.expected_paper_balanced_projection,
                     progress=progress,
                 )
                 if config.get("oracle_policy") != policy:
@@ -231,6 +254,7 @@ def main() -> None:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "results_root": str(args.results_root.resolve()),
             "semantic_label_manifest": str(args.semantic_label_manifest.resolve()),
+            "paper_balanced_projection": args.expected_paper_balanced_projection,
             "semantic_annotation": {
                 key: label_manifest.get(key)
                 for key in ("annotation_version", "prompt_version", "model", "reasoning_effort")

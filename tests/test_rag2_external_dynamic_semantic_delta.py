@@ -160,6 +160,107 @@ class ExternalDynamicSemanticDeltaTest(unittest.TestCase):
             self.assertEqual([row["doc_rank"] for row in rows], list(range(1, 10)))
             self.assertEqual(rows[-1]["dynamic_union_origin"], "new_dynamic_delta")
 
+    def test_oracle_export_covers_every_dynamic_top_k_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            union_root = root / "union"
+            semantic_root = root / "semantic"
+            output_path = root / "dynamic_semantic_oracle.jsonl"
+            sample_id = "medqa:test:000000"
+            sample_key = "medqa::test::medqa:test:000000::0"
+            top_k_values = [1, 2, 4, 8, 16, 32]
+            documents = []
+            labels = []
+            for rank in range(1, 33):
+                memberships = [top_k for top_k in top_k_values if rank <= top_k]
+                rank_by_top_k = {str(top_k): rank for top_k in memberships}
+                stable_id = f"doc-{rank}"
+                documents.append(
+                    {
+                        "stable_id": stable_id,
+                        "source": "pubmed",
+                        "text": f"evidence {rank}",
+                        "rerank_rank": rank,
+                        "oracle_union_rank": rank,
+                        "metadata": {
+                            "oracle_dynamic_top_k_membership": memberships,
+                            "oracle_dynamic_rerank_rank_by_top_k": rank_by_top_k,
+                        },
+                    }
+                )
+                labels.append(
+                    {
+                        "dataset": "medqa",
+                        "sample_id": sample_id,
+                        "doc_rank": rank,
+                        "doc_stable_id": stable_id,
+                        "semantic_label": "direct_support" if rank == 1 else "no_evidence",
+                        "dynamic_top_k_membership": memberships,
+                        "dynamic_rerank_rank_by_top_k": rank_by_top_k,
+                    }
+                )
+            candidate_row = {
+                "key": sample_key,
+                "dataset": "medqa",
+                "sample_id": sample_id,
+                "row_idx": 0,
+                "split": "test",
+                "candidate_documents": documents,
+            }
+            candidate_path = union_root / "medqa" / "test" / "candidates_topk_union.jsonl"
+            write_jsonl(candidate_path, [candidate_row])
+            union_manifest = {
+                "type": "rag2_paper_balanced_dynamic_oracle_candidate_union",
+                "questions": 1,
+                "pairs": 32,
+                "questions_by_dataset": {"medqa": 1},
+                "pairs_by_dataset": {"medqa": 32},
+                "dynamic_top_k_values": top_k_values,
+            }
+            (union_root / "manifest.json").parent.mkdir(parents=True, exist_ok=True)
+            (union_root / "manifest.json").write_text(json.dumps(union_manifest), encoding="utf-8")
+            label_path = semantic_root / "medqa" / "codex_semantic_labels.jsonl"
+            write_jsonl(label_path, labels)
+            semantic_manifest = {
+                "merge_version": MODULE.MERGE_VERSION,
+                "status": "complete",
+                "questions": 1,
+                "pairs": 32,
+                "dynamic_top_k_values": top_k_values,
+                "annotation_version": MODULE.ANNOTATION_VERSION,
+                "prompt_version": MODULE.PROMPT_VERSION,
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "medium",
+                "web_search_enabled": False,
+                "datasets": {"medqa": {"questions": 1, "pairs": 32}},
+                "outputs": {"medqa": MODULE.path_identity(label_path)},
+            }
+            (semantic_root / "manifest.json").write_text(
+                json.dumps(semantic_manifest), encoding="utf-8"
+            )
+
+            args = SimpleNamespace(
+                candidate_union_root=union_root,
+                semantic_label_root=semantic_root,
+                output_path=output_path,
+                datasets=["medqa"],
+                resume=True,
+            )
+            manifest = MODULE.export_oracle(args)
+            self.assertEqual(manifest["questions"], 1)
+            self.assertEqual(manifest["pairs"], 32)
+            self.assertEqual(
+                manifest["datasets"]["medqa"]["top_k_membership_counts"],
+                {"1": 1, "2": 2, "4": 4, "8": 8, "16": 16, "32": 32},
+            )
+            rows = [json.loads(line) for line in output_path.read_text().splitlines()]
+            self.assertEqual(len(rows), 32)
+            self.assertTrue(all(row["sample_key"] == sample_key for row in rows))
+            self.assertEqual(rows[0]["semantic_label"], "direct_support")
+
+            resumed = MODULE.export_oracle(args)
+            self.assertEqual(resumed["input_fingerprint"], manifest["input_fingerprint"])
+
 
 if __name__ == "__main__":
     unittest.main()
