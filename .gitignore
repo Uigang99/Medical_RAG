@@ -124,6 +124,8 @@ venv/
 !/scripts/run_rag2_margin_regression_training.sh
 !/scripts/train_rag2_pairwise_utility_ranker.py
 !/scripts/run_rag2_pairwise_utility_ranking.sh
+!/scripts/evaluate_rag2_semantic_attention_mvp.py
+!/scripts/run_rag2_semantic_attention_mvp_medqa.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 
@@ -141,3 +143,4 @@ venv/
 !/tests/test_rag2_anchored_document_pipeline.py
 !/tests/test_rag2_two_head_filter.py
 !/tests/test_rag2_margin_regressor.py
+!/tests/test_rag2_semantic_attention.py
