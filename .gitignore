@@ -126,8 +126,16 @@ venv/
 !/scripts/run_rag2_pairwise_utility_ranking.sh
 !/scripts/evaluate_rag2_semantic_attention_mvp.py
 !/scripts/run_rag2_semantic_attention_mvp_medqa.sh
+!/scripts/generate_rag2_top8_baseline_rationales.py
+!/scripts/prepare_rag2_semantic_attention_controller.py
+!/scripts/train_rag2_semantic_attention_controller.py
+!/scripts/run_rag2_semantic_attention_controller_training.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
+!/medrag/filtering/semantic_features.py
+!/medrag/generation/learned_semantic_attention.py
+!/medrag/training/rag2_semantic_attention_data.py
+!/medrag/training/__init__.py
 
 /tests/*
 !/tests/test_rag2_hidden_score_gold_margin.py
@@ -144,3 +152,7 @@ venv/
 !/tests/test_rag2_two_head_filter.py
 !/tests/test_rag2_margin_regressor.py
 !/tests/test_rag2_semantic_attention.py
+!/tests/test_rag2_semantic_features.py
+!/tests/test_rag2_learned_semantic_attention.py
+!/tests/test_rag2_semantic_attention_data.py
+!/tests/test_rag2_semantic_attention_controller_training.py
