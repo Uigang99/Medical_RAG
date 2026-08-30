@@ -24,6 +24,7 @@ from typing import Any, Iterable, Iterator
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -53,6 +54,18 @@ SEMANTIC_CLASS_NAMES = {
     2: "supporting_evidence",
     3: "direct_support",
 }
+
+# PyTorch 2.11 may route masked BF16 SDPA to cuDNN attention on H200.  cuDNN
+# cannot build an execution plan for every left-padded sequence shape used by
+# this trainer and raises ``No valid execution plans built`` instead of falling
+# back.  Keep Flash/Efficient attention available, with the universally
+# supported math implementation as a final fallback, while excluding only the
+# failing cuDNN backend for the frozen prefix replay.
+PREFIX_SDPA_BACKENDS = [
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -332,7 +345,7 @@ def final_choice_logits(
         base_model = getattr(model, "model", None)
         if base_model is None:
             raise TypeError("Expected a causal-LM wrapper with a .model decoder")
-        with torch.no_grad():
+        with torch.no_grad(), sdpa_kernel(PREFIX_SDPA_BACKENDS, set_priority=True):
             prefix = base_model(
                 input_ids=batch["prefix_ids"],
                 attention_mask=batch["attention_mask"],

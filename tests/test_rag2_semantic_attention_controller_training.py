@@ -3,11 +3,13 @@ from __future__ import annotations
 import unittest
 
 import torch
+from torch.nn.attention import SDPBackend
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from medrag.generation.learned_semantic_attention import freeze_module_for_controller_training
 from medrag.generation.semantic_attention import register_semantic_attention
 from scripts.train_rag2_semantic_attention_controller import (
+    PREFIX_SDPA_BACKENDS,
     collate_prefix_batch,
     final_choice_logits,
     normalize_accumulated_gradients,
@@ -15,6 +17,10 @@ from scripts.train_rag2_semantic_attention_controller import (
 
 
 class SemanticAttentionControllerTrainingTest(unittest.TestCase):
+    def test_prefix_sdpa_backends_exclude_failing_cudnn_path(self) -> None:
+        self.assertNotIn(SDPBackend.CUDNN_ATTENTION, PREFIX_SDPA_BACKENDS)
+        self.assertIn(SDPBackend.MATH, PREFIX_SDPA_BACKENDS)
+
     def test_left_padding_does_not_change_choice_logits(self) -> None:
         attention_name = register_semantic_attention()
         torch.manual_seed(19)
