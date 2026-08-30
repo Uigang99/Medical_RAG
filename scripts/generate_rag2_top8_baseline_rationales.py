@@ -157,6 +157,30 @@ def valid_complete(
     )
 
 
+def generation_manifest_matches(
+    path: Path,
+    run_contract: dict[str, Any],
+    shard_count: int,
+) -> bool:
+    """Return whether a completed manifest already represents this cache.
+
+    ``completed_at`` is intentionally ignored.  Rewriting an otherwise
+    identical manifest on every resume changes its file hash/mtime and makes
+    downstream immutable feature caches appear stale.
+    """
+
+    if not path.is_file():
+        return False
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        all(manifest.get(key) == value for key, value in run_contract.items())
+        and int(manifest.get("rationale_shards", -1)) == shard_count
+    )
+
+
 def count_candidates(path: Path, maximum: int) -> int:
     count = 0
     with path.open("rb") as handle:
@@ -377,14 +401,22 @@ def main() -> None:
             progress.update(2 * len(compact_rows))
         if observed != total:
             raise RuntimeError(f"Candidate coverage mismatch: observed={observed} expected={total}")
-        atomic_write_json(
-            args.output_dir / "generation_manifest.json",
-            {
-                **run_contract,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "rationale_shards": shard_count,
-            },
-        )
+        manifest_path = args.output_dir / "generation_manifest.json"
+        if completed == total and generation_manifest_matches(
+            manifest_path,
+            run_contract,
+            shard_count,
+        ):
+            logging.info("Complete rationale manifest is unchanged; preserving cache identity")
+        else:
+            atomic_write_json(
+                manifest_path,
+                {
+                    **run_contract,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "rationale_shards": shard_count,
+                },
+            )
         logging.info("Top-8 unbiased rationale cache complete: %s", args.output_dir)
     finally:
         progress.close()

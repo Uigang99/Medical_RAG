@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import hashlib
 import json
@@ -158,6 +159,31 @@ def model_bundle_identity(root: Path) -> list[dict[str, Any]]:
     if not paths:
         raise FileNotFoundError(f"No immutable model artifacts under {root}")
     return [file_identity(path) for path in paths]
+
+
+def resume_contract_differs_only_by_rationale_manifest_refresh(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    """Allow legacy caches whose upstream completion timestamp was refreshed.
+
+    The rationale generator historically rewrote ``generation_manifest.json``
+    even when every validated shard was already complete.  Only that file's
+    size/hash/mtime identity may differ here; all actual data, model, prompt,
+    split, and preparation settings must remain identical.
+    """
+
+    left = copy.deepcopy(previous)
+    right = copy.deepcopy(current)
+    left.pop("contract_fingerprint", None)
+    right.pop("contract_fingerprint", None)
+    for value in (left, right):
+        manifest = value.get("rationale_cache", {}).get("manifest")
+        if not isinstance(manifest, dict):
+            return False
+        for mutable_key in ("size", "mtime_ns", "sha256"):
+            manifest.pop(mutable_key, None)
+    return left == right
 
 
 def load_rationale_cache(root: Path, dataset: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
@@ -414,7 +440,21 @@ def main() -> None:
     contract_path = args.output_dir / "preparation_contract.json"
     if contract_path.is_file() and args.resume:
         previous = json.loads(contract_path.read_text(encoding="utf-8"))
-        if previous != {**source_contract, "contract_fingerprint": fingerprint}:
+        current = {**source_contract, "contract_fingerprint": fingerprint}
+        if previous == current:
+            pass
+        elif resume_contract_differs_only_by_rationale_manifest_refresh(previous, current):
+            # Preserve the original fingerprint because it is embedded in
+            # every validated feature shard and its completion marker.
+            logging.warning(
+                "Accepting legacy prepared features: only the completed rationale "
+                "manifest file metadata changed; all immutable contracts match"
+            )
+            source_contract = {
+                key: value for key, value in previous.items() if key != "contract_fingerprint"
+            }
+            fingerprint = str(previous["contract_fingerprint"])
+        else:
             raise RuntimeError("Prepared-feature resume contract mismatch; use a new output directory")
     else:
         atomic_write_json(contract_path, {**source_contract, "contract_fingerprint": fingerprint})
