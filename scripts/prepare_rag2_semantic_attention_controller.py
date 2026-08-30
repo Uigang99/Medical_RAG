@@ -291,7 +291,7 @@ def encode_final_decision(
     question: Any,
     rationale: str,
     max_model_length: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     document_texts = [" ".join(document.text.split()) for document in question.documents]
     row = {
         "question": question.question,
@@ -333,12 +333,22 @@ def encode_final_decision(
         if not matches:
             raise RuntimeError(f"Document {document_index} has no aligned Llama tokens")
         token_document_ids[matches] = document_index
+    assistant_indices = [
+        token_index
+        for token_index, (_, right) in enumerate(offsets)
+        if right > len(chat_prompt)
+    ]
+    if not assistant_indices:
+        raise RuntimeError(
+            f"Anchored assistant prefix has no aligned tokens for {question.sample_id}"
+        )
+    assistant_query_start = int(assistant_indices[0])
     final_text = tokenizer.decode([int(input_ids[-1])], skip_special_tokens=False)
     if "(" not in final_text:
         raise RuntimeError(
             f"Final choice anchor is not the last token for {question.sample_id}: {final_text!r}"
         )
-    return input_ids, token_document_ids
+    return input_ids, token_document_ids, assistant_query_start
 
 
 def shard_paths(output_dir: Path, split: str, index: int) -> tuple[Path, Path]:
@@ -569,6 +579,7 @@ def main() -> None:
                     raise RuntimeError("Frozen semantic feature shape mismatch")
                 input_ids: list[torch.Tensor] = []
                 token_document_ids: list[torch.Tensor] = []
+                assistant_query_starts: list[int] = []
                 semantic_targets: list[list[int]] = []
                 semantic_masks: list[list[bool]] = []
                 sample_ids: list[str] = []
@@ -582,7 +593,7 @@ def main() -> None:
                     expected_ids = [document.pair_id for document in question.documents]
                     if list(rationale_row.get("document_pair_ids") or []) != expected_ids:
                         raise RuntimeError(f"Rationale/candidate document mismatch: {question.sample_id}")
-                    ids, mapping = encode_final_decision(
+                    ids, mapping, assistant_query_start = encode_final_decision(
                         tokenizer,
                         question,
                         str(rationale_row["rationale"]),
@@ -590,6 +601,7 @@ def main() -> None:
                     )
                     input_ids.append(ids)
                     token_document_ids.append(mapping)
+                    assistant_query_starts.append(assistant_query_start)
                     sample_ids.append(question.sample_id)
                     pair_ids.append(expected_ids)
                     semantic_targets.append(
@@ -643,6 +655,10 @@ def main() -> None:
                     "no_rag_correct": torch.tensor(no_rag_correct, dtype=torch.bool),
                     "input_ids": input_ids,
                     "token_document_ids": token_document_ids,
+                    "assistant_query_starts": torch.tensor(
+                        assistant_query_starts,
+                        dtype=torch.int32,
+                    ),
                 }
                 atomic_torch_save(data_path, payload)
                 atomic_write_json(

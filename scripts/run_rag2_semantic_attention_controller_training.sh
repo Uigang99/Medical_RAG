@@ -5,6 +5,7 @@ PROJECT=/home/user/Uiheon/Medical_RAG
 PYTHON_BIN=/home/user/Uiheon/.venv_vllm/bin/python
 DATASET=${1:-medqa}
 MODE=${2:-pilot}
+ATTENTION_SCOPE=${ATTENTION_SCOPE:-final_choice}
 
 if [[ "${DATASET}" != "medqa" && "${DATASET}" != "medmcqa" ]]; then
   echo "dataset must be medqa or medmcqa" >&2
@@ -14,10 +15,17 @@ if [[ "${MODE}" != "pilot" && "${MODE}" != "full" ]]; then
   echo "mode must be pilot or full" >&2
   exit 2
 fi
+if [[ "${ATTENTION_SCOPE}" != "final_choice" && "${ATTENTION_SCOPE}" != "rationale_wide" ]]; then
+  echo "ATTENTION_SCOPE must be final_choice or rationale_wide" >&2
+  exit 2
+fi
 
 BASE="$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
-RUN_TAG=${RUN_TAG:-"${DATASET}_${MODE}_top8_final_choice_v1"}
-RATIONALE_CACHE="$BASE/semantic_attention_controller_v1/$RUN_TAG/top8_unbiased_rationales"
+RUN_TAG=${RUN_TAG:-"${DATASET}_${MODE}_top8_${ATTENTION_SCOPE}_v1"}
+# Unbiased rationale generation is independent of the learned attention scope.
+# Reuse the already materialized final-choice pilot cache by default.
+RATIONALE_CACHE_TAG=${RATIONALE_CACHE_TAG:-"${DATASET}_${MODE}_top8_final_choice_v1"}
+RATIONALE_CACHE="$BASE/semantic_attention_controller_v1/$RATIONALE_CACHE_TAG/top8_unbiased_rationales"
 FEATURE_DIR="$BASE/semantic_attention_controller_v1/$RUN_TAG/prepared_features"
 MODEL_DIR="/home/user/Uiheon/models/RAG2-Semantic-Attention-Controller/$DATASET/$RUN_TAG"
 INDEX_PATH="$BASE/semantic_attention_controller_v1/shared_indices/${DATASET}.sqlite"
@@ -36,6 +44,14 @@ else
   else
     EPOCHS=${EPOCHS:-3}
   fi
+fi
+
+if [[ "${ATTENTION_SCOPE}" == "rationale_wide" ]]; then
+  DEFAULT_QUESTION_BATCH_SIZE=1
+  DEFAULT_GRADIENT_ACCUMULATION_STEPS=8
+else
+  DEFAULT_QUESTION_BATCH_SIZE=32
+  DEFAULT_GRADIENT_ACCUMULATION_STEPS=1
 fi
 
 workflow_start=$(date +%s)
@@ -79,7 +95,7 @@ announce_stage 2 "join full Top-8 labels and cache independent semantic vectors/
   "$PARTIAL_FLAG" \
   --resume
 
-announce_stage 3 "train residual document-attention controller with frozen Llama final-choice loss"
+announce_stage 3 "train residual document-attention controller with frozen Llama ${ATTENTION_SCOPE} loss"
 "$PYTHON_BIN" "$PROJECT/scripts/train_rag2_semantic_attention_controller.py" \
   --dataset "$DATASET" \
   --feature-dir "$FEATURE_DIR" \
@@ -87,10 +103,11 @@ announce_stage 3 "train residual document-attention controller with frozen Llama
   --output-dir "$MODEL_DIR" \
   --epochs "$EPOCHS" \
   --patience "${PATIENCE:-2}" \
-  --question-batch-size "${QUESTION_BATCH_SIZE:-32}" \
-  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
+  --question-batch-size "${QUESTION_BATCH_SIZE:-$DEFAULT_QUESTION_BATCH_SIZE}" \
+  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-$DEFAULT_GRADIENT_ACCUMULATION_STEPS}" \
   --learning-rate "${LEARNING_RATE:-3e-4}" \
   --semantic-layer-start "${SEMANTIC_LAYER_START:-16}" \
+  --attention-scope "$ATTENTION_SCOPE" \
   --prior-strength "${PRIOR_STRENGTH:-0.25}" \
   --boundary-epsilon "${BOUNDARY_EPSILON:-0.05}" \
   --ordering-loss-weight "${ORDERING_LOSS_WEIGHT:-0.1}" \

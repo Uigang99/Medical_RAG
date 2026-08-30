@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Train a semantic-prior residual controller at the final MCQ choice query.
+"""Train a semantic-prior residual document-attention controller.
 
 The target Llama and semantic Flan-T5 encoder are frozen.  The only trainable
 parameters are a small residual MLP that converts independent semantic
 question-document features into per-document attention-logit biases.  Prefix
-KV states are computed without autograd using SDPA; the final ``("` query is
-replayed with differentiable document-key biases and gold-option CE.
+KV states can be computed without autograd for the legacy ``final_choice``
+scope, or the complete cached assistant rationale can be replayed with
+differentiable document-key biases for the ``rationale_wide`` scope.  Both
+scopes optimize gold-option cross entropy without updating Llama.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from medrag.rag2_anchored_trace import CHOICES  # noqa: E402
 
 
 RUN_VERSION = "rag2_semantic_final_choice_attention_controller_v1"
+RATIONALE_WIDE_RUN_VERSION = "rag2_semantic_rationale_wide_attention_controller_v1"
 DEFAULT_LLM = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 SEMANTIC_CLASS_NAMES = {
     -1: "indeterminate_or_mixed",
@@ -88,6 +91,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-suppression-factor", type=float, default=4.0)
     parser.add_argument("--boundary-epsilon", type=float, default=0.05)
     parser.add_argument("--semantic-layer-start", type=int, default=16)
+    parser.add_argument(
+        "--attention-scope",
+        choices=("final_choice", "rationale_wide"),
+        default="final_choice",
+        help=(
+            "final_choice preserves the cheap legacy q_len=1 replay; "
+            "rationale_wide applies learned document bias from the first "
+            "assistant rationale token through the final choice anchor"
+        ),
+    )
     parser.add_argument("--ordering-margin", type=float, default=0.1)
     parser.add_argument("--ordering-loss-weight", type=float, default=0.1)
     parser.add_argument("--anchor-loss-weight", type=float, default=1e-3)
@@ -268,6 +281,17 @@ def load_feature_shard(
             raise ValueError(f"Top-8/final-anchor mapping mismatch in {path}:{row_index}")
         if bool(((mapping < -1) | (mapping > 7)).any()):
             raise ValueError(f"Out-of-range document token mapping in {path}:{row_index}")
+    if "assistant_query_starts" in value:
+        starts = value["assistant_query_starts"]
+        if not isinstance(starts, torch.Tensor) or tuple(starts.shape) != (count,):
+            raise ValueError(f"Prepared assistant_query_starts shape mismatch in {path}")
+        for row_index, (start, ids) in enumerate(
+            zip(starts.tolist(), value["input_ids"], strict=True)
+        ):
+            if not 0 <= int(start) < int(ids.numel()):
+                raise ValueError(
+                    f"Assistant query start is out of range in {path}:{row_index}"
+                )
     return value
 
 
@@ -323,6 +347,57 @@ def collate_prefix_batch(
         "query_ids": query_ids.to(device),
         "prefix_position_ids": prefix_position_ids.to(device),
         "query_position_ids": query_position_ids.to(device),
+    }
+
+
+def collate_rationale_wide_batch(
+    payload: dict[str, Any],
+    indices: list[int],
+    *,
+    pad_token_id: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Left-pad complete cached rationales and mark every assistant query.
+
+    The last input token is the fixed ``("` anchor, whose output logits select
+    A/B/C/D.  Document-key biases are active for every assistant token from
+    ``Rationale:`` onward, so gradients can train a controller through the
+    entire cached reasoning path instead of only the terminal query.
+    """
+
+    if "assistant_query_starts" not in payload:
+        raise RuntimeError(
+            "Prepared features lack assistant_query_starts; build a new feature "
+            "directory with the updated preparation script"
+        )
+    full_ids = [payload["input_ids"][index].long() for index in indices]
+    mappings = [payload["token_document_ids"][index].long() for index in indices]
+    starts = [int(payload["assistant_query_starts"][index]) for index in indices]
+    max_length = max(int(ids.numel()) for ids in full_ids)
+    batch_size = len(indices)
+    padded_ids = torch.full((batch_size, max_length), int(pad_token_id), dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long)
+    padded_map = torch.full((batch_size, max_length), -1, dtype=torch.long)
+    query_mask = torch.zeros((batch_size, max_length), dtype=torch.float32)
+    for row, (ids, mapping, assistant_start) in enumerate(
+        zip(full_ids, mappings, starts, strict=True)
+    ):
+        length = int(ids.numel())
+        if not 0 <= assistant_start < length:
+            raise RuntimeError("Assistant query start is outside its prompt")
+        left = max_length - length
+        padded_ids[row, left:] = ids
+        attention_mask[row, left:] = 1
+        padded_map[row, left:] = mapping
+        query_mask[row, left + assistant_start :] = 1.0
+    position_ids = attention_mask.cumsum(dim=1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+    return {
+        "input_ids": padded_ids.to(device),
+        "attention_mask": attention_mask.to(device),
+        "position_ids": position_ids.to(device),
+        "token_document_ids": padded_map.to(device),
+        "semantic_query_mask": query_mask.to(device),
     }
 
 
@@ -397,6 +472,83 @@ def final_choice_logits(
         return logits
     finally:
         model.config._attn_implementation = previous_attention
+
+
+def rationale_wide_choice_logits(
+    model: Any,
+    attention_name: str,
+    batch: dict[str, torch.Tensor],
+    document_bias: torch.Tensor,
+    choice_token_ids: torch.Tensor,
+    layer_start: int,
+) -> torch.Tensor:
+    """Replay the cached rationale with bias active on all assistant queries."""
+
+    previous_attention = model.config._attn_implementation
+    try:
+        model.config._attn_implementation = attention_name
+        token_bias = document_bias_to_token_bias(
+            document_bias,
+            batch["token_document_ids"],
+        )
+        outputs = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            use_cache=False,
+            return_dict=True,
+            logits_to_keep=1,
+            semantic_token_bias=token_bias,
+            semantic_query_mask=batch["semantic_query_mask"],
+            semantic_layer_start=layer_start,
+        )
+        logits = outputs.logits[:, -1].float().index_select(1, choice_token_ids)
+        del outputs
+        return logits
+    finally:
+        model.config._attn_implementation = previous_attention
+
+
+def controller_choice_logits(
+    model: Any,
+    tokenizer: Any,
+    attention_name: str,
+    payload: dict[str, Any],
+    indices: list[int],
+    document_bias: torch.Tensor,
+    choice_token_ids: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    device = torch.device(args.device)
+    if args.attention_scope == "final_choice":
+        batch = collate_prefix_batch(
+            payload,
+            indices,
+            pad_token_id=int(tokenizer.pad_token_id),
+            device=device,
+        )
+        return final_choice_logits(
+            model,
+            attention_name,
+            batch,
+            document_bias,
+            choice_token_ids,
+            args.semantic_layer_start,
+        )
+    batch = collate_rationale_wide_batch(
+        payload,
+        indices,
+        pad_token_id=int(tokenizer.pad_token_id),
+        device=device,
+    )
+    return rationale_wide_choice_logits(
+        model,
+        attention_name,
+        batch,
+        document_bias,
+        choice_token_ids,
+        args.semantic_layer_start,
+    )
 
 
 def batch_controller_inputs(
@@ -559,19 +711,15 @@ def evaluate_split(
             for indices in shuffled_batches(len(payload["sample_ids"]), args.question_batch_size, args.seed):
                 values = batch_controller_inputs(payload, indices, torch.device(args.device))
                 output = controller(values["features"], values["margins"])
-                prefix = collate_prefix_batch(
+                logits = controller_choice_logits(
+                    model,
+                    tokenizer,
+                    attention_name,
                     payload,
                     indices,
-                    pad_token_id=int(tokenizer.pad_token_id),
-                    device=torch.device(args.device),
-                )
-                logits = final_choice_logits(
-                    model,
-                    attention_name,
-                    prefix,
                     output.document_bias,
                     choice_token_ids,
-                    args.semantic_layer_start,
+                    args,
                 )
                 loss, _ = controller_loss(logits, values, output, args)
                 update_metrics(state, logits, values, output.document_bias, loss)
@@ -597,7 +745,7 @@ def save_checkpoint(
     atomic_torch_save(
         path,
         {
-            "run_version": RUN_VERSION,
+            "run_version": run_contract["run_version"],
             "run_contract": run_contract,
             "controller": controller.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -674,6 +822,11 @@ def main() -> None:
     if feature_manifest.get("dataset") != args.dataset:
         raise ValueError("Prepared feature dataset does not match --dataset")
     hidden_size = int(feature_manifest["feature_hidden_size"])
+    run_version = (
+        RATIONALE_WIDE_RUN_VERSION
+        if args.attention_scope == "rationale_wide"
+        else RUN_VERSION
+    )
     current_llm_identity = model_bundle_identity(args.llm_model)
     if feature_manifest.get("llm_model_bundle") != current_llm_identity:
         raise RuntimeError(
@@ -688,7 +841,7 @@ def main() -> None:
         raise RuntimeError("--no-resume requires an empty or new training output directory")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_contract = {
-        "run_version": RUN_VERSION,
+        "run_version": run_version,
         "dataset": args.dataset,
         "feature_contract_fingerprint": feature_manifest["contract_fingerprint"],
         "feature_hidden_size": hidden_size,
@@ -716,6 +869,8 @@ def main() -> None:
         "seed": args.seed,
         "dtype": args.dtype,
     }
+    if args.attention_scope != "final_choice":
+        run_contract["attention_scope"] = args.attention_scope
     run_contract_path = args.output_dir / "training_contract.json"
     if run_contract_path.is_file() and args.resume:
         if json.loads(run_contract_path.read_text(encoding="utf-8")) != run_contract:
@@ -799,7 +954,11 @@ def main() -> None:
             raise RuntimeError(f"Choice {label} is not one token after the fixed '(' anchor: {ids}")
         choice_ids.append(int(ids[0]))
     choice_token_ids = torch.tensor(choice_ids, dtype=torch.long, device=device)
-    logging.info("Loading frozen target Llama for final-choice attention training: %s", args.llm_model)
+    logging.info(
+        "Loading frozen target Llama for %s attention training: %s",
+        args.attention_scope,
+        args.llm_model,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.llm_model,
         local_files_only=True,
@@ -877,19 +1036,15 @@ def main() -> None:
                 for batch_number, indices in enumerate(batches, start=1):
                     values = batch_controller_inputs(payload, indices, device)
                     output = controller(values["features"], values["margins"])
-                    prefix = collate_prefix_batch(
+                    logits = controller_choice_logits(
+                        model,
+                        tokenizer,
+                        attention_name,
                         payload,
                         indices,
-                        pad_token_id=int(tokenizer.pad_token_id),
-                        device=device,
-                    )
-                    logits = final_choice_logits(
-                        model,
-                        attention_name,
-                        prefix,
                         output.document_bias,
                         choice_token_ids,
-                        args.semantic_layer_start,
+                        args,
                     )
                     loss, loss_parts = controller_loss(logits, values, output, args)
                     loss.backward()
@@ -956,7 +1111,7 @@ def main() -> None:
                 atomic_torch_save(
                     args.output_dir / "best_controller.pt",
                     {
-                        "run_version": RUN_VERSION,
+                        "run_version": run_version,
                         "run_contract": run_contract,
                         "epoch": epoch + 1,
                         "controller": controller.state_dict(),
@@ -1018,7 +1173,7 @@ def main() -> None:
             "3/3 final internal test with best validation checkpoint",
         )
         summary = {
-            "run_version": RUN_VERSION,
+            "run_version": run_version,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "dataset": args.dataset,
             "cached_reference_definition": (
@@ -1036,7 +1191,7 @@ def main() -> None:
         atomic_torch_save(
             args.output_dir / "final_controller.pt",
             {
-                "run_version": RUN_VERSION,
+                "run_version": run_version,
                 "run_contract": run_contract,
                 "best_epoch": int(best["epoch"]),
                 "controller": controller.state_dict(),

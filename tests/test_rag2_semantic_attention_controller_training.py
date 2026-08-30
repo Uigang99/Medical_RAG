@@ -11,8 +11,10 @@ from medrag.generation.semantic_attention import register_semantic_attention
 from scripts.train_rag2_semantic_attention_controller import (
     PREFIX_SDPA_BACKENDS,
     collate_prefix_batch,
+    collate_rationale_wide_batch,
     final_choice_logits,
     normalize_accumulated_gradients,
+    rationale_wide_choice_logits,
 )
 
 
@@ -73,6 +75,78 @@ class SemanticAttentionControllerTrainingTest(unittest.TestCase):
         module.weight.grad = torch.tensor([[6.0, 9.0]])
         normalize_accumulated_gradients(module, 3)
         self.assertTrue(torch.equal(module.weight.grad, torch.tensor([[2.0, 3.0]])))
+
+    def test_rationale_wide_collation_marks_only_assistant_queries(self) -> None:
+        payload = {
+            "input_ids": [
+                torch.tensor([1, 2, 3, 4, 5]),
+                torch.tensor([1, 7, 8, 9, 10, 11, 12, 5]),
+            ],
+            "token_document_ids": [
+                torch.tensor([-1, 0, 0, -1, -1]),
+                torch.tensor([-1, 0, 0, 1, 1, -1, -1, -1]),
+            ],
+            "assistant_query_starts": torch.tensor([3, 5]),
+        }
+        batch = collate_rationale_wide_batch(
+            payload,
+            [0, 1],
+            pad_token_id=0,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(tuple(batch["input_ids"].shape), (2, 8))
+        self.assertTrue(
+            torch.equal(
+                batch["semantic_query_mask"],
+                torch.tensor(
+                    [
+                        [0, 0, 0, 0, 0, 0, 1, 1],
+                        [0, 0, 0, 0, 0, 1, 1, 1],
+                    ],
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    def test_rationale_wide_answer_loss_reaches_document_bias(self) -> None:
+        attention_name = register_semantic_attention()
+        torch.manual_seed(23)
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            attention_dropout=0.0,
+            pad_token_id=0,
+            attn_implementation="sdpa",
+        )
+        model = freeze_module_for_controller_training(LlamaForCausalLM(config))
+        payload = {
+            "input_ids": [torch.tensor([1, 2, 3, 4, 5, 6])],
+            "token_document_ids": [torch.tensor([-1, 0, 0, 1, -1, -1])],
+            "assistant_query_starts": torch.tensor([4]),
+        }
+        batch = collate_rationale_wide_batch(
+            payload,
+            [0],
+            pad_token_id=0,
+            device=torch.device("cpu"),
+        )
+        document_bias = torch.tensor([[-0.2, -0.5]], requires_grad=True)
+        logits = rationale_wide_choice_logits(
+            model,
+            attention_name,
+            batch,
+            document_bias,
+            torch.tensor([20, 21, 22, 23]),
+            0,
+        )
+        torch.nn.functional.cross_entropy(logits, torch.tensor([1])).backward()
+        self.assertIsNotNone(document_bias.grad)
+        self.assertGreater(float(document_bias.grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":
