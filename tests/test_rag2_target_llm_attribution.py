@@ -10,7 +10,10 @@ from medrag.attribution.target_llm_predictor import (
     masked_document_distribution,
 )
 from scripts.prepare_rag2_target_llm_attribution import build_conditional_removal_batch
-from scripts.train_rag2_target_llm_attribution import permute_document_aligned_batch
+from scripts.train_rag2_target_llm_attribution import (
+    permute_document_aligned_batch,
+    selected_paths,
+)
 
 
 class TargetLLMAttributionPredictorTest(unittest.TestCase):
@@ -179,6 +182,41 @@ class TargetLLMAttributionPredictorTest(unittest.TestCase):
         torch.testing.assert_close(shuffled["teacher_total_loo"], batch["teacher_total_loo"])
         self.assertEqual(shuffled["sample_ids"], batch["sample_ids"])
         self.assertFalse(bool(shuffled["document_mask"][1, 2]))
+
+    def test_training_sample_prefixes_are_nested(self) -> None:
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sample_ids = [f"sample-{index:02d}" for index in range(16)]
+            row_root = root / "rows" / "train"
+            row_root.mkdir(parents=True)
+            for sample_id in sample_ids:
+                digest = hashlib.sha256(sample_id.encode("utf-8")).hexdigest()[:24]
+                (row_root / f"{digest}.pt").touch()
+            first = set(
+                selected_paths(
+                    root,
+                    "train",
+                    sample_ids=sample_ids,
+                    maximum=4,
+                    seed=42,
+                )
+            )
+            second = set(
+                selected_paths(
+                    root,
+                    "train",
+                    sample_ids=sample_ids,
+                    maximum=8,
+                    seed=42,
+                )
+            )
+            self.assertEqual(len(first), 4)
+            self.assertEqual(len(second), 8)
+            self.assertTrue(first < second)
 
     def test_masked_distribution_sums_only_present_documents(self) -> None:
         probabilities = masked_document_distribution(

@@ -137,9 +137,11 @@ def selected_paths(
     missing = [path for path in paths if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Prepared attribution rows are missing for {split}: {missing[:5]}")
-    if maximum > 0 and len(paths) > maximum:
-        paths = random.Random(seed).sample(paths, maximum)
-    return sorted(paths)
+    ordered = sorted(paths)
+    random.Random(seed).shuffle(ordered)
+    if maximum > 0:
+        ordered = ordered[:maximum]
+    return sorted(ordered)
 
 
 def collate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
