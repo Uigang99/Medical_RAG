@@ -388,7 +388,11 @@ def evaluate_one(
         choice_token_ids,
         int(contract["semantic_layer_start"]),
         device,
-    ).cpu()
+    )
+    # ``choice_logits_for_loo_batch`` returns both a tensor and a diagnostic
+    # collector.  Only the logits tensor can be moved to CPU; applying
+    # ``.cpu()`` to the returned tuple raises AttributeError before row 1.
+    logits = logits.cpu()
     attention_all = attention_collector.summarize()
     attention_controlled = attention_collector.summarize(
         layer_start=int(contract["semantic_layer_start"])

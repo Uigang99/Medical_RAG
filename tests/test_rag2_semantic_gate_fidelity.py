@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from medrag.generation.learned_semantic_attention import document_bias_to_token_bias
+from medrag.generation.learned_semantic_attention import (
+    SemanticResidualAttentionController,
+    document_bias_to_token_bias,
+)
 from medrag.generation.semantic_attention import (
     DocumentAttentionCollector,
     register_semantic_attention,
 )
 from scripts.evaluate_rag2_semantic_gate_fidelity import (
     build_physical_loo_batch,
+    evaluate_one,
     jensen_shannon_divergence,
     normalize_positive,
     pearson_correlation,
@@ -124,6 +129,55 @@ class SemanticGateFidelityTest(unittest.TestCase):
         summary = collector.summarize()
         self.assertEqual(tuple(summary["document_share"].shape), (1, 2))
         self.assertAlmostEqual(float(summary["document_share"].sum()), 1.0, places=5)
+
+    def test_evaluate_one_unpacks_logits_and_collector_before_cpu_transfer(self) -> None:
+        attention_name = register_semantic_attention()
+        model = LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+                pad_token_id=0,
+                attn_implementation=attention_name,
+            )
+        ).eval()
+        controller = SemanticResidualAttentionController(
+            input_dim=4,
+            hidden_dim=8,
+            dropout=0.0,
+        ).eval()
+        payload = {
+            "semantic_features": torch.zeros((1, 8, 4)),
+            "semantic_margins": torch.linspace(-1.0, 1.0, 8).unsqueeze(0),
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]),
+            "token_document_ids": torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, -1, -1]]),
+            "assistant_query_starts": torch.tensor([8]),
+            "gold_options": torch.tensor([0]),
+            "semantic_class_ids": torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]),
+            "sample_ids": ["tiny-question"],
+            "pair_ids": [[f"pair-{index}" for index in range(8)]],
+        }
+        row = evaluate_one(
+            payload,
+            0,
+            controller,
+            model,
+            SimpleNamespace(pad_token_id=0),
+            torch.tensor([11, 12, 13, 14]),
+            {"attention_scope": "rationale_wide", "semantic_layer_start": 0},
+            SimpleNamespace(
+                device="cpu",
+                minimum_total_jsd=0.0,
+                dataset="medqa",
+                split="test",
+            ),
+        )
+        self.assertEqual(len(row["predicted_document_share"]), 8)
+        self.assertEqual(len(row["loo_jsd"]), 8)
 
 
 if __name__ == "__main__":
