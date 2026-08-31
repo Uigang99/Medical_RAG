@@ -65,7 +65,7 @@ class SemanticGateFidelityTest(unittest.TestCase):
         self.assertAlmostEqual(jensen_shannon_divergence(left, left), 0.0)
 
     def test_attention_collector_sums_document_spans(self) -> None:
-        collector = DocumentAttentionCollector(document_count=2)
+        collector = DocumentAttentionCollector(document_count=2, collect_value_norm=True)
         weights = torch.tensor(
             [[[[0.1, 0.3, 0.2, 0.4], [0.2, 0.2, 0.5, 0.1]]]],
             dtype=torch.float32,
@@ -73,6 +73,10 @@ class SemanticGateFidelityTest(unittest.TestCase):
         collector.update(
             layer_index=3,
             attention_weights=weights,
+            value_states=torch.tensor(
+                [[[[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [0.0, 0.0]]]],
+                dtype=torch.float32,
+            ),
             token_document_ids=torch.tensor([[-1, 0, 1, 1]]),
             active_query_mask=torch.tensor([[0.0, 1.0]]),
         )
@@ -83,6 +87,13 @@ class SemanticGateFidelityTest(unittest.TestCase):
         )
         self.assertTrue(
             torch.allclose(summary["document_attention_fraction"], torch.tensor([0.8]))
+        )
+        self.assertEqual(tuple(summary["document_value_share"].shape), (1, 2))
+        self.assertAlmostEqual(float(summary["document_value_share"].sum()), 1.0, places=6)
+        # doc0: 0.2*[2,0] -> norm .4; doc1: 0.5*[0,2] -> norm 1.0.
+        torch.testing.assert_close(
+            summary["document_value_share"],
+            torch.tensor([[2.0 / 7.0, 5.0 / 7.0]]),
         )
 
     def test_tiny_llama_collects_attention_during_loo_batch(self) -> None:
@@ -112,7 +123,7 @@ class SemanticGateFidelityTest(unittest.TestCase):
             document_bias,
             batch["token_document_ids"],
         )
-        collector = DocumentAttentionCollector(document_count=2)
+        collector = DocumentAttentionCollector(document_count=2, collect_value_norm=True)
         with torch.inference_mode():
             output = model(
                 input_ids=batch["input_ids"],
@@ -129,6 +140,8 @@ class SemanticGateFidelityTest(unittest.TestCase):
         summary = collector.summarize()
         self.assertEqual(tuple(summary["document_share"].shape), (1, 2))
         self.assertAlmostEqual(float(summary["document_share"].sum()), 1.0, places=5)
+        self.assertEqual(tuple(summary["document_value_share"].shape), (1, 2))
+        self.assertAlmostEqual(float(summary["document_value_share"].sum()), 1.0, places=5)
 
     def test_evaluate_one_unpacks_logits_and_collector_before_cpu_transfer(self) -> None:
         attention_name = register_semantic_attention()
