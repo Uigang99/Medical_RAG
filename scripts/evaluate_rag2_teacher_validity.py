@@ -47,7 +47,14 @@ from medrag.generation.semantic_attention import (  # noqa: E402
     register_semantic_attention,
 )
 from medrag.progress import PipelineProgress  # noqa: E402
-from medrag.rag2_anchored_trace import CHOICES  # noqa: E402
+from medrag.rag2_anchored_trace import (  # noqa: E402
+    CHOICES,
+    END_REASONING_MARKER,
+    FINAL_ANSWER_PREFIX,
+    RATIONALE_HEADER,
+    build_anchored_user_prompt,
+    render_chat_prompt,
+)
 from medrag.training.rag2_semantic_attention_data import (  # noqa: E402
     RAG2SemanticAttentionDataset,
     SemanticAttentionQuestion,
@@ -62,6 +69,7 @@ from scripts.evaluate_rag2_semantic_gate_fidelity import (  # noqa: E402
 
 RUN_VERSION = "rag2_teacher_construct_validity_v1"
 DIRECT_ROW_VERSION = "rag2_teacher_validity_direct_choice_proxy_v1"
+E2E_SCORE_ROW_VERSION = "rag2_teacher_validity_regenerated_rationale_exact_choice_v1"
 DEFAULT_LLM = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 SIGNAL_THRESHOLDS = (0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2)
 MIN_REFERENCE_COVERAGE = 0.50
@@ -144,17 +152,13 @@ def logprobs_to_probabilities(values: dict[str, float | None]) -> list[float]:
     return [value / total for value in weights]
 
 
-def e2e_metrics(row: dict[str, Any]) -> dict[str, Any]:
-    variants = {str(value["variant"]): value for value in row["variants"]}
-    expected = {"full", "repeat", *(f"remove_{index}" for index in range(8))}
-    if set(variants) != expected:
-        raise ValueError(f"Invalid regenerated variants for {row.get('sample_id')}")
-    full = logprobs_to_probabilities(variants["full"]["choice_logprobs"])
-    repeat = logprobs_to_probabilities(variants["repeat"]["choice_logprobs"])
-    removals = [
-        logprobs_to_probabilities(variants[f"remove_{index}"]["choice_logprobs"])
-        for index in range(8)
-    ]
+def distribution_metrics(
+    full: list[float],
+    repeat: list[float],
+    removals: list[list[float]],
+) -> dict[str, Any]:
+    if len(full) != 4 or len(repeat) != 4 or len(removals) != 8:
+        raise ValueError("Expected full/repeat four-choice distributions and eight removals")
     full_tensor = torch.tensor(full)
     jsd = [
         jensen_shannon_divergence(full_tensor, torch.tensor(probabilities))
@@ -172,6 +176,26 @@ def e2e_metrics(row: dict[str, Any]) -> dict[str, Any]:
         "removal_predictions": removal_predictions,
         "flips": [value != full_prediction for value in removal_predictions],
     }
+
+
+def e2e_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    """Parse complete vLLM choice rows; retained for cache/unit diagnostics.
+
+    The construct-validity report uses exact Hugging Face rescoring instead,
+    because vLLM top-logprobs can omit a very-low-probability allowed choice.
+    """
+
+    variants = {str(value["variant"]): value for value in row["variants"]}
+    expected = {"full", "repeat", *(f"remove_{index}" for index in range(8))}
+    if set(variants) != expected:
+        raise ValueError(f"Invalid regenerated variants for {row.get('sample_id')}")
+    full = logprobs_to_probabilities(variants["full"]["choice_logprobs"])
+    repeat = logprobs_to_probabilities(variants["repeat"]["choice_logprobs"])
+    removals = [
+        logprobs_to_probabilities(variants[f"remove_{index}"]["choice_logprobs"])
+        for index in range(8)
+    ]
+    return distribution_metrics(full, repeat, removals)
 
 
 def benchmark_sample(question: SemanticAttentionQuestion) -> BenchmarkSample:
@@ -284,8 +308,71 @@ def build_direct_batch(
     }
 
 
+def build_e2e_choice_batch(
+    tokenizer: Any,
+    question: SemanticAttentionQuestion,
+    e2e_row: dict[str, Any],
+    max_input_tokens: int,
+) -> dict[str, torch.Tensor]:
+    variants = {str(value["variant"]): value for value in e2e_row["variants"]}
+    variant_names = ["full", "repeat"] + [f"remove_{index}" for index in range(8)]
+    if set(variants) != set(variant_names):
+        raise ValueError(f"Invalid regenerated variants for {question.sample_id}")
+    texts = document_texts(question)
+    prompt_row = {
+        "question": question.question,
+        "options": dict(question.options),
+        "answer": question.gold_answers[0] if question.gold_answers else None,
+    }
+    encoded_variants: list[torch.Tensor] = []
+    for name in variant_names:
+        if name in {"full", "repeat"}:
+            active = list(range(8))
+        else:
+            removed = int(name.split("_", 1)[1])
+            active = [index for index in range(8) if index != removed]
+        context = "\n\n".join(texts[index] for index in active)
+        user_prompt = build_anchored_user_prompt(prompt_row, context)
+        rationale = str(variants[name]["rationale"]).strip()
+        decision_prompt = (
+            render_chat_prompt(tokenizer, user_prompt)
+            + RATIONALE_HEADER
+            + rationale
+            + "\n"
+            + END_REASONING_MARKER
+            + "\n"
+            + FINAL_ANSWER_PREFIX
+        )
+        token_ids = tokenizer.encode(decision_prompt, add_special_tokens=False)
+        encoded_variants.append(torch.tensor(token_ids, dtype=torch.long))
+    maximum = max(int(ids.numel()) for ids in encoded_variants)
+    if maximum > max_input_tokens:
+        raise RuntimeError(
+            f"Regenerated-rationale validity prompt exceeds {max_input_tokens} tokens for "
+            f"{question.sample_id}: {maximum}"
+        )
+    pad_id = int(tokenizer.pad_token_id)
+    input_ids = torch.full((10, maximum), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((10, maximum), dtype=torch.long)
+    for row_index, ids in enumerate(encoded_variants):
+        length = int(ids.numel())
+        input_ids[row_index, maximum - length :] = ids
+        attention_mask[row_index, maximum - length :] = 1
+    position_ids = attention_mask.cumsum(dim=1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+
+
 def direct_row_path(output_dir: Path, sample_id: str) -> Path:
     return hashed_path(output_dir / "direct_rows", sample_id, "pt")
+
+
+def e2e_score_row_path(output_dir: Path, sample_id: str) -> Path:
+    return hashed_path(output_dir / "e2e_exact_choice_rows", sample_id, "pt")
 
 
 def valid_direct_row(path: Path, sample_id: str, fingerprint: str) -> bool:
@@ -297,6 +384,20 @@ def valid_direct_row(path: Path, sample_id: str, fingerprint: str) -> bool:
         return False
     return bool(
         row.get("run_version") == DIRECT_ROW_VERSION
+        and row.get("sample_id") == sample_id
+        and row.get("contract_fingerprint") == fingerprint
+    )
+
+
+def valid_e2e_score_row(path: Path, sample_id: str, fingerprint: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        row = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    return bool(
+        row.get("run_version") == E2E_SCORE_ROW_VERSION
         and row.get("sample_id") == sample_id
         and row.get("contract_fingerprint") == fingerprint
     )
@@ -366,6 +467,51 @@ def evaluate_direct_one(
         "value_share_late": late_layers["document_value_share"][0],
         "attention_layers_all": all_layers["layers"],
         "attention_layers_late": late_layers["layers"],
+    }
+
+
+def evaluate_e2e_exact_one(
+    question: SemanticAttentionQuestion,
+    e2e_row: dict[str, Any],
+    model: Any,
+    tokenizer: Any,
+    choice_ids: torch.Tensor,
+    args: argparse.Namespace,
+    fingerprint: str,
+) -> dict[str, Any]:
+    batch = build_e2e_choice_batch(tokenizer, question, e2e_row, args.max_input_tokens)
+    device = torch.device(args.device)
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=batch["input_ids"].to(device),
+            attention_mask=batch["attention_mask"].to(device),
+            position_ids=batch["position_ids"].to(device),
+            use_cache=False,
+            return_dict=True,
+            logits_to_keep=1,
+        )
+    logits = outputs.logits[:, -1].float().index_select(1, choice_ids).cpu()
+    probabilities = torch.softmax(logits, dim=-1)
+    metrics = distribution_metrics(
+        probabilities[0].tolist(),
+        probabilities[1].tolist(),
+        probabilities[2:].tolist(),
+    )
+    return {
+        "run_version": E2E_SCORE_ROW_VERSION,
+        "contract_fingerprint": fingerprint,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "sample_id": question.sample_id,
+        "pair_ids": [document.pair_id for document in question.documents],
+        "exact_choice_probabilities": probabilities,
+        "exact_jsd": torch.tensor(metrics["jsd"], dtype=torch.float32),
+        "exact_total_jsd": float(metrics["total_jsd"]),
+        "exact_repeat_noise_jsd": float(metrics["repeat_noise_jsd"]),
+        "exact_full_prediction": int(metrics["full_prediction"]),
+        "exact_removal_predictions": torch.tensor(
+            metrics["removal_predictions"], dtype=torch.int8
+        ),
+        "exact_flips": torch.tensor(metrics["flips"], dtype=torch.bool),
     }
 
 
@@ -683,33 +829,43 @@ def main() -> None:
     else:
         atomic_write_json(contract_path, run_contract)
 
-    cached_ids = {
+    direct_cached_ids = {
         sample_id
         for sample_id in selected_ids
         if valid_direct_row(direct_row_path(args.output_dir, sample_id), sample_id, fingerprint)
     }
-    pending_ids = [sample_id for sample_id in selected_ids if sample_id not in cached_ids]
+    e2e_cached_ids = {
+        sample_id
+        for sample_id in selected_ids
+        if valid_e2e_score_row(
+            e2e_score_row_path(args.output_dir, sample_id), sample_id, fingerprint
+        )
+    }
+    fully_cached_ids = direct_cached_ids & e2e_cached_ids
+    pending_ids = [sample_id for sample_id in selected_ids if sample_id not in fully_cached_ids]
     logging.info(
-        "Teacher-validity evaluation plan: questions=%d direct_cached=%d remaining=%d "
-        "direct_interventions=%d",
+        "Teacher-validity evaluation plan: questions=%d direct_cached=%d "
+        "e2e_exact_cached=%d remaining_questions=%d exact_forward_batches=%d",
         len(selected_ids),
-        len(cached_ids),
+        len(direct_cached_ids),
+        len(e2e_cached_ids),
         len(pending_ids),
-        len(pending_ids) * 10,
+        sum(sample_id not in direct_cached_ids for sample_id in selected_ids)
+        + sum(sample_id not in e2e_cached_ids for sample_id in selected_ids),
     )
     if args.plan_only:
         return
 
     progress = PipelineProgress(
         overall_total=2 * len(selected_ids),
-        overall_initial=len(cached_ids),
+        overall_initial=len(fully_cached_ids),
         desc="TeacherValidityAudit:medqa",
     )
     try:
         progress.set_stage(
-            "1/2 direct-choice LOO + one-forward attention/value proxies",
+            "1/2 exact regenerated-rationale/direct LOO + one-forward proxies",
             total=len(selected_ids),
-            initial=len(cached_ids),
+            initial=len(fully_cached_ids),
         )
         if pending_ids:
             attention_name = register_semantic_attention()
@@ -738,16 +894,30 @@ def main() -> None:
             model.requires_grad_(False)
             choice_ids = torch.tensor(choice_token_values, dtype=torch.long, device=device)
             for sample_id in pending_ids:
-                direct = evaluate_direct_one(
-                    indexed[sample_id],
-                    model,
-                    tokenizer,
-                    marker_ids,
-                    choice_ids,
-                    args,
-                    fingerprint,
-                )
-                atomic_torch_save(direct_row_path(args.output_dir, sample_id), direct)
+                if sample_id not in direct_cached_ids:
+                    direct = evaluate_direct_one(
+                        indexed[sample_id],
+                        model,
+                        tokenizer,
+                        marker_ids,
+                        choice_ids,
+                        args,
+                        fingerprint,
+                    )
+                    atomic_torch_save(direct_row_path(args.output_dir, sample_id), direct)
+                if sample_id not in e2e_cached_ids:
+                    raw_e2e_path = hashed_path(args.end_to_end_dir / "rows", sample_id, "json")
+                    raw_e2e = json.loads(raw_e2e_path.read_text(encoding="utf-8"))
+                    exact_e2e = evaluate_e2e_exact_one(
+                        indexed[sample_id],
+                        raw_e2e,
+                        model,
+                        tokenizer,
+                        choice_ids,
+                        args,
+                        fingerprint,
+                    )
+                    atomic_torch_save(e2e_score_row_path(args.output_dir, sample_id), exact_e2e)
                 progress.update(1)
                 progress.set_detail(f"sample={sample_id}")
             del model
@@ -760,17 +930,31 @@ def main() -> None:
             fixed_path = hashed_path(args.fixed_teacher_dir / "rows" / args.split, sample_id, "pt")
             e2e_path = hashed_path(args.end_to_end_dir / "rows", sample_id, "json")
             direct_path = direct_row_path(args.output_dir, sample_id)
-            if not fixed_path.is_file() or not e2e_path.is_file() or not direct_path.is_file():
+            e2e_score_path = e2e_score_row_path(args.output_dir, sample_id)
+            if (
+                not fixed_path.is_file()
+                or not e2e_path.is_file()
+                or not direct_path.is_file()
+                or not e2e_score_path.is_file()
+            ):
                 raise FileNotFoundError(f"Incomplete teacher tuple for {sample_id}")
             fixed = torch.load(fixed_path, map_location="cpu", weights_only=False)
             direct = torch.load(direct_path, map_location="cpu", weights_only=False)
-            e2e = e2e_metrics(json.loads(e2e_path.read_text(encoding="utf-8")))
+            e2e_score = torch.load(e2e_score_path, map_location="cpu", weights_only=False)
+            e2e = {
+                "jsd": as_float_list(e2e_score["exact_jsd"]),
+                "total_jsd": float(e2e_score["exact_total_jsd"]),
+                "repeat_noise_jsd": float(e2e_score["exact_repeat_noise_jsd"]),
+                "flips": [bool(value) for value in e2e_score["exact_flips"].tolist()],
+            }
             fixed_value = fixed_metrics(fixed)
             expected_pairs = [document.pair_id for document in indexed[sample_id].documents]
             if [str(value) for value in fixed["pair_ids"]] != expected_pairs:
                 raise RuntimeError(f"Fixed teacher document mismatch for {sample_id}")
             if [str(value) for value in direct["pair_ids"]] != expected_pairs:
                 raise RuntimeError(f"Direct teacher document mismatch for {sample_id}")
+            if [str(value) for value in e2e_score["pair_ids"]] != expected_pairs:
+                raise RuntimeError(f"End-to-end teacher document mismatch for {sample_id}")
             detail_rows.append(
                 {
                     "sample_id": sample_id,
