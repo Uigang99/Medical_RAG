@@ -54,7 +54,7 @@ announce_stage 1 "regenerate rationale and choice for full/repeat/eight physical
   --generation-batch-size "${GENERATION_BATCH_SIZE:-64}" \
   --max-new-tokens "${MAX_NEW_TOKENS:-512}" \
   --retry-max-new-tokens "${RETRY_MAX_NEW_TOKENS:-768}" \
-  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.92}" \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.60}" \
   --llm-max-model-len "${LLM_MAX_MODEL_LEN:-8192}" \
   --vllm-max-num-seqs "${VLLM_MAX_NUM_SEQS:-80}" \
   --vllm-max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS:-65536}" \
