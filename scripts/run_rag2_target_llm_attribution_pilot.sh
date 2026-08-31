@@ -15,6 +15,27 @@ if [[ "${MODE}" != "memorize" && "${MODE}" != "pilot" ]]; then
   exit 2
 fi
 
+boolean_flag() {
+  local value=$1
+  local enabled=$2
+  local disabled=$3
+  case "${value}" in
+    1|true|TRUE|yes|YES) printf '%s' "${enabled}" ;;
+    0|false|FALSE|no|NO) printf '%s' "${disabled}" ;;
+    *)
+      echo "Expected a boolean value, got: ${value}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+RANK_FEATURE_FLAG=$(boolean_flag "${USE_RANK_FEATURE:-1}" --use-rank-feature --no-use-rank-feature)
+LENGTH_FEATURE_FLAG=$(boolean_flag "${USE_LENGTH_FEATURE:-1}" --use-length-feature --no-use-length-feature)
+SHUFFLE_DOCUMENT_FLAG=$(boolean_flag \
+  "${SHUFFLE_DOCUMENTS_DURING_TRAINING:-0}" \
+  --shuffle-documents-during-training \
+  --no-shuffle-documents-during-training)
+
 BASE="$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
 SOURCE_FEATURE_DIR=${SOURCE_FEATURE_DIR:-"$BASE/semantic_attention_controller_v1/${DATASET}_pilot_top8_rationale_wide_v1/prepared_features"}
 RUN_TAG=${RUN_TAG:-"${DATASET}_${MODE}_k8_layers20_28_fixed_rationale_v1"}
@@ -98,6 +119,9 @@ announce_stage 2 "train sequence-aware conditional-removal attribution predictor
   --rank-loss-weight "${RANK_LOSS_WEIGHT:-0.1}" \
   --minimum-total-for-share "${MINIMUM_TOTAL_FOR_SHARE:-1e-6}" \
   --minimum-rank-log-ratio "${MINIMUM_RANK_LOG_RATIO:-0.25}" \
+  "$RANK_FEATURE_FLAG" \
+  "$LENGTH_FEATURE_FLAG" \
+  "$SHUFFLE_DOCUMENT_FLAG" \
   --max-train-samples "$MAX_TRAIN_SAMPLES" \
   --max-eval-samples "$MAX_EVAL_SAMPLES" \
   --num-workers "${NUM_WORKERS:-4}" \

@@ -58,6 +58,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank-loss-weight", type=float, default=0.1)
     parser.add_argument("--minimum-total-for-share", type=float, default=1e-6)
     parser.add_argument("--minimum-rank-log-ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--use-rank-feature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--use-length-feature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--shuffle-documents-during-training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--epsilon", type=float, default=1e-12)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -218,17 +233,51 @@ def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     }
 
 
+DOCUMENT_ALIGNED_KEYS = (
+    "document_features",
+    "document_mask",
+    "relative_rank",
+    "normalized_length",
+    "teacher_influence",
+)
+
+
+def permute_document_aligned_batch(
+    batch: dict[str, Any],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """Apply a deterministic per-question permutation to all document axes."""
+
+    result = dict(batch)
+    for key in DOCUMENT_ALIGNED_KEYS:
+        result[key] = batch[key].clone()
+    generator = torch.Generator().manual_seed(int(seed))
+    for row in range(len(batch["sample_ids"])):
+        count = int(batch["document_mask"][row].sum().item())
+        permutation = torch.randperm(count, generator=generator)
+        for key in DOCUMENT_ALIGNED_KEYS:
+            result[key][row, :count] = batch[key][row, permutation]
+    return result
+
+
 def forward_loss(
     model: TargetLLMAttributionPredictor,
     batch: dict[str, Any],
     args: argparse.Namespace,
 ) -> tuple[Any, dict[str, torch.Tensor]]:
+    relative_rank = batch["relative_rank"]
+    if not args.use_rank_feature:
+        relative_rank = torch.zeros_like(relative_rank)
+    normalized_length = batch["normalized_length"]
+    if not args.use_length_feature:
+        normalized_length = torch.zeros_like(normalized_length)
     prediction = model(
         batch["document_features"],
         batch["global_features"],
         batch["document_mask"],
-        batch["relative_rank"],
-        batch["normalized_length"],
+        relative_rank,
+        normalized_length,
     )
     losses = attribution_loss(
         prediction,
@@ -330,6 +379,11 @@ def train_epoch(
     sums = {name: 0.0 for name in ("loss", "total", "share", "set_shift", "rank")}
     samples = 0
     for batch_index, batch in enumerate(loader, start=1):
+        if args.shuffle_documents_during_training:
+            batch = permute_document_aligned_batch(
+                batch,
+                seed=args.seed + epoch * 1_000_003 + batch_index,
+            )
         batch = move_batch(batch, torch.device(args.device))
         optimizer.zero_grad(set_to_none=True)
         _prediction, losses = forward_loss(model, batch, args)
@@ -455,6 +509,9 @@ def main() -> None:
         "rank_loss_weight": args.rank_loss_weight,
         "minimum_total_for_share": args.minimum_total_for_share,
         "minimum_rank_log_ratio": args.minimum_rank_log_ratio,
+        "use_rank_feature": args.use_rank_feature,
+        "use_length_feature": args.use_length_feature,
+        "shuffle_documents_during_training": args.shuffle_documents_during_training,
         "epsilon": args.epsilon,
         "seed": args.seed,
     }
@@ -465,18 +522,25 @@ def main() -> None:
         # Runs created before the relative-only objective was added implicitly
         # used a unit weight for the total-LOO loss.
         previous.setdefault("total_loss_weight", 1.0)
+        previous.setdefault("use_rank_feature", True)
+        previous.setdefault("use_length_feature", True)
+        previous.setdefault("shuffle_documents_during_training", False)
         if previous != run_contract:
             raise RuntimeError("Attribution-predictor resume contract mismatch; use a new output directory")
     else:
         atomic_write_json(contract_path, run_contract)
     logging.info(
-        "Attribution training plan: train=%d val=%d test=%d epochs=%d batch=%d memorization=%s",
+        "Attribution training plan: train=%d val=%d test=%d epochs=%d batch=%d "
+        "memorization=%s rank_feature=%s length_feature=%s train_permutation=%s",
         len(train_paths),
         len(validation_paths),
         len(test_paths),
         args.epochs,
         args.batch_size,
         args.memorization_check,
+        args.use_rank_feature,
+        args.use_length_feature,
+        args.shuffle_documents_during_training,
     )
     if args.plan_only:
         return
@@ -614,6 +678,11 @@ def main() -> None:
                 "relative_share": args.share_loss_weight > 0,
                 "set_shift": args.set_shift_loss_weight > 0,
                 "within_question_rank": args.rank_loss_weight > 0,
+            },
+            "input_features": {
+                "rank": args.use_rank_feature,
+                "document_length": args.use_length_feature,
+                "training_document_permutation": args.shuffle_documents_during_training,
             },
             "interpretation": {
                 "output": "predicted conditional-removal sensitivity, not literal attention usage",

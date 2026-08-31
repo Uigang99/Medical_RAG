@@ -10,6 +10,7 @@ from medrag.attribution.target_llm_predictor import (
     masked_document_distribution,
 )
 from scripts.prepare_rag2_target_llm_attribution import build_conditional_removal_batch
+from scripts.train_rag2_target_llm_attribution import permute_document_aligned_batch
 
 
 class TargetLLMAttributionPredictorTest(unittest.TestCase):
@@ -150,6 +151,34 @@ class TargetLLMAttributionPredictorTest(unittest.TestCase):
             losses["loss"],
             losses["share"] + 0.1 * losses["rank"],
         )
+
+    def test_document_order_augmentation_preserves_feature_target_alignment(self) -> None:
+        batch = {
+            "sample_ids": ["first", "second"],
+            "document_features": torch.tensor(
+                [[[[10.0]], [[20.0]], [[30.0]]], [[[40.0]], [[50.0]], [[0.0]]]]
+            ),
+            "document_mask": torch.tensor([[True, True, True], [True, True, False]]),
+            "relative_rank": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 0.0]]),
+            "normalized_length": torch.tensor([[11.0, 21.0, 31.0], [41.0, 51.0, 0.0]]),
+            "teacher_influence": torch.tensor([[12.0, 22.0, 32.0], [42.0, 52.0, 0.0]]),
+            "teacher_total_loo": torch.tensor([66.0, 94.0]),
+        }
+        shuffled = permute_document_aligned_batch(batch, seed=123)
+        self.assertFalse(
+            torch.equal(shuffled["document_features"], batch["document_features"])
+        )
+        for row, count in ((0, 3), (1, 2)):
+            feature_ids = shuffled["document_features"][row, :count, 0, 0]
+            torch.testing.assert_close(
+                shuffled["normalized_length"][row, :count], feature_ids + 1.0
+            )
+            torch.testing.assert_close(
+                shuffled["teacher_influence"][row, :count], feature_ids + 2.0
+            )
+        torch.testing.assert_close(shuffled["teacher_total_loo"], batch["teacher_total_loo"])
+        self.assertEqual(shuffled["sample_ids"], batch["sample_ids"])
+        self.assertFalse(bool(shuffled["document_mask"][1, 2]))
 
     def test_masked_distribution_sums_only_present_documents(self) -> None:
         probabilities = masked_document_distribution(
