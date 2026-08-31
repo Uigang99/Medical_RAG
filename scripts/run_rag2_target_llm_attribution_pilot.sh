@@ -92,6 +92,7 @@ announce_stage 2 "train sequence-aware conditional-removal attribution predictor
   --transformer-layers "${TRANSFORMER_LAYERS:-2}" \
   --attention-heads "${ATTENTION_HEADS:-4}" \
   --feedforward-dim "${FEEDFORWARD_DIM:-1024}" \
+  --total-loss-weight "${TOTAL_LOSS_WEIGHT:-1.0}" \
   --share-loss-weight "${SHARE_LOSS_WEIGHT:-0.5}" \
   --set-shift-loss-weight "${SET_SHIFT_LOSS_WEIGHT:-0.5}" \
   --rank-loss-weight "${RANK_LOSS_WEIGHT:-0.1}" \

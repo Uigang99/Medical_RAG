@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-heads", type=int, default=4)
     parser.add_argument("--feedforward-dim", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--total-loss-weight", type=float, default=1.0)
     parser.add_argument("--share-loss-weight", type=float, default=0.5)
     parser.add_argument("--set-shift-loss-weight", type=float, default=0.5)
     parser.add_argument("--rank-loss-weight", type=float, default=0.1)
@@ -237,6 +238,7 @@ def forward_loss(
         document_mask=batch["document_mask"],
         minimum_total_for_share=args.minimum_total_for_share,
         epsilon=args.epsilon,
+        total_weight=args.total_loss_weight,
         share_weight=args.share_loss_weight,
         set_shift_weight=args.set_shift_loss_weight,
         rank_weight=args.rank_loss_weight,
@@ -373,6 +375,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("epochs, batch-size, and learning-rate must be positive")
     if args.minimum_total_for_share < 0 or args.epsilon <= 0:
         raise ValueError("signal threshold must be non-negative and epsilon positive")
+    loss_weights = (
+        args.total_loss_weight,
+        args.share_loss_weight,
+        args.set_shift_loss_weight,
+        args.rank_loss_weight,
+    )
+    if not all(math.isfinite(weight) for weight in loss_weights):
+        raise ValueError("loss weights must be finite")
+    if any(weight < 0 for weight in loss_weights) or not any(
+        weight > 0 for weight in loss_weights
+    ):
+        raise ValueError("loss weights must be non-negative and at least one must be positive")
 
 
 def main() -> None:
@@ -435,6 +449,7 @@ def main() -> None:
         "attention_heads": args.attention_heads,
         "feedforward_dim": args.feedforward_dim,
         "dropout": args.dropout,
+        "total_loss_weight": args.total_loss_weight,
         "share_loss_weight": args.share_loss_weight,
         "set_shift_loss_weight": args.set_shift_loss_weight,
         "rank_loss_weight": args.rank_loss_weight,
@@ -447,6 +462,9 @@ def main() -> None:
     contract_path = args.output_dir / "run_contract.json"
     if contract_path.is_file() and args.resume:
         previous = json.loads(contract_path.read_text(encoding="utf-8"))
+        # Runs created before the relative-only objective was added implicitly
+        # used a unit weight for the total-LOO loss.
+        previous.setdefault("total_loss_weight", 1.0)
         if previous != run_contract:
             raise RuntimeError("Attribution-predictor resume contract mismatch; use a new output directory")
     else:
@@ -591,6 +609,12 @@ def main() -> None:
             "best_epoch": int(best["epoch"]),
             "best_validation_metric": float(best["best_metric"]),
             "test": test_metrics,
+            "active_objectives": {
+                "total_loo": args.total_loss_weight > 0,
+                "relative_share": args.share_loss_weight > 0,
+                "set_shift": args.set_shift_loss_weight > 0,
+                "within_question_rank": args.rank_loss_weight > 0,
+            },
             "interpretation": {
                 "output": "predicted conditional-removal sensitivity, not literal attention usage",
                 "teacher": feature_manifest["teacher_mode"],

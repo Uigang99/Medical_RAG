@@ -243,6 +243,7 @@ def attribution_loss(
     document_mask: torch.Tensor,
     minimum_total_for_share: float = 1e-6,
     epsilon: float = 1e-12,
+    total_weight: float = 1.0,
     share_weight: float = 0.5,
     set_shift_weight: float = 0.5,
     rank_weight: float = 0.1,
@@ -276,7 +277,7 @@ def attribution_loss(
         share_loss = prediction.document_logits.sum() * 0.0
         rank_loss = prediction.document_logits.sum() * 0.0
     loss = (
-        total_loss
+        float(total_weight) * total_loss
         + float(share_weight) * share_loss
         + float(set_shift_weight) * set_shift_loss
         + float(rank_weight) * rank_loss

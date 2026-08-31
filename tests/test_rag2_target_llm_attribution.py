@@ -126,6 +126,31 @@ class TargetLLMAttributionPredictorTest(unittest.TestCase):
         self.assertTrue(gradients)
         self.assertTrue(all(bool(torch.isfinite(gradient).all()) for gradient in gradients))
 
+    def test_relative_only_objective_excludes_set_level_losses(self) -> None:
+        model = self.make_model()
+        prediction = model(
+            torch.randn(2, 3, 2, 8),
+            torch.randn(2, 2, 8),
+            torch.ones(2, 3, dtype=torch.bool),
+            torch.tensor([[0.0, 0.5, 1.0], [0.0, 0.5, 1.0]]),
+            torch.ones(2, 3) * 0.5,
+        )
+        losses = attribution_loss(
+            prediction,
+            teacher_influence=torch.tensor([[0.08, 0.01, 0.03], [0.01, 0.07, 0.02]]),
+            teacher_total_loo=torch.tensor([0.12, 0.10]),
+            teacher_set_shift=torch.tensor([0.02, 0.04]),
+            document_mask=torch.ones(2, 3, dtype=torch.bool),
+            total_weight=0.0,
+            share_weight=1.0,
+            set_shift_weight=0.0,
+            rank_weight=0.1,
+        )
+        torch.testing.assert_close(
+            losses["loss"],
+            losses["share"] + 0.1 * losses["rank"],
+        )
+
     def test_masked_distribution_sums_only_present_documents(self) -> None:
         probabilities = masked_document_distribution(
             torch.tensor([[1.0, 2.0, 99.0]]),
