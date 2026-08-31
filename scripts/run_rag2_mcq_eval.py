@@ -192,6 +192,9 @@ def parse_args() -> argparse.Namespace:
             "semantic_direct_supporting",
             "behavioral_best_direct",
             "behavioral_best_semantic_candidates",
+            "gold_free_max_confidence",
+            "gold_free_min_entropy",
+            "gold_free_consensus_confidence",
         ],
         default=None,
         help="Label/score field to materialize as Helpful for --case oracle_rag.",
@@ -3686,6 +3689,9 @@ def apply_oracle_labels(
             elif args.oracle_policy in {
                 "behavioral_best_direct",
                 "behavioral_best_semantic_candidates",
+                "gold_free_max_confidence",
+                "gold_free_min_entropy",
+                "gold_free_consensus_confidence",
             }:
                 expected_selection_policy = args.oracle_policy
                 actual_selection_policy = str(row.get("selection_policy") or "")
@@ -3720,7 +3726,13 @@ def apply_oracle_labels(
                     if args.oracle_policy in {"semantic_direct", "semantic_direct_supporting"}
                     else row.get("pseudo_label")
                     if args.oracle_policy
-                    in {"behavioral_best_direct", "behavioral_best_semantic_candidates"}
+                    in {
+                        "behavioral_best_direct",
+                        "behavioral_best_semantic_candidates",
+                        "gold_free_max_confidence",
+                        "gold_free_min_entropy",
+                        "gold_free_consensus_confidence",
+                    }
                     else row.get("hidden_label")
                 ),
                 "utility_score": row.get("utility_score"),
@@ -3733,6 +3745,13 @@ def apply_oracle_labels(
                 "behavioral_subset_gold_margin": row.get("selected_subset_gold_margin"),
                 "behavioral_subset_size": row.get("selected_subset_size"),
                 "behavioral_candidate_labels": row.get("candidate_semantic_labels"),
+                "behavioral_subset_prediction": row.get("selected_subset_prediction"),
+                "behavioral_subset_confidence_gap": row.get(
+                    "selected_subset_confidence_gap"
+                ),
+                "behavioral_subset_entropy": row.get("selected_subset_entropy"),
+                "behavioral_subset_consensus_choice": row.get("subset_consensus_choice"),
+                "behavioral_subset_selection_uses_gold": row.get("gold_used_for_selection"),
             }
         _rank_scored_documents(documents)
     if len(used) != sum(len(value) for value in reranked_docs):

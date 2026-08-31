@@ -135,6 +135,9 @@ venv/
 !/scripts/prepare_rag2_target_llm_attribution.py
 !/scripts/train_rag2_target_llm_attribution.py
 !/scripts/run_rag2_target_llm_attribution_pilot.sh
+!/scripts/materialize_rag2_gold_free_subset_policies.py
+!/scripts/summarize_rag2_gold_free_subset_policies.py
+!/scripts/run_rag2_gold_free_subset_selector_top8.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
@@ -166,3 +169,4 @@ venv/
 !/tests/test_rag2_semantic_attention_controller_training.py
 !/tests/test_rag2_semantic_gate_fidelity.py
 !/tests/test_rag2_target_llm_attribution.py
+!/tests/test_rag2_gold_free_subset_policies.py

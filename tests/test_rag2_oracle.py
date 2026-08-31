@@ -413,6 +413,51 @@ class Rag2OracleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "policy mismatch"):
                 apply_oracle_labels(args, [sample()], [[document]])
 
+    def test_gold_free_subset_policy_uses_explicit_membership_without_gold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            labels_path = Path(directory) / "gold_free_labels.jsonl"
+            document = RetrievedDocument(
+                source="pubmed",
+                local_id=1,
+                db_id="doc-1",
+                corpus_id=None,
+                chunk_id=None,
+                doc_id=None,
+                title=None,
+                text="Evidence",
+                retrieval_score=1.0,
+                rerank_score=2.0,
+                rerank_rank=1,
+            )
+            labels_path.write_text(
+                json.dumps(
+                    {
+                        "sample_key": sample_key(sample()),
+                        "doc_rank": 1,
+                        "doc_stable_id": document.stable_id,
+                        "selection_policy": "gold_free_consensus_confidence",
+                        "selected": True,
+                        "selected_subset_size": 1,
+                        "selected_subset_prediction": "A",
+                        "selected_subset_confidence_gap": 2.5,
+                        "selected_subset_entropy": 0.2,
+                        "subset_consensus_choice": "A",
+                        "gold_used_for_selection": False,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = Namespace(
+                oracle_labels_path=labels_path,
+                oracle_policy="gold_free_consensus_confidence",
+            )
+            result = apply_oracle_labels(args, [sample()], [[document]])[0][0]
+            self.assertEqual(result.filter_prediction, "helpful")
+            metadata = result.metadata["oracle_filter"]
+            self.assertEqual(metadata["behavioral_subset_prediction"], "A")
+            self.assertFalse(metadata["behavioral_subset_selection_uses_gold"])
+
 
 if __name__ == "__main__":
     unittest.main()
