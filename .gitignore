@@ -132,12 +132,18 @@ venv/
 !/scripts/run_rag2_semantic_attention_controller_training.sh
 !/scripts/evaluate_rag2_semantic_gate_fidelity.py
 !/scripts/run_rag2_semantic_gate_fidelity_pilot.sh
+!/scripts/prepare_rag2_target_llm_attribution.py
+!/scripts/train_rag2_target_llm_attribution.py
+!/scripts/run_rag2_target_llm_attribution_pilot.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
 !/medrag/generation/learned_semantic_attention.py
 !/medrag/training/rag2_semantic_attention_data.py
 !/medrag/training/__init__.py
+!/medrag/attribution/
+!/medrag/attribution/__init__.py
+!/medrag/attribution/target_llm_predictor.py
 
 /tests/*
 !/tests/test_rag2_hidden_score_gold_margin.py
@@ -159,3 +165,4 @@ venv/
 !/tests/test_rag2_semantic_attention_data.py
 !/tests/test_rag2_semantic_attention_controller_training.py
 !/tests/test_rag2_semantic_gate_fidelity.py
+!/tests/test_rag2_target_llm_attribution.py
