@@ -48,7 +48,8 @@ from medrag.training.semantic_behavior_lora import (  # noqa: E402
 )
 
 
-RUN_VERSION = "rag2_semantic_behavior_single_document_lora_v1"
+RUN_VERSION = "rag2_semantic_behavior_single_document_lora_v2"
+ATTENTION_BACKEND_POLICY = "disable_cudnn_sdpa_keep_flash_efficient_math_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,6 +125,26 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def configure_attention_backend(attn_implementation: str) -> None:
+    """Avoid the H200 cuDNN SDPA planner failure for padded BF16 batches.
+
+    PyTorch can route ``scaled_dot_product_attention`` through cuDNN on H200.
+    Some left-padded, variable-length training shapes have no valid cuDNN
+    execution plan.  Disabling only that backend keeps Flash, memory-efficient,
+    and math SDPA fallbacks available, including during checkpoint recompute.
+    """
+
+    if attn_implementation != "sdpa" or not torch.cuda.is_available():
+        return
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
+    logging.info(
+        "SDPA backend policy: cuDNN disabled; Flash/Efficient/Math fallbacks enabled"
+    )
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -615,6 +636,7 @@ def main() -> None:
         "max_input_tokens": args.max_input_tokens,
         "dtype": args.dtype,
         "attn_implementation": args.attn_implementation,
+        "attention_backend_policy": ATTENTION_BACKEND_POLICY,
         "gradient_checkpointing": args.gradient_checkpointing,
         "seed": args.seed,
     }
@@ -639,6 +661,7 @@ def main() -> None:
         atomic_json(contract_path, {**contract, "contract_fingerprint": contract_hash})
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
+    configure_attention_backend(args.attn_implementation)
     tokenizer = AutoTokenizer.from_pretrained(
         str(args.model_name_or_path), local_files_only=True, use_fast=True, trust_remote_code=True
     )

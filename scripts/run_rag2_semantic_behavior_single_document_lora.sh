@@ -25,7 +25,9 @@ BASE="$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v
 PAIR_ROOT=${PAIR_ROOT:-"$BASE/semantic_behavior_single_document_pairs_${MODE}_v1"}
 MODEL_ROOT=${MODEL_ROOT:-/home/user/Uiheon/models/RAG2-SemanticBehavior-LoRA}
 LLAMA_MODEL=${LLAMA_MODEL:-/home/user/Uiheon/models/Llama-3-8B-Instruct}
-RUN_SUFFIX=${RUN_SUFFIX:-v1}
+# v1 could fail before its first optimizer step when PyTorch selected cuDNN
+# SDPA for a left-padded BF16 batch.  v2 records and uses the safe SDPA policy.
+RUN_SUFFIX=${RUN_SUFFIX:-v2}
 
 if [[ "${MODE}" == "pilot" ]]; then
   MAX_TRAIN_PAIRS=${MAX_TRAIN_PAIRS:-3000}
