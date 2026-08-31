@@ -320,6 +320,99 @@ class Rag2OracleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Invalid semantic oracle label"):
                 apply_oracle_labels(args, [sample()], [[document]])
 
+    def test_behavioral_subset_oracle_uses_explicit_selected_membership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            labels_path = Path(directory) / "subset_labels.jsonl"
+            documents = [
+                RetrievedDocument(
+                    source="pubmed",
+                    local_id=rank,
+                    db_id=stable_id,
+                    corpus_id=None,
+                    chunk_id=None,
+                    doc_id=None,
+                    title=None,
+                    text="Evidence",
+                    retrieval_score=1.0,
+                    rerank_score=2.0,
+                    rerank_rank=rank,
+                )
+                for rank, stable_id in enumerate(("selected", "rejected"), start=1)
+            ]
+            labels_path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "sample_key": sample_key(sample()),
+                            "doc_rank": rank,
+                            "doc_stable_id": document.stable_id,
+                            "selection_policy": "behavioral_best_semantic_candidates",
+                            "selected": rank == 1,
+                            "pseudo_label": "Helpful" if rank == 1 else "Not Helpful",
+                            "selected_subset_gold_margin": 1.25,
+                            "selected_subset_size": 1,
+                            "candidate_semantic_labels": [
+                                "direct_support",
+                                "supporting_evidence",
+                            ],
+                        }
+                    )
+                    + "\n"
+                    for rank, document in enumerate(documents, start=1)
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                oracle_labels_path=labels_path,
+                oracle_policy="behavioral_best_semantic_candidates",
+            )
+            result = apply_oracle_labels(args, [sample()], [[*documents]])[0]
+            self.assertEqual(
+                [document.filter_prediction for document in result],
+                ["helpful", "not helpful"],
+            )
+            self.assertIsNone(result[0].filter_score)
+            self.assertEqual(
+                result[0].metadata["oracle_filter"]["behavioral_subset_gold_margin"],
+                1.25,
+            )
+
+    def test_behavioral_subset_oracle_rejects_policy_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            labels_path = Path(directory) / "subset_labels.jsonl"
+            document = RetrievedDocument(
+                source="pubmed",
+                local_id=1,
+                db_id="doc-1",
+                corpus_id=None,
+                chunk_id=None,
+                doc_id=None,
+                title=None,
+                text="Evidence",
+                retrieval_score=1.0,
+                rerank_score=2.0,
+                rerank_rank=1,
+            )
+            labels_path.write_text(
+                json.dumps(
+                    {
+                        "sample_key": sample_key(sample()),
+                        "doc_rank": 1,
+                        "doc_stable_id": document.stable_id,
+                        "selection_policy": "behavioral_best_direct",
+                        "selected": True,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = Namespace(
+                oracle_labels_path=labels_path,
+                oracle_policy="behavioral_best_semantic_candidates",
+            )
+            with self.assertRaisesRegex(ValueError, "policy mismatch"):
+                apply_oracle_labels(args, [sample()], [[document]])
+
 
 if __name__ == "__main__":
     unittest.main()

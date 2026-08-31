@@ -190,6 +190,8 @@ def parse_args() -> argparse.Namespace:
             "margin_utility",
             "semantic_direct",
             "semantic_direct_supporting",
+            "behavioral_best_direct",
+            "behavioral_best_semantic_candidates",
         ],
         default=None,
         help="Label/score field to materialize as Helpful for --case oracle_rag.",
@@ -3681,6 +3683,27 @@ def apply_oracle_labels(
                 # class, not P(Helpful). Keep it in metadata instead of
                 # misrepresenting it as a signed/continuous filter score.
                 score = None
+            elif args.oracle_policy in {
+                "behavioral_best_direct",
+                "behavioral_best_semantic_candidates",
+            }:
+                expected_selection_policy = args.oracle_policy
+                actual_selection_policy = str(row.get("selection_policy") or "")
+                if actual_selection_policy != expected_selection_policy:
+                    raise ValueError(
+                        "Behavioral subset policy mismatch for "
+                        f"{key}: labels={actual_selection_policy!r} "
+                        f"requested={expected_selection_policy!r}"
+                    )
+                if not isinstance(row.get("selected"), bool):
+                    raise ValueError(
+                        f"Behavioral subset decision is not boolean for {key}: "
+                        f"{row.get('selected')!r}"
+                    )
+                helpful = bool(row["selected"])
+                # This margin belongs to the complete selected subset, not to
+                # an individual document.  Do not expose it as a document score.
+                score = None
             else:
                 threshold = 0.0 if args.oracle_policy == "hidden_tau_0" else 0.4
                 score = float(row["projection_score"])
@@ -3695,6 +3718,9 @@ def apply_oracle_labels(
                     if args.oracle_policy in {"rag2", "margin_utility"}
                     else row.get("semantic_label")
                     if args.oracle_policy in {"semantic_direct", "semantic_direct_supporting"}
+                    else row.get("pseudo_label")
+                    if args.oracle_policy
+                    in {"behavioral_best_direct", "behavioral_best_semantic_candidates"}
                     else row.get("hidden_label")
                 ),
                 "utility_score": row.get("utility_score"),
@@ -3703,6 +3729,10 @@ def apply_oracle_labels(
                 "semantic_label": row.get("semantic_label"),
                 "semantic_confidence": row.get("confidence"),
                 "semantic_topic_relation": row.get("topic_relation"),
+                "behavioral_subset_selected": row.get("selected"),
+                "behavioral_subset_gold_margin": row.get("selected_subset_gold_margin"),
+                "behavioral_subset_size": row.get("selected_subset_size"),
+                "behavioral_candidate_labels": row.get("candidate_semantic_labels"),
             }
         _rank_scored_documents(documents)
     if len(used) != sum(len(value) for value in reranked_docs):
