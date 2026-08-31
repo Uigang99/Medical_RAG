@@ -130,6 +130,8 @@ venv/
 !/scripts/prepare_rag2_semantic_attention_controller.py
 !/scripts/train_rag2_semantic_attention_controller.py
 !/scripts/run_rag2_semantic_attention_controller_training.sh
+!/scripts/evaluate_rag2_semantic_gate_fidelity.py
+!/scripts/run_rag2_semantic_gate_fidelity_pilot.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
@@ -156,3 +158,4 @@ venv/
 !/tests/test_rag2_learned_semantic_attention.py
 !/tests/test_rag2_semantic_attention_data.py
 !/tests/test_rag2_semantic_attention_controller_training.py
+!/tests/test_rag2_semantic_gate_fidelity.py

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -11,6 +12,99 @@ from transformers.models.llama.modeling_llama import repeat_kv
 
 
 ATTENTION_NAME = "rag2_semantic_eager"
+
+
+@dataclass
+class DocumentAttentionCollector:
+    """Accumulate document-span attention mass without retaining attention maps.
+
+    The collector is intentionally diagnostic.  It sums attention from marked
+    assistant query tokens to each mapped document span for selected batch
+    rows.  Per-layer tensors are only ``[selected_batch, documents]``; the
+    original ``[batch, heads, queries, keys]`` attention maps are never kept.
+    """
+
+    document_count: int
+    selected_batch_indices: tuple[int, ...] = (0,)
+    layer_document_mass: dict[int, torch.Tensor] = field(default_factory=dict)
+    layer_query_head_mass: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.document_count <= 0:
+            raise ValueError("document_count must be positive")
+        if not self.selected_batch_indices or any(index < 0 for index in self.selected_batch_indices):
+            raise ValueError("selected_batch_indices must contain non-negative indices")
+
+    def update(
+        self,
+        *,
+        layer_index: int,
+        attention_weights: torch.Tensor,
+        token_document_ids: torch.Tensor,
+        active_query_mask: torch.Tensor,
+    ) -> None:
+        """Accumulate one layer's post-softmax attention for selected rows."""
+
+        if attention_weights.ndim != 4:
+            raise ValueError("attention_weights must have shape [batch, heads, queries, keys]")
+        batch, heads, queries, keys = attention_weights.shape
+        if token_document_ids.shape != (batch, keys):
+            raise ValueError("token_document_ids must align with attention keys")
+        if active_query_mask.shape != (batch, queries):
+            raise ValueError("active_query_mask must align with attention queries")
+        if max(self.selected_batch_indices) >= batch:
+            raise ValueError("selected batch index is out of range")
+
+        rows = torch.tensor(
+            self.selected_batch_indices,
+            dtype=torch.long,
+            device=attention_weights.device,
+        )
+        weights = attention_weights.index_select(0, rows).float()
+        document_ids = token_document_ids.to(attention_weights.device).index_select(0, rows).long()
+        query_mask = active_query_mask.to(attention_weights.device).index_select(0, rows).float()
+        valid_document = (document_ids >= 0) & (document_ids < self.document_count)
+        safe_document_ids = document_ids.clamp(min=0, max=self.document_count - 1)
+        one_hot = torch.nn.functional.one_hot(
+            safe_document_ids,
+            num_classes=self.document_count,
+        ).float()
+        one_hot = one_hot * valid_document.unsqueeze(-1)
+        # Sum over heads, active assistant queries, and mapped document keys.
+        document_mass = torch.einsum("bhqk,bq,bkd->bd", weights, query_mask, one_hot)
+        query_head_mass = query_mask.sum(dim=1) * float(heads)
+        self.layer_document_mass[int(layer_index)] = document_mass.detach()
+        self.layer_query_head_mass[int(layer_index)] = query_head_mass.detach()
+
+    def summarize(self, *, layer_start: int | None = None) -> dict[str, torch.Tensor]:
+        """Return relative document shares and absolute document-attention mass."""
+
+        selected_layers = [
+            layer
+            for layer in sorted(self.layer_document_mass)
+            if layer_start is None or layer >= layer_start
+        ]
+        if not selected_layers:
+            batch = len(self.selected_batch_indices)
+            return {
+                "document_mass": torch.zeros((batch, self.document_count)),
+                "document_share": torch.zeros((batch, self.document_count)),
+                "document_attention_fraction": torch.zeros(batch),
+                "layers": torch.tensor([], dtype=torch.long),
+            }
+        mass = torch.stack([self.layer_document_mass[layer] for layer in selected_layers]).sum(dim=0)
+        possible = torch.stack(
+            [self.layer_query_head_mass[layer] for layer in selected_layers]
+        ).sum(dim=0)
+        total_document_mass = mass.sum(dim=1)
+        share = mass / total_document_mass.unsqueeze(1).clamp_min(1e-30)
+        fraction = total_document_mass / possible.clamp_min(1e-30)
+        return {
+            "document_mass": mass.cpu(),
+            "document_share": share.cpu(),
+            "document_attention_fraction": fraction.cpu(),
+            "layers": torch.tensor(selected_layers, dtype=torch.long),
+        }
 
 
 def suppression_bias(
@@ -88,6 +182,23 @@ def semantic_eager_attention_forward(
         attn_weights = attn_weights + semantic_bias
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    collector = kwargs.get("semantic_attention_collector")
+    document_ids = kwargs.get("semantic_token_document_ids")
+    if collector is not None:
+        if document_ids is None or query_mask is None:
+            raise ValueError(
+                "semantic attention collection requires token document IDs and query mask"
+            )
+        query_length = int(query.shape[-2])
+        key_length = int(key_states.shape[-2])
+        query_start = key_length - query_length
+        active_queries = query_mask[:, query_start:key_length]
+        collector.update(
+            layer_index=layer_index,
+            attention_weights=attn_weights,
+            token_document_ids=document_ids[:, :key_length],
+            active_query_mask=active_queries,
+        )
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()

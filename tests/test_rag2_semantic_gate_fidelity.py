@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import unittest
+
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+from medrag.generation.learned_semantic_attention import document_bias_to_token_bias
+from medrag.generation.semantic_attention import (
+    DocumentAttentionCollector,
+    register_semantic_attention,
+)
+from scripts.evaluate_rag2_semantic_gate_fidelity import (
+    build_physical_loo_batch,
+    jensen_shannon_divergence,
+    normalize_positive,
+    pearson_correlation,
+    rankdata,
+    spearman_correlation,
+)
+
+
+class SemanticGateFidelityTest(unittest.TestCase):
+    def test_physical_loo_removes_each_document_tokens(self) -> None:
+        batch = build_physical_loo_batch(
+            torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+            torch.tensor([-1, 0, 0, 1, 1, -1, -1]),
+            5,
+            pad_token_id=0,
+            attention_scope="rationale_wide",
+            document_count=2,
+        )
+        self.assertEqual(tuple(batch["input_ids"].shape), (3, 7))
+        self.assertEqual(batch["variant_lengths"].tolist(), [7, 5, 5])
+        self.assertFalse(bool(batch["token_document_ids"][1].eq(0).any()))
+        self.assertFalse(bool(batch["token_document_ids"][2].eq(1).any()))
+        self.assertEqual(int(batch["semantic_query_mask"][1].sum().item()), 2)
+        self.assertEqual(int(batch["semantic_query_mask"][2].sum().item()), 2)
+
+    def test_document_shares_sum_to_one(self) -> None:
+        normalized = normalize_positive([0.25, 0.5, 0.25])
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertAlmostEqual(sum(normalized), 1.0)
+        self.assertEqual(normalize_positive([0.0, 0.0], minimum_total=1e-6), None)
+
+    def test_correlations_and_tie_ranks(self) -> None:
+        self.assertEqual(rankdata([1.0, 1.0, 3.0]), [0.5, 0.5, 2.0])
+        self.assertAlmostEqual(pearson_correlation([1, 2, 3], [2, 4, 6]) or 0.0, 1.0)
+        self.assertAlmostEqual(spearman_correlation([1, 3, 2], [2, 6, 4]) or 0.0, 1.0)
+
+    def test_jsd_is_bounded_and_symmetric(self) -> None:
+        left = torch.tensor([0.9, 0.1])
+        right = torch.tensor([0.1, 0.9])
+        first = jensen_shannon_divergence(left, right)
+        second = jensen_shannon_divergence(right, left)
+        self.assertGreater(first, 0.0)
+        self.assertLessEqual(first, 1.0)
+        self.assertAlmostEqual(first, second)
+        self.assertAlmostEqual(jensen_shannon_divergence(left, left), 0.0)
+
+    def test_attention_collector_sums_document_spans(self) -> None:
+        collector = DocumentAttentionCollector(document_count=2)
+        weights = torch.tensor(
+            [[[[0.1, 0.3, 0.2, 0.4], [0.2, 0.2, 0.5, 0.1]]]],
+            dtype=torch.float32,
+        )
+        collector.update(
+            layer_index=3,
+            attention_weights=weights,
+            token_document_ids=torch.tensor([[-1, 0, 1, 1]]),
+            active_query_mask=torch.tensor([[0.0, 1.0]]),
+        )
+        summary = collector.summarize()
+        # Active second query: doc0=0.2, doc1=0.6, non-document=0.2.
+        self.assertTrue(
+            torch.allclose(summary["document_share"], torch.tensor([[0.25, 0.75]]))
+        )
+        self.assertTrue(
+            torch.allclose(summary["document_attention_fraction"], torch.tensor([0.8]))
+        )
+
+    def test_tiny_llama_collects_attention_during_loo_batch(self) -> None:
+        attention_name = register_semantic_attention()
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            pad_token_id=0,
+            attn_implementation=attention_name,
+        )
+        model = LlamaForCausalLM(config).eval()
+        batch = build_physical_loo_batch(
+            torch.tensor([1, 2, 3, 4, 5, 6]),
+            torch.tensor([-1, 0, 0, 1, -1, -1]),
+            4,
+            pad_token_id=0,
+            attention_scope="rationale_wide",
+            document_count=2,
+        )
+        document_bias = torch.tensor([[-0.1, -0.4]]).expand(3, -1)
+        token_bias = document_bias_to_token_bias(
+            document_bias,
+            batch["token_document_ids"],
+        )
+        collector = DocumentAttentionCollector(document_count=2)
+        with torch.inference_mode():
+            output = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                position_ids=batch["position_ids"],
+                logits_to_keep=1,
+                semantic_token_bias=token_bias,
+                semantic_query_mask=batch["semantic_query_mask"],
+                semantic_layer_start=0,
+                semantic_token_document_ids=batch["token_document_ids"],
+                semantic_attention_collector=collector,
+            )
+        self.assertEqual(tuple(output.logits.shape), (3, 1, 64))
+        summary = collector.summarize()
+        self.assertEqual(tuple(summary["document_share"].shape), (1, 2))
+        self.assertAlmostEqual(float(summary["document_share"].sum()), 1.0, places=5)
+
+
+if __name__ == "__main__":
+    unittest.main()
