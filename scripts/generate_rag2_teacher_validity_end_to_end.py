@@ -343,15 +343,28 @@ def main() -> None:
             if not valid_row(row_path(args.output_dir, sample_id), sample_id, fingerprint):
                 raise RuntimeError(f"Invalid regenerated teacher row: {sample_id}")
             progress.update(VARIANTS_PER_QUESTION)
-        atomic_write_json(
-            args.output_dir / "generation_manifest.json",
-            {
-                **run_contract,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "question_count": len(selected_ids),
-                "generation_count": total_units,
-            },
-        )
+        manifest_path = args.output_dir / "generation_manifest.json"
+        manifest_payload = {
+            **run_contract,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "question_count": len(selected_ids),
+            "generation_count": total_units,
+        }
+        preserve_manifest = False
+        if manifest_path.is_file():
+            try:
+                previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                preserve_manifest = (
+                    all(previous_manifest.get(key) == value for key, value in run_contract.items())
+                    and previous_manifest.get("question_count") == len(selected_ids)
+                    and previous_manifest.get("generation_count") == total_units
+                )
+            except (OSError, json.JSONDecodeError):
+                preserve_manifest = False
+        if preserve_manifest:
+            logging.info("Complete generation manifest is unchanged; preserving cache identity")
+        else:
+            atomic_write_json(manifest_path, manifest_payload)
         logging.info("Regenerated-rationale LOO teacher complete: %s", args.output_dir)
     finally:
         progress.close()

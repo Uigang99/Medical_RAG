@@ -825,7 +825,31 @@ def main() -> None:
     if contract_path.is_file() and args.resume:
         previous = json.loads(contract_path.read_text(encoding="utf-8"))
         if previous != run_contract:
-            raise RuntimeError("Teacher-validity resume contract mismatch; use a new output directory")
+            differing_keys = {
+                key
+                for key in set(previous) | set(run_contract)
+                if previous.get(key) != run_contract.get(key)
+            }
+            if differing_keys <= {
+                "end_to_end_manifest_sha256",
+                "contract_fingerprint",
+            }:
+                # Older generator versions rewrote only ``completed_at`` in an
+                # otherwise identical completed generation manifest.  That
+                # changed the file hash even though selected questions, row
+                # fingerprints, prompts, model, and all cached generations
+                # were unchanged.  Preserve the already materialized direct
+                # rows and their fingerprint in this narrowly scoped case.
+                logging.warning(
+                    "Accepting stable teacher-validity resume: only the completed "
+                    "generation-manifest file hash changed"
+                )
+                run_contract = previous
+                fingerprint = str(previous["contract_fingerprint"])
+            else:
+                raise RuntimeError(
+                    "Teacher-validity resume contract mismatch; use a new output directory"
+                )
     else:
         atomic_write_json(contract_path, run_contract)
 
