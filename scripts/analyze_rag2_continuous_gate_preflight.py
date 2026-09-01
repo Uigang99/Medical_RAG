@@ -527,6 +527,44 @@ def load_trace_rows(path: Path) -> list[dict[str, Any]]:
     return list(iter_jsonl(path))
 
 
+def locate_trace_rows(
+    root: Path,
+    dataset: str,
+    split: str,
+    row_idx: int,
+    sample_id: str,
+    *,
+    questions_per_shard: int,
+    filename: str,
+    neighbor_radius: int,
+) -> list[dict[str, Any]]:
+    """Locate a sample even when excluded source rows shift compact shards.
+
+    MedMCQA's candidate generation excluded four malformed questions.  The
+    document-trace shards therefore follow compact candidate order rather than
+    raw ``row_idx // questions_per_shard`` exactly.  Searching adjacent shards
+    preserves the original trace cache and avoids regenerating rationales.
+    """
+
+    predicted = row_idx // questions_per_shard
+    offsets = [0]
+    for distance in range(1, neighbor_radius + 1):
+        offsets.extend((-distance, distance))
+    matches: list[dict[str, Any]] = []
+    for offset in offsets:
+        shard_index = predicted + offset
+        if shard_index < 0:
+            continue
+        path = root / dataset / split / f"shard_{shard_index:05d}" / filename
+        if not path.is_file():
+            continue
+        local = [row for row in load_trace_rows(path) if str(row.get("sample_id")) == sample_id]
+        if local:
+            matches.extend(local)
+            break
+    return matches
+
+
 def analyze_answer_modes(
     args: argparse.Namespace,
     dataset: str,
@@ -549,24 +587,26 @@ def analyze_answer_modes(
     for row in cohort:
         sample_id = str(row["sample_id"])
         row_idx = int(row["row_idx"])
-        no_rag_shard_index = row_idx // 256
-        document_shard_index = row_idx // 128
-        no_rag_path = (
-            args.no_rag_trace_root
-            / dataset
-            / args.source_split
-            / f"shard_{no_rag_shard_index:05d}"
-            / "questions.jsonl"
+        no_rag_matches = locate_trace_rows(
+            args.no_rag_trace_root,
+            dataset,
+            args.source_split,
+            row_idx,
+            sample_id,
+            questions_per_shard=256,
+            filename="questions.jsonl",
+            neighbor_radius=0,
         )
-        document_path = (
-            args.document_trace_root
-            / dataset
-            / args.source_split
-            / f"shard_{document_shard_index:05d}"
-            / "pairs.jsonl"
+        document_matches = locate_trace_rows(
+            args.document_trace_root,
+            dataset,
+            args.source_split,
+            row_idx,
+            sample_id,
+            questions_per_shard=128,
+            filename="pairs.jsonl",
+            neighbor_radius=2,
         )
-        no_rag_matches = [trace for trace in load_trace_rows(no_rag_path) if str(trace["sample_id"]) == sample_id]
-        document_matches = [trace for trace in load_trace_rows(document_path) if str(trace["sample_id"]) == sample_id]
         if len(no_rag_matches) != 1:
             raise RuntimeError(f"Expected one no-RAG trace for {sample_id}, got {len(no_rag_matches)}")
         no_trace = no_rag_matches[0]
