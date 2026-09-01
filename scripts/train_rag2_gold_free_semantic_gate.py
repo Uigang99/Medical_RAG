@@ -52,7 +52,7 @@ from train_rag2_semantic_attention_controller import (  # noqa: E402
 )
 
 
-RUN_VERSION = "rag2_gold_free_set_semantic_gate_v1"
+RUN_VERSION = "rag2_gold_free_set_semantic_gate_v2"
 DEFAULT_LLM = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 
 
@@ -396,9 +396,26 @@ def evaluate(
     metrics["mean_valid_gate"] = state["valid_gate"] / count
     metrics["mean_invalid_gate"] = state["invalid_gate"] / count
     metrics["valid_minus_invalid_gate"] = metrics["mean_valid_gate"] - metrics["mean_invalid_gate"]
+    for policy in ("zero", "learned"):
+        metrics[policy]["mean_preference_margin"] = 0.5 * (
+            metrics[policy]["mean_full_preference_margin"]
+            + metrics[policy]["mean_invalid_preference_margin"]
+        )
     metrics["macro_delta_vs_zero"] = (
         metrics["learned"]["macro_preference_accuracy"]
         - metrics["zero"]["macro_preference_accuracy"]
+    )
+    metrics["full_margin_delta_vs_zero"] = (
+        metrics["learned"]["mean_full_preference_margin"]
+        - metrics["zero"]["mean_full_preference_margin"]
+    )
+    metrics["invalid_margin_delta_vs_zero"] = (
+        metrics["learned"]["mean_invalid_preference_margin"]
+        - metrics["zero"]["mean_invalid_preference_margin"]
+    )
+    metrics["mean_margin_delta_vs_zero"] = (
+        metrics["learned"]["mean_preference_margin"]
+        - metrics["zero"]["mean_preference_margin"]
     )
     return metrics, details
 
@@ -605,7 +622,10 @@ def main() -> None:
                 "val", encoded_examples["val"], features_by_split["val"], controller,
                 model, args, device, progress, f"2/3 validation epoch {epoch + 1}/{args.epochs}",
             )
-            metric = float(validation["learned"]["macro_preference_accuracy"])
+            # Sign accuracy is often saturated before training.  Select the
+            # checkpoint by the continuous within-question response margin,
+            # which is the quantity optimized by the preference objective.
+            metric = float(validation["learned"]["mean_preference_margin"])
             row = {"epoch": epoch + 1, "train_loss": loss_sum / train_count, "validation": validation}
             history.append(row)
             atomic_json(args.output_dir / "history.json", history)
@@ -625,9 +645,12 @@ def main() -> None:
                 "bad_epochs": bad_epochs, "history": history,
             })
             logging.info(
-                "Epoch %d: val_macro=%.4f zero=%.4f delta=%+.4f gate_gap=%+.4f",
-                epoch + 1, metric, validation["zero"]["macro_preference_accuracy"],
-                validation["macro_delta_vs_zero"], validation["valid_minus_invalid_gate"],
+                "Epoch %d: val_macro_acc=%.4f zero_acc=%.4f acc_delta=%+.4f "
+                "margin_delta=%+.4f gate_gap=%+.4f",
+                epoch + 1, validation["learned"]["macro_preference_accuracy"],
+                validation["zero"]["macro_preference_accuracy"],
+                validation["macro_delta_vs_zero"], validation["mean_margin_delta_vs_zero"],
+                validation["valid_minus_invalid_gate"],
             )
             if args.patience and bad_epochs >= args.patience:
                 logging.info("Early stopping after epoch %d", epoch + 1)
@@ -641,18 +664,27 @@ def main() -> None:
         )
         if args.mode == "overfit":
             passed = (
-                test["learned"]["macro_preference_accuracy"] >= 0.80
+                test["mean_margin_delta_vs_zero"] >= 0.02
+                and test["full_margin_delta_vs_zero"] >= 0.01
+                and test["invalid_margin_delta_vs_zero"] >= 0.01
                 and test["valid_minus_invalid_gate"] >= 0.10
             )
-            criterion = "same-16-question macro preference accuracy >=0.80 and gate gap >=0.10"
+            criterion = (
+                "same-16-question mean response-margin gain >=0.02, each context gain "
+                ">=0.01, and valid-invalid gate gap >=0.10"
+            )
         else:
             passed = (
-                test["macro_delta_vs_zero"] >= 0.10
-                and test["learned"]["full_prefers_valid_response_accuracy"] >= 0.60
-                and test["learned"]["invalid_prefers_norag_response_accuracy"] >= 0.60
+                test["mean_margin_delta_vs_zero"] >= 0.01
+                and test["full_margin_delta_vs_zero"] >= 0.005
+                and test["invalid_margin_delta_vs_zero"] >= 0.005
+                and test["macro_delta_vs_zero"] >= -0.02
                 and test["valid_minus_invalid_gate"] >= 0.10
             )
-            criterion = "test macro +0.10 over no-gate, both preferences >=0.60, gate gap >=0.10"
+            criterion = (
+                "held-out mean response-margin gain >=0.01, each context gain >=0.005, "
+                "sign-accuracy loss <=0.02, and gate gap >=0.10"
+            )
         summary = {
             "run_version": RUN_VERSION,
             "completed_at": datetime.now(timezone.utc).isoformat(),

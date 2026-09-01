@@ -10,9 +10,9 @@ INDEX_PATH=${INDEX_PATH:-${ROOT}/datasets/filtering/rag2/llama3_8b_paper_compati
 RUN_ROOT=${RUN_ROOT:-${ROOT}/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1/gold_free_semantic_gate_pilot_v1}
 MODEL_ROOT=${MODEL_ROOT:-/home/user/Uiheon/models/RAG2-Gold-Free-Semantic-Gate/medqa}
 TEACHER_DIR=${RUN_ROOT}/teachers
-OVERFIT_DIR=${MODEL_ROOT}/medqa_top8_gold_free_overfit16_v1
-PILOT_DIR=${MODEL_ROOT}/medqa_top8_gold_free_pilot256_v1
-EVAL_DIR=${RUN_ROOT}/free_generation_eval128
+OVERFIT_DIR=${MODEL_ROOT}/medqa_top8_gold_free_overfit16_v2
+PILOT_DIR=${MODEL_ROOT}/medqa_top8_gold_free_pilot256_v2
+EVAL_DIR=${RUN_ROOT}/free_generation_eval128_v2
 TRAIN_QUESTIONS=${TRAIN_QUESTIONS:-256}
 VAL_QUESTIONS=${VAL_QUESTIONS:-128}
 TEST_QUESTIONS=${TEST_QUESTIONS:-128}
@@ -80,7 +80,9 @@ import json, sys
 from pathlib import Path
 path = Path(sys.argv[1])
 summary = json.loads(path.read_text())
-print(f"Overfit result: passed={summary[\"passed\"]} criterion={summary[\"success_criterion\"]}")
+print("Overfit result: passed={} criterion={}".format(
+    summary["passed"], summary["success_criterion"]
+))
 if not summary["passed"]:
     raise SystemExit("STOP: target/actuator did not pass tiny-set learnability; pilot was not launched")
 ' "${OVERFIT_DIR}/summary.json"
