@@ -19,6 +19,11 @@ from scripts.evaluate_rag2_all_layer_document_mask_contract import (
     choice_logits_for_exact_document_masks,
     choice_logits_for_plain_batch,
 )
+from scripts.evaluate_rag2_all_layer_continuous_gate_contract import (
+    canonical_factors,
+    decreasing_distance_metrics,
+    trajectory_metrics,
+)
 from scripts.evaluate_rag2_semantic_gate_fidelity import (
     build_physical_loo_batch,
     evaluate_one,
@@ -31,6 +36,39 @@ from scripts.evaluate_rag2_semantic_gate_fidelity import (
 
 
 class SemanticGateFidelityTest(unittest.TestCase):
+    def test_continuous_gate_trajectory_metrics_detect_monotonic_path(self) -> None:
+        factors = canonical_factors([0.25, 1.0, 0.0, 0.75, 0.5])
+        result = trajectory_metrics(
+            [0.8, 0.7, 0.6, 0.5, 0.4],
+            0.4,
+            factors,
+            tolerance=1e-8,
+        )
+        self.assertTrue(result["strictly_monotonic_with_tolerance"])
+        self.assertAlmostEqual(result["normalized_progress"][2], 0.5)
+        self.assertAlmostEqual(result["suppression_progress_spearman"] or 0.0, 1.0)
+
+    def test_continuous_gate_metrics_reject_backtracking_path(self) -> None:
+        factors = [1.0, 0.75, 0.5, 0.25, 0.0]
+        result = trajectory_metrics(
+            [0.8, 0.7, 0.76, 0.5, 0.4],
+            0.4,
+            factors,
+            tolerance=1e-8,
+        )
+        self.assertFalse(result["strictly_monotonic_with_tolerance"])
+        distributions = [
+            torch.tensor(value, dtype=torch.float32)
+            for value in ([0.8, 0.2], [0.7, 0.3], [0.76, 0.24], [0.5, 0.5], [0.4, 0.6])
+        ]
+        distance = decreasing_distance_metrics(
+            distributions,
+            torch.tensor([0.4, 0.6]),
+            factors,
+            tolerance=1e-8,
+        )
+        self.assertFalse(distance["strictly_monotonic_with_tolerance"])
+
     def test_physical_loo_removes_each_document_tokens(self) -> None:
         batch = build_physical_loo_batch(
             torch.tensor([1, 2, 3, 4, 5, 6, 7]),
