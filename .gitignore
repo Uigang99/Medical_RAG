@@ -138,6 +138,9 @@ venv/
 !/scripts/materialize_rag2_gold_free_subset_policies.py
 !/scripts/summarize_rag2_gold_free_subset_policies.py
 !/scripts/run_rag2_gold_free_subset_selector_top8.sh
+!/scripts/materialize_rag2_semantic_subset_plan.py
+!/scripts/generate_rag2_anchored_semantic_subset_traces.py
+!/scripts/run_rag2_anchored_semantic_subset_rationale_generation.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
@@ -170,3 +173,4 @@ venv/
 !/tests/test_rag2_semantic_gate_fidelity.py
 !/tests/test_rag2_target_llm_attribution.py
 !/tests/test_rag2_gold_free_subset_policies.py
+!/tests/test_rag2_semantic_subset_traces.py
