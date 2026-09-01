@@ -248,7 +248,11 @@ def main() -> None:
         generation_batch_size=args.generation_batch_size,
     )
     resources = init_llm(generation_args) if completed_count < total else None
-    progress = PipelineProgress(total, completed_count, desc=f"GoldFreeTeachers:{args.dataset}")
+    progress = PipelineProgress(
+        overall_total=total,
+        overall_initial=completed_count,
+        desc=f"GoldFreeTeachers:{args.dataset}",
+    )
     try:
         progress.set_stage("1/1 valid-only frozen-Llama response generation", total=total, initial=completed_count)
         for split, rows in questions_by_split.items():

@@ -546,7 +546,11 @@ def main() -> None:
 
     train_count, val_count, test_count = (len(encoded_examples[s]) for s in ("train", "val", "test"))
     total = args.epochs * (train_count + val_count) + test_count
-    progress = PipelineProgress(total, start_epoch * (train_count + val_count), desc=f"GoldFreeGate:{args.dataset}:{args.mode}")
+    progress = PipelineProgress(
+        overall_total=total,
+        overall_initial=start_epoch * (train_count + val_count),
+        desc=f"GoldFreeGate:{args.dataset}:{args.mode}",
+    )
     try:
         for epoch in range(start_epoch, args.epochs):
             controller.train()

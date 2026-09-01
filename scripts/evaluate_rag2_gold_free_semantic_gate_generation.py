@@ -211,7 +211,11 @@ def main() -> None:
     cached = {policy: existing(path) if args.resume else {} for policy, path in outputs.items()}
     total = args.test_questions * 2
     completed = sum(len(rows) for rows in cached.values())
-    progress = PipelineProgress(total, completed, desc=f"GoldFreeGateGeneration:{args.dataset}")
+    progress = PipelineProgress(
+        overall_total=total,
+        overall_initial=completed,
+        desc=f"GoldFreeGateGeneration:{args.dataset}",
+    )
     try:
         for policy_index, policy in enumerate(contract["policies"], start=1):
             progress.set_stage(
