@@ -210,6 +210,14 @@ def semantic_eager_attention_forward(
     ``semantic_query_mask`` marks assistant rationale/answer query positions.
     Both tensors may include reserved future positions for cached generation.
     The bias is only active from ``semantic_layer_start`` onward.
+
+    ``semantic_blocked_document_ids`` is a separate, exact intervention used
+    by mechanism audits.  For every batch row it identifies one document whose
+    mapped key/value positions are masked for *all* queries from
+    ``semantic_document_block_layer_start`` onward.  Setting that start to zero
+    prevents the document from exporting information through attention at any
+    layer; unlike the soft semantic bias, it is not restricted to assistant
+    queries and uses a true ``-inf`` mask before softmax.
     """
 
     key_states = repeat_kv(key, module.num_key_value_groups)
@@ -247,9 +255,33 @@ def semantic_eager_attention_forward(
         semantic_bias = active_queries[:, None, :, None] * active_keys[:, None, None, :]
         attn_weights = attn_weights + semantic_bias
 
+    blocked_document_ids = kwargs.get("semantic_blocked_document_ids")
+    document_ids = kwargs.get("semantic_token_document_ids")
+    block_layer_start = int(kwargs.get("semantic_document_block_layer_start", 0))
+    if blocked_document_ids is not None and layer_index >= block_layer_start:
+        if document_ids is None:
+            raise ValueError(
+                "semantic_blocked_document_ids requires semantic_token_document_ids"
+            )
+        if blocked_document_ids.ndim != 1 or blocked_document_ids.shape[0] != query.shape[0]:
+            raise ValueError("semantic_blocked_document_ids must have shape [batch]")
+        key_length = int(key_states.shape[-2])
+        if document_ids.ndim != 2 or document_ids.shape[0] != query.shape[0]:
+            raise ValueError("semantic_token_document_ids must have shape [batch, sequence]")
+        if document_ids.shape[1] < key_length:
+            raise ValueError("semantic_token_document_ids is shorter than the current KV cache")
+        blocked_keys = document_ids[:, :key_length].to(attn_weights.device).eq(
+            blocked_document_ids.to(attn_weights.device).unsqueeze(1)
+        )
+        if bool(blocked_keys.all(dim=1).any()):
+            raise ValueError("Exact document mask cannot block every attention key")
+        attn_weights = attn_weights.masked_fill(
+            blocked_keys[:, None, None, :],
+            float("-inf"),
+        )
+
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     collector = kwargs.get("semantic_attention_collector")
-    document_ids = kwargs.get("semantic_token_document_ids")
     if collector is not None:
         if document_ids is None or query_mask is None:
             raise ValueError(

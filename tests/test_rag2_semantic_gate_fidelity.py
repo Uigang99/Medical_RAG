@@ -14,6 +14,11 @@ from medrag.generation.semantic_attention import (
     DocumentAttentionCollector,
     register_semantic_attention,
 )
+from scripts.evaluate_rag2_all_layer_document_mask_contract import (
+    build_exact_document_mask_batch,
+    choice_logits_for_exact_document_masks,
+    choice_logits_for_plain_batch,
+)
 from scripts.evaluate_rag2_semantic_gate_fidelity import (
     build_physical_loo_batch,
     evaluate_one,
@@ -41,6 +46,63 @@ class SemanticGateFidelityTest(unittest.TestCase):
         self.assertFalse(bool(batch["token_document_ids"][2].eq(1).any()))
         self.assertEqual(int(batch["semantic_query_mask"][1].sum().item()), 2)
         self.assertEqual(int(batch["semantic_query_mask"][2].sum().item()), 2)
+
+    def test_compact_exact_mask_matches_physical_deletion_on_tiny_llama(self) -> None:
+        attention_name = register_semantic_attention()
+        torch.manual_seed(17)
+        model = LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+                pad_token_id=0,
+                attention_dropout=0.0,
+                attn_implementation=attention_name,
+            )
+        ).eval()
+        input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7], dtype=torch.long)
+        mapping = torch.tensor([-1, 0, 0, 1, 1, -1, -1], dtype=torch.long)
+        physical = build_physical_loo_batch(
+            input_ids,
+            mapping,
+            5,
+            pad_token_id=0,
+            attention_scope="rationale_wide",
+            document_count=2,
+        )
+        choices = torch.tensor([10, 11, 12, 13], dtype=torch.long)
+        physical_logits = choice_logits_for_plain_batch(
+            model,
+            physical,
+            choices,
+            torch.device("cpu"),
+        )
+        masked_logits = choice_logits_for_exact_document_masks(
+            model,
+            input_ids,
+            mapping,
+            choices,
+            compact_positions=True,
+            document_count=2,
+            device=torch.device("cpu"),
+        )
+        torch.testing.assert_close(masked_logits[0], physical_logits[1], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(masked_logits[1], physical_logits[2], atol=1e-5, rtol=1e-5)
+
+    def test_exact_mask_compacts_only_kept_token_positions(self) -> None:
+        batch = build_exact_document_mask_batch(
+            torch.tensor([1, 2, 3, 4, 5, 6]),
+            torch.tensor([-1, 0, 0, 1, -1, -1]),
+            compact_positions=True,
+            document_count=2,
+        )
+        self.assertEqual(batch["blocked_document_ids"].tolist(), [0, 1])
+        self.assertEqual(batch["position_ids"][0].tolist(), [0, 0, 0, 1, 2, 3])
+        self.assertEqual(batch["position_ids"][1].tolist(), [0, 1, 2, 2, 3, 4])
 
     def test_document_shares_sum_to_one(self) -> None:
         normalized = normalize_positive([0.25, 0.5, 0.25])
