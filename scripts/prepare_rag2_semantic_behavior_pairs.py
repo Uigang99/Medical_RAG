@@ -33,6 +33,7 @@ from medrag.progress import PipelineProgress  # noqa: E402
 from medrag.training.semantic_behavior_lora import (  # noqa: E402
     choose_semantic_behavior_pair,
     jensen_shannon_divergence,
+    natural_pair_limit,
     stratified_pair_limit,
 )
 
@@ -73,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-pairs", type=int, default=3000)
     parser.add_argument("--max-eval-pairs", type=int, default=1000)
     parser.add_argument("--hard-fraction", type=float, default=0.7)
+    parser.add_argument(
+        "--train-selection",
+        choices=("natural", "stratified"),
+        default="stratified",
+        help="Natural keeps every eligible question distribution; stratified reproduces the original hard-pair pilot.",
+    )
     parser.add_argument("--violation-threshold", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -364,6 +371,7 @@ def main() -> None:
         "max_train_pairs": args.max_train_pairs,
         "max_eval_pairs": args.max_eval_pairs,
         "hard_fraction": args.hard_fraction,
+        "train_selection": args.train_selection,
         "violation_threshold": args.violation_threshold,
         "seed": args.seed,
     }
@@ -410,7 +418,7 @@ def main() -> None:
             selected[split] = sorted(
                 candidates[split], key=lambda row: str(row["sample_id"])
             )
-        elif split == "train":
+        elif split == "train" and args.train_selection == "stratified":
             split_hard_fraction = args.hard_fraction
             selected[split] = stratified_pair_limit(
                 candidates[split],
@@ -418,21 +426,20 @@ def main() -> None:
                 hard_fraction=split_hard_fraction,
                 seed=rng_seed,
             )
+        elif split == "train":
+            selected[split] = natural_pair_limit(
+                candidates[split], limit=limit, seed=rng_seed
+            )
         else:
-            hard_count = sum(
-                str(row["pair_group"]) == "hard" for row in candidates[split]
-            )
-            split_hard_fraction = (
-                hard_count / len(candidates[split]) if candidates[split] else 0.0
-            )
-            selected[split] = stratified_pair_limit(
-                candidates[split],
-                limit=limit,
-                hard_fraction=split_hard_fraction,
-                seed=rng_seed,
+            selected[split] = natural_pair_limit(
+                candidates[split], limit=limit, seed=rng_seed
             )
         requested = len(candidates[split]) if limit <= 0 else min(limit, len(candidates[split]))
-        if split == "train" and len(selected[split]) < requested:
+        if (
+            split == "train"
+            and args.train_selection == "stratified"
+            and len(selected[split]) < requested
+        ):
             logging.warning(
                 "Selected %d/%d %s pairs because the requested %.2f hard fraction "
                 "is limited by available hard/aligned questions",

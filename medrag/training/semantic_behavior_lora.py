@@ -155,6 +155,18 @@ def stratified_pair_limit(
     return selected
 
 
+def natural_pair_limit(
+    rows: Sequence[dict[str, Any]], *, limit: int | None, seed: int
+) -> list[dict[str, Any]]:
+    """Deterministically sample questions without changing group prevalence."""
+
+    values = list(rows)
+    random.Random(seed).shuffle(values)
+    if limit is None or limit <= 0 or limit >= len(values):
+        return values
+    return values[:limit]
+
+
 def gold_margins(choice_logits: torch.Tensor, gold_indices: torch.Tensor) -> torch.Tensor:
     """Gold logit minus the strongest non-gold logit for four-choice MCQ."""
 
@@ -180,6 +192,8 @@ def semantic_behavior_losses(
     preference_weight: float,
     negative_invariance_weight: float,
     no_rag_preservation_weight: float,
+    negative_reference_probabilities: torch.Tensor | None = None,
+    detach_negative_margin: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Single-document semantic-behavior LoRA objective.
 
@@ -187,18 +201,34 @@ def semantic_behavior_losses(
     the three student branches receive gradients.
     """
 
-    teacher = frozen_no_rag_probabilities.detach().to(dtype=torch.float32)
-    teacher = teacher.clamp_min(1e-8)
-    teacher = teacher / teacher.sum(dim=1, keepdim=True)
+    frozen_teacher = frozen_no_rag_probabilities.detach().to(dtype=torch.float32)
+    frozen_teacher = frozen_teacher.clamp_min(1e-8)
+    frozen_teacher = frozen_teacher / frozen_teacher.sum(dim=1, keepdim=True)
+    negative_teacher = (
+        frozen_teacher
+        if negative_reference_probabilities is None
+        else negative_reference_probabilities.detach().to(dtype=torch.float32)
+    )
+    negative_teacher = negative_teacher.clamp_min(1e-8)
+    negative_teacher = negative_teacher / negative_teacher.sum(dim=1, keepdim=True)
     positive_ce = F.cross_entropy(positive_logits.float(), gold_indices)
     positive_margin = gold_margins(positive_logits.float(), gold_indices)
     negative_margin = gold_margins(negative_logits.float(), gold_indices)
-    preference = F.relu(float(preference_margin) - (positive_margin - negative_margin)).mean()
+    preference_reference = (
+        negative_margin.detach() if detach_negative_margin else negative_margin
+    )
+    preference = F.relu(
+        float(preference_margin) - (positive_margin - preference_reference)
+    ).mean()
     negative_invariance = F.kl_div(
-        F.log_softmax(negative_logits.float(), dim=-1), teacher, reduction="batchmean"
+        F.log_softmax(negative_logits.float(), dim=-1),
+        negative_teacher,
+        reduction="batchmean",
     )
     no_rag_preservation = F.kl_div(
-        F.log_softmax(no_rag_logits.float(), dim=-1), teacher, reduction="batchmean"
+        F.log_softmax(no_rag_logits.float(), dim=-1),
+        frozen_teacher,
+        reduction="batchmean",
     )
     total = (
         float(positive_weight) * positive_ce

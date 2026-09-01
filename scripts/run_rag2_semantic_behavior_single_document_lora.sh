@@ -11,13 +11,14 @@ if [[ "${DATASET}" != "medqa" && "${DATASET}" != "medmcqa" ]]; then
   echo "dataset must be medqa or medmcqa" >&2
   exit 2
 fi
-if [[ "${MODE}" != "pilot" && "${MODE}" != "full" ]]; then
-  echo "mode must be pilot or full" >&2
+if [[ "${MODE}" != "pilot" && "${MODE}" != "scaled" && "${MODE}" != "full" ]]; then
+  echo "mode must be pilot, scaled, or full" >&2
   exit 2
 fi
-if [[ "${OBJECTIVE}" != "all" && "${OBJECTIVE}" != "proposed" && \
+if [[ "${OBJECTIVE}" != "all" && "${OBJECTIVE}" != "compare" && \
+      "${OBJECTIVE}" != "proposed_preserved" && "${OBJECTIVE}" != "proposed" && \
       "${OBJECTIVE}" != "question_only" && "${OBJECTIVE}" != "rag_ce" ]]; then
-  echo "objective must be all, proposed, question_only, or rag_ce" >&2
+  echo "objective must be all, compare, proposed_preserved, proposed, question_only, or rag_ce" >&2
   exit 2
 fi
 
@@ -27,13 +28,25 @@ MODEL_ROOT=${MODEL_ROOT:-/home/user/Uiheon/models/RAG2-SemanticBehavior-LoRA}
 LLAMA_MODEL=${LLAMA_MODEL:-/home/user/Uiheon/models/Llama-3-8B-Instruct}
 # v1 could fail before its first optimizer step when PyTorch selected cuDNN
 # SDPA for a left-padded BF16 batch.  v2 records and uses the safe SDPA policy.
-RUN_SUFFIX=${RUN_SUFFIX:-v2}
+RUN_SUFFIX=${RUN_SUFFIX:-v3}
 
 if [[ "${MODE}" == "pilot" ]]; then
   MAX_TRAIN_PAIRS=${MAX_TRAIN_PAIRS:-3000}
   MAX_EVAL_PAIRS=${MAX_EVAL_PAIRS:-1000}
   EPOCHS=${EPOCHS:-3}
+  TRAIN_SELECTION=${TRAIN_SELECTION:-stratified}
+elif [[ "${MODE}" == "scaled" ]]; then
+  TRAIN_SELECTION=${TRAIN_SELECTION:-natural}
+  EPOCHS=${EPOCHS:-3}
+  if [[ "${DATASET}" == "medqa" ]]; then
+    MAX_TRAIN_PAIRS=${MAX_TRAIN_PAIRS:-0}
+    MAX_EVAL_PAIRS=${MAX_EVAL_PAIRS:-0}
+  else
+    MAX_TRAIN_PAIRS=${MAX_TRAIN_PAIRS:-5000}
+    MAX_EVAL_PAIRS=${MAX_EVAL_PAIRS:-1000}
+  fi
 else
+  TRAIN_SELECTION=${TRAIN_SELECTION:-natural}
   MAX_TRAIN_PAIRS=${MAX_TRAIN_PAIRS:-0}
   MAX_EVAL_PAIRS=${MAX_EVAL_PAIRS:-0}
   if [[ "${DATASET}" == "medqa" ]]; then
@@ -59,7 +72,9 @@ announce_stage() {
 }
 
 if [[ "${OBJECTIVE}" == "all" ]]; then
-  OBJECTIVES=(question_only rag_ce proposed)
+  OBJECTIVES=(question_only rag_ce proposed proposed_preserved)
+elif [[ "${OBJECTIVE}" == "compare" ]]; then
+  OBJECTIVES=(proposed proposed_preserved)
 else
   OBJECTIVES=("${OBJECTIVE}")
 fi
@@ -72,6 +87,7 @@ announce_stage 1 "$TOTAL_STAGES" "prepare same-question D+ / D- single-document 
   --max-train-pairs "$MAX_TRAIN_PAIRS" \
   --max-eval-pairs "$MAX_EVAL_PAIRS" \
   --hard-fraction "${HARD_FRACTION:-0.70}" \
+  --train-selection "$TRAIN_SELECTION" \
   --violation-threshold "${VIOLATION_THRESHOLD:-0.0}" \
   --seed "${SEED:-42}" \
   --resume
@@ -81,6 +97,13 @@ for current_objective in "${OBJECTIVES[@]}"; do
   announce_stage "$stage" "$TOTAL_STAGES" \
     "LoRA train objective=${current_objective} (single document per forward)"
   run_name="${DATASET}_${MODE}_semantic_behavior_${current_objective}_${RUN_SUFFIX}"
+  if [[ "$current_objective" == "proposed_preserved" ]]; then
+    current_negative_weight=${PRESERVED_NEGATIVE_INVARIANCE_WEIGHT:-1.0}
+    current_no_rag_weight=${PRESERVED_NO_RAG_PRESERVATION_WEIGHT:-1.0}
+  else
+    current_negative_weight=${NEGATIVE_INVARIANCE_WEIGHT:-0.1}
+    current_no_rag_weight=${NO_RAG_PRESERVATION_WEIGHT:-0.1}
+  fi
   "$PYTHON_BIN" "$PROJECT/scripts/train_rag2_semantic_behavior_lora.py" \
     --dataset "$DATASET" \
     --pair-root "$PAIR_ROOT" \
@@ -99,8 +122,12 @@ for current_objective in "${OBJECTIVES[@]}"; do
     --preference-margin "${PREFERENCE_MARGIN:-0.5}" \
     --positive-loss-weight "${POSITIVE_LOSS_WEIGHT:-1.0}" \
     --preference-loss-weight "${PREFERENCE_LOSS_WEIGHT:-1.0}" \
-    --negative-invariance-weight "${NEGATIVE_INVARIANCE_WEIGHT:-0.1}" \
-    --no-rag-preservation-weight "${NO_RAG_PRESERVATION_WEIGHT:-0.1}" \
+    --negative-invariance-weight "$current_negative_weight" \
+    --no-rag-preservation-weight "$current_no_rag_weight" \
+    --max-negative-no-rag-answer-change-rate "${MAX_NEGATIVE_NO_RAG_ANSWER_CHANGE_RATE:-0.10}" \
+    --max-negative-no-rag-js "${MAX_NEGATIVE_NO_RAG_JS:-0.05}" \
+    --max-negative-accuracy-drop "${MAX_NEGATIVE_ACCURACY_DROP:-0.03}" \
+    --max-no-rag-accuracy-drop "${MAX_NO_RAG_ACCURACY_DROP:-0.01}" \
     --lora-rank "${LORA_RANK:-16}" \
     --lora-alpha "${LORA_ALPHA:-32}" \
     --dtype "${DTYPE:-bfloat16}" \

@@ -48,7 +48,7 @@ from medrag.training.semantic_behavior_lora import (  # noqa: E402
 )
 
 
-RUN_VERSION = "rag2_semantic_behavior_single_document_lora_v2"
+RUN_VERSION = "rag2_semantic_behavior_single_document_lora_v3"
 ATTENTION_BACKEND_POLICY = "disable_cudnn_sdpa_keep_flash_efficient_math_v1"
 
 
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", required=True)
     parser.add_argument(
         "--objective",
-        choices=("proposed", "question_only", "rag_ce"),
+        choices=("proposed", "proposed_preserved", "question_only", "rag_ce"),
         default="proposed",
     )
     parser.add_argument("--epochs", type=int, default=3)
@@ -92,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preference-loss-weight", type=float, default=1.0)
     parser.add_argument("--negative-invariance-weight", type=float, default=0.1)
     parser.add_argument("--no-rag-preservation-weight", type=float, default=0.1)
+    parser.add_argument("--max-negative-no-rag-answer-change-rate", type=float, default=0.10)
+    parser.add_argument("--max-negative-no-rag-js", type=float, default=0.05)
+    parser.add_argument("--max-negative-accuracy-drop", type=float, default=0.03)
+    parser.add_argument("--max-no-rag-accuracy-drop", type=float, default=0.01)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -339,7 +343,8 @@ def objective_losses(
     gold: torch.Tensor,
     teacher: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    if args.objective == "proposed":
+    if args.objective in {"proposed", "proposed_preserved"}:
+        preserve_current_student = args.objective == "proposed_preserved"
         return semantic_behavior_losses(
             positive_logits=positive,
             negative_logits=negative,
@@ -351,6 +356,12 @@ def objective_losses(
             preference_weight=args.preference_loss_weight,
             negative_invariance_weight=args.negative_invariance_weight,
             no_rag_preservation_weight=args.no_rag_preservation_weight,
+            negative_reference_probabilities=(
+                F.softmax(no_rag.detach().float(), dim=-1)
+                if preserve_current_student
+                else None
+            ),
+            detach_negative_margin=preserve_current_student,
         )
     zero = positive.sum() * 0.0
     if args.objective == "question_only":
@@ -375,11 +386,13 @@ def new_metric_accumulator() -> dict[str, Any]:
         "preference_correct": 0,
         "positive_changed": 0,
         "negative_changed": 0,
+        "negative_student_no_rag_changed": 0,
         "no_rag_changed": 0,
         "positive_margin_sum": 0.0,
         "negative_margin_sum": 0.0,
         "positive_js_sum": 0.0,
         "negative_js_sum": 0.0,
+        "negative_student_no_rag_js_sum": 0.0,
         "positive_transitions": Counter(),
         "negative_transitions": Counter(),
         "positive_transitions_from_frozen_document": Counter(),
@@ -421,6 +434,9 @@ def update_metrics(
     preference = positive_margin > negative_margin
     positive_js = categorical_js(teacher, F.softmax(positive, dim=-1)).detach().cpu()
     negative_js = categorical_js(teacher, F.softmax(negative, dim=-1)).detach().cpu()
+    negative_student_no_rag_js = categorical_js(
+        F.softmax(no_rag, dim=-1), F.softmax(negative, dim=-1)
+    ).detach().cpu()
     frozen_positive_correct = torch.tensor(
         [bool(row["positive"]["base_correct"]) for row in rows], dtype=torch.bool
     )
@@ -449,11 +465,17 @@ def update_metrics(
         (positive_prediction != frozen_positive_prediction).sum()
     )
     accumulator["negative_changed"] += int((negative_prediction != teacher_prediction).sum())
+    accumulator["negative_student_no_rag_changed"] += int(
+        (negative_prediction != no_rag_prediction).sum()
+    )
     accumulator["no_rag_changed"] += int((no_rag_prediction != teacher_prediction).sum())
     accumulator["positive_margin_sum"] += float(positive_margin.sum())
     accumulator["negative_margin_sum"] += float(negative_margin.sum())
     accumulator["positive_js_sum"] += float(positive_js.sum())
     accumulator["negative_js_sum"] += float(negative_js.sum())
+    accumulator["negative_student_no_rag_js_sum"] += float(
+        negative_student_no_rag_js.sum()
+    )
     for index, row in enumerate(rows):
         frozen_correct = bool(teacher_prediction[index] == gold_cpu[index])
         positive_correct = bool(positive_prediction[index] == gold_cpu[index])
@@ -522,11 +544,23 @@ def finalize_metrics(accumulator: dict[str, Any]) -> tuple[dict[str, Any], list[
         "preference_accuracy": accumulator["preference_correct"] / count,
         "positive_answer_change_rate_from_frozen_document": accumulator["positive_changed"] / count,
         "negative_answer_change_rate": accumulator["negative_changed"] / count,
+        "negative_vs_student_no_rag_answer_change_rate": (
+            accumulator["negative_student_no_rag_changed"] / count
+        ),
         "no_rag_answer_change_rate": accumulator["no_rag_changed"] / count,
         "mean_positive_margin": accumulator["positive_margin_sum"] / count,
         "mean_negative_margin": accumulator["negative_margin_sum"] / count,
         "mean_positive_js_from_frozen_no_rag": accumulator["positive_js_sum"] / count,
         "mean_negative_js_divergence": accumulator["negative_js_sum"] / count,
+        "mean_negative_js_from_student_no_rag": (
+            accumulator["negative_student_no_rag_js_sum"] / count
+        ),
+        "negative_accuracy_delta_vs_student_no_rag": (
+            accumulator["negative_correct"] - accumulator["no_rag_correct"]
+        ) / count,
+        "no_rag_accuracy_delta_vs_frozen": (
+            accumulator["no_rag_correct"] - accumulator["frozen_no_rag_correct"]
+        ) / count,
         "positive_transitions_from_frozen_no_rag": dict(accumulator["positive_transitions"]),
         "negative_transitions_from_frozen_no_rag": dict(accumulator["negative_transitions"]),
         "positive_transitions_from_frozen_document": dict(
@@ -575,13 +609,75 @@ def evaluate(
     return finalize_metrics(accumulator)
 
 
-def selection_score(metrics: dict[str, Any]) -> float:
+def weighted_selection_score(metrics: dict[str, Any]) -> float:
     return (
         0.40 * float(metrics["preference_accuracy"])
         + 0.30 * float(metrics["positive_accuracy"])
         + 0.15 * (1.0 - float(metrics["negative_answer_change_rate"]))
         + 0.15 * (1.0 - float(metrics["no_rag_answer_change_rate"]))
     )
+
+
+def checkpoint_selection(args: argparse.Namespace, metrics: dict[str, Any]) -> dict[str, Any]:
+    """Select preserved checkpoints lexicographically under explicit constraints."""
+
+    if args.objective != "proposed_preserved":
+        score = weighted_selection_score(metrics)
+        return {
+            "mode": "weighted",
+            "feasible": True,
+            "score": score,
+            "violations": {},
+            "rank": [score],
+        }
+
+    measured = {
+        "negative_no_rag_answer_change_rate": float(
+            metrics["negative_vs_student_no_rag_answer_change_rate"]
+        ),
+        "negative_no_rag_js": float(metrics["mean_negative_js_from_student_no_rag"]),
+        "negative_accuracy_drop": max(
+            0.0,
+            -float(metrics["negative_accuracy_delta_vs_student_no_rag"]),
+        ),
+        "no_rag_accuracy_drop": max(
+            0.0,
+            -float(metrics["no_rag_accuracy_delta_vs_frozen"]),
+        ),
+    }
+    limits = {
+        "negative_no_rag_answer_change_rate": float(
+            args.max_negative_no_rag_answer_change_rate
+        ),
+        "negative_no_rag_js": float(args.max_negative_no_rag_js),
+        "negative_accuracy_drop": float(args.max_negative_accuracy_drop),
+        "no_rag_accuracy_drop": float(args.max_no_rag_accuracy_drop),
+    }
+    violations = {
+        name: max(0.0, measured[name] - limit) for name, limit in limits.items()
+    }
+    normalized_violation = sum(
+        violations[name] / max(limits[name], 1e-8) for name in limits
+    )
+    feasible = all(value <= 1e-12 for value in violations.values())
+    preference = float(metrics["preference_accuracy"])
+    positive = float(metrics["positive_accuracy"])
+    negative_change = measured["negative_no_rag_answer_change_rate"]
+    rank = (
+        [1.0, preference, positive, -negative_change]
+        if feasible
+        else [0.0, -normalized_violation, preference, positive]
+    )
+    return {
+        "mode": "constrained",
+        "feasible": feasible,
+        "score": preference,
+        "measured": measured,
+        "limits": limits,
+        "violations": violations,
+        "normalized_violation": normalized_violation,
+        "rank": rank,
+    }
 
 
 def save_predictions(path: Path, values: Sequence[dict[str, Any]]) -> None:
@@ -625,6 +721,14 @@ def main() -> None:
             "preference": args.preference_loss_weight,
             "negative_invariance": args.negative_invariance_weight,
             "no_rag_preservation": args.no_rag_preservation_weight,
+        },
+        "checkpoint_constraints": {
+            "max_negative_no_rag_answer_change_rate": (
+                args.max_negative_no_rag_answer_change_rate
+            ),
+            "max_negative_no_rag_js": args.max_negative_no_rag_js,
+            "max_negative_accuracy_drop": args.max_negative_accuracy_drop,
+            "max_no_rag_accuracy_drop": args.max_no_rag_accuracy_drop,
         },
         "preference_margin": args.preference_margin,
         "lora": {
@@ -748,6 +852,8 @@ def main() -> None:
     start_epoch = 1
     best_epoch = 0
     best_score = -float("inf")
+    best_selection_rank: tuple[float, ...] | None = None
+    best_selection: dict[str, Any] | None = None
     bad_epochs = 0
     history: list[dict[str, Any]] = []
     if args.resume and checkpoint_path.is_file():
@@ -761,6 +867,13 @@ def main() -> None:
         start_epoch = int(checkpoint["epoch"]) + 1
         best_epoch = int(checkpoint["best_epoch"])
         best_score = float(checkpoint["best_score"])
+        stored_rank = checkpoint.get("best_selection_rank")
+        best_selection_rank = (
+            tuple(float(value) for value in stored_rank)
+            if stored_rank is not None
+            else (best_score,)
+        )
+        best_selection = checkpoint.get("best_selection")
         bad_epochs = int(checkpoint["bad_epochs"])
         history = list(checkpoint["history"])
         logging.info("Resuming after epoch %d", start_epoch - 1)
@@ -833,15 +946,23 @@ def main() -> None:
             f"3/4 validation epoch {epoch}/{args.epochs}",
             collect_predictions=False,
         )
-        score = selection_score(val_metrics)
-        improved = score > best_score + 1e-6
+        selection = checkpoint_selection(args, val_metrics)
+        selection_rank = tuple(float(value) for value in selection["rank"])
+        improved = best_selection_rank is None or selection_rank > best_selection_rank
         if improved:
-            best_score = score
+            best_score = float(selection["score"])
+            best_selection_rank = selection_rank
+            best_selection = selection
             best_epoch = epoch
             bad_epochs = 0
             atomic_torch_save(
                 best_path,
-                {"adapter_state": get_peft_model_state_dict(model), "epoch": epoch, "score": score},
+                {
+                    "adapter_state": get_peft_model_state_dict(model),
+                    "epoch": epoch,
+                    "score": best_score,
+                    "selection": selection,
+                },
             )
         else:
             bad_epochs += 1
@@ -849,7 +970,8 @@ def main() -> None:
             "epoch": epoch,
             "train_loss": train_loss_sum / max(1, train_count),
             "validation": val_metrics,
-            "selection_score": score,
+            "selection_score": float(selection["score"]),
+            "checkpoint_selection": selection,
             "best": improved,
         }
         history.append(record)
@@ -861,6 +983,8 @@ def main() -> None:
                 "epoch": epoch,
                 "best_epoch": best_epoch,
                 "best_score": best_score,
+                "best_selection_rank": list(best_selection_rank),
+                "best_selection": best_selection,
                 "bad_epochs": bad_epochs,
                 "history": history,
                 "adapter_state": get_peft_model_state_dict(model),
@@ -869,13 +993,17 @@ def main() -> None:
             },
         )
         logging.info(
-            "Epoch %d: train_loss=%.4f val_preference=%.4f val_positive=%.4f val_no_rag=%.4f score=%.4f best=%d",
+            "Epoch %d: train_loss=%.4f val_preference=%.4f val_positive=%.4f "
+            "val_no_rag=%.4f neg_vs_no_rag_change=%.4f feasible=%s "
+            "constraint_violation=%.4f best=%d",
             epoch,
             record["train_loss"],
             val_metrics["preference_accuracy"],
             val_metrics["positive_accuracy"],
             val_metrics["no_rag_accuracy"],
-            score,
+            val_metrics["negative_vs_student_no_rag_answer_change_rate"],
+            selection["feasible"],
+            float(selection.get("normalized_violation", 0.0)),
             best_epoch,
         )
         stopped_epoch = epoch
@@ -915,6 +1043,7 @@ def main() -> None:
         "best_epoch": best_epoch,
         "stopped_epoch": stopped_epoch,
         "best_validation_score": best_score,
+        "best_checkpoint_selection": best_selection,
         "best_validation": history[best_epoch - 1]["validation"],
         "test": test_metrics,
         "final_model": str(final_dir.resolve()),
