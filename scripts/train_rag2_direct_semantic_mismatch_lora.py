@@ -472,6 +472,7 @@ def write_summary_markdown(path: Path, summary: dict[str, Any]) -> None:
         "",
         f"- Best epoch: {summary['best_epoch']}",
         f"- Objective: `{summary['objective']}`",
+        f"- Preregistered pilot criterion: **{'PASS' if summary['pilot_success']['passed'] else 'FAIL'}**",
         "- Frozen is the unchanged Llama-3-8B under the identical direct-choice prompt.",
         "",
         "| Metric | N | Frozen | Student | Absolute change |",
@@ -490,6 +491,39 @@ def write_summary_markdown(path: Path, summary: dict[str, Any]) -> None:
     temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
     temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(temporary, path)
+
+
+def pilot_success(metrics: dict[str, Any]) -> dict[str, Any]:
+    groups = metrics["pair_groups"]
+    primary_delta = float(
+        groups.get("direct_support:no_rag_wrong", {}).get("absolute_accuracy_delta")
+        or 0.0
+    )
+    no_rag_delta = float(metrics["question_level_no_rag"]["absolute_accuracy_delta"])
+    direct_safe_delta = float(
+        groups.get("direct_support:no_rag_correct", {}).get("absolute_accuracy_delta")
+        or 0.0
+    )
+    no_evidence_safe_delta = float(
+        groups.get("no_evidence:no_rag_correct", {}).get("absolute_accuracy_delta")
+        or 0.0
+    )
+    criteria = {
+        "direct_support_no_rag_wrong_accuracy_gain_at_least_0p02": primary_delta >= 0.02,
+        "no_rag_accuracy_drop_at_most_0p005": no_rag_delta >= -0.005,
+        "direct_support_destruction_does_not_increase": direct_safe_delta >= 0.0,
+        "no_evidence_destruction_does_not_increase": no_evidence_safe_delta >= 0.0,
+    }
+    return {
+        "passed": all(criteria.values()),
+        "criteria": criteria,
+        "measured": {
+            "primary_accuracy_delta": primary_delta,
+            "no_rag_accuracy_delta": no_rag_delta,
+            "direct_support_no_rag_correct_accuracy_delta": direct_safe_delta,
+            "no_evidence_no_rag_correct_accuracy_delta": no_evidence_safe_delta,
+        },
+    }
 
 
 def main() -> None:
@@ -707,6 +741,7 @@ def main() -> None:
         "best_validation": history[best_epoch - 1]["validation"],
         "best_validation_selection": history[best_epoch - 1]["selection"],
         "test": test_metrics,
+        "pilot_success": pilot_success(test_metrics),
         "test_selection_audit": selection(test_metrics, args),
         "final_model": str(final_dir.resolve()),
     }
