@@ -14,10 +14,11 @@ MODEL="/home/user/Uiheon/models/Llama-3-8B-Instruct"
 CANDIDATES="$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1/candidates/source_balanced32_rerank8_v1"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1/direct_choice_single_document_outcomes_source_balanced32_rerank8_v1}"
 
-# 128 is a conservative high-throughput starting point on an H200.  Exact
-# outputs do not change with this value; an OOM is automatically retried at a
-# smaller batch size.  Override PROMPT_BATCH_SIZE only for operational tuning.
-PROMPT_BATCH_SIZE="${PROMPT_BATCH_SIZE:-128}"
+# Eager attention is deliberate here. PyTorch 2.11/cuDNN SDPA cannot build an
+# execution plan for some of the variable-length left-padded train batches.
+# The exact A/B/C/D score contract is unchanged. 64 keeps eager-attention peak
+# memory conservative on the H200; CUDA OOM still retries at half batch size.
+PROMPT_BATCH_SIZE="${PROMPT_BATCH_SIZE:-64}"
 QUESTIONS_PER_SHARD="${QUESTIONS_PER_SHARD:-1024}"
 
 test -x "$PYTHON"
@@ -45,6 +46,6 @@ exec "$PYTHON" "$SCRIPT" \
   --max-input-tokens 2048 \
   --device cuda:0 \
   --dtype bfloat16 \
-  --attn-implementation sdpa \
+  --attn-implementation eager \
   --resume \
   --log-level INFO
