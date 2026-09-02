@@ -13,6 +13,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -299,6 +300,13 @@ def objective_loss(args: argparse.Namespace, document: torch.Tensor, question: t
 
 def proportion(correct: int, count: int) -> float | None:
     return correct / count if count else None
+
+
+def format_duration(seconds: float) -> str:
+    value = max(0, int(seconds))
+    hours, remainder = divmod(value, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}h{minutes:02d}m{secs:02d}s"
 
 
 def wilson_interval(correct: int, count: int, z: float = 1.96) -> list[float] | None:
@@ -599,7 +607,10 @@ def main() -> None:
         history = list(checkpoint["history"])
         logging.info("Resuming after durable epoch %d", start_epoch - 1)
 
+    measured_epoch_seconds: list[float] = []
+    last_validation_seconds = 0.0
     for epoch in range(start_epoch, args.epochs + 1):
+        epoch_started = time.time()
         model.train()
         optimizer.zero_grad(set_to_none=True)
         progress = StageProgress(len(encoded["train"]), f"[train epoch {epoch}/{args.epochs}:{args.dataset}]")
@@ -628,7 +639,9 @@ def main() -> None:
             progress.set_detail(f"batch={batch_index}/{len(loaders['train'])} loss={float(losses['loss'].detach()):.4f}")
             progress.update(count)
         progress.close()
+        validation_started = time.time()
         val_metrics, _ = evaluate(model, loaders["val"], selected_ids, device, f"[validation epoch {epoch}/{args.epochs}:{args.dataset}]")
+        last_validation_seconds = time.time() - validation_started
         current_selection = selection(val_metrics, args)
         current_rank = tuple(float(value) for value in current_selection["rank"])
         improved = best_rank is None or current_rank > best_rank
@@ -639,12 +652,39 @@ def main() -> None:
             atomic_torch(best_path, {"adapter": get_peft_model_state_dict(model), "epoch": epoch, "selection": current_selection})
         else:
             bad_epochs += 1
-        record = {"epoch": epoch, "train_loss": loss_sum / max(1, count_sum), "validation": val_metrics, "selection": current_selection, "best": improved}
+        measured_epoch_seconds.append(time.time() - epoch_started)
+        will_stop = bad_epochs >= args.patience
+        remaining_epochs = 0 if will_stop else args.epochs - epoch
+        average_epoch_seconds = sum(measured_epoch_seconds) / len(measured_epoch_seconds)
+        estimated_test_seconds = (
+            last_validation_seconds * len(encoded["test"]) / max(1, len(encoded["val"]))
+        )
+        estimated_remaining = remaining_epochs * average_epoch_seconds + estimated_test_seconds
+        record = {
+            "epoch": epoch,
+            "duration_seconds": measured_epoch_seconds[-1],
+            "estimated_remaining_seconds": estimated_remaining,
+            "train_loss": loss_sum / max(1, count_sum),
+            "validation": val_metrics,
+            "selection": current_selection,
+            "best": improved,
+        }
         history.append(record)
         atomic_json(output_dir / "history.json", history)
         atomic_torch(checkpoint_path, {"contract_fingerprint": contract_hash, "epoch": epoch, "best_rank": list(best_rank), "best_epoch": best_epoch, "bad_epochs": bad_epochs, "history": history, "adapter": get_peft_model_state_dict(model), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()})
-        logging.info("Epoch %d: loss=%.4f primary_DS_given_noRAG_wrong=%.4f noRAG_delta=%+.4f feasible=%s best=%d", epoch, record["train_loss"], current_selection["primary_accuracy"], val_metrics["question_level_no_rag"]["absolute_accuracy_delta"], current_selection["feasible"], best_epoch)
-        if bad_epochs >= args.patience:
+        logging.info(
+            "Epoch %d complete: duration=%s loss=%.4f primary_DS_given_noRAG_wrong=%.4f "
+            "noRAG_delta=%+.4f feasible=%s best=%d estimated_remaining=%s",
+            epoch,
+            format_duration(measured_epoch_seconds[-1]),
+            record["train_loss"],
+            current_selection["primary_accuracy"],
+            val_metrics["question_level_no_rag"]["absolute_accuracy_delta"],
+            current_selection["feasible"],
+            best_epoch,
+            format_duration(estimated_remaining),
+        )
+        if will_stop:
             logging.info("Early stopping after epoch %d; durable checkpoint=%s", epoch, checkpoint_path)
             break
 
