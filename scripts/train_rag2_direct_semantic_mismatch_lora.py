@@ -45,7 +45,7 @@ from medrag.training.direct_semantic_mismatch import (  # noqa: E402
 )
 
 
-RUN_VERSION = "rag2_direct_semantic_mismatch_lora_v1"
+RUN_VERSION = "rag2_direct_semantic_mismatch_lora_v2"
 PAIR_VERSION = "rag2_direct_semantic_mismatch_mvp_pairs_v1"
 BASE = PROJECT_ROOT / "datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
 
@@ -216,21 +216,46 @@ class EncodedDataset(Dataset[dict[str, Any]]):
         return self.values[index]
 
 
+class QuestionDataset(Dataset[dict[str, Any]]):
+    """Expose one canonical No-RAG input per question for deterministic evaluation."""
+
+    def __init__(self, source: EncodedDataset) -> None:
+        self.values: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for value in source.values:
+            sample_id = str(value["row"]["sample_id"])
+            if sample_id in seen:
+                continue
+            seen.add(sample_id)
+            self.values.append(value)
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self.values[index]
+
+
+def pad_sequences(sequences: Sequence[Sequence[int]], pad_token_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    maximum = max(map(len, sequences))
+    ids = torch.full((len(sequences), maximum), int(pad_token_id), dtype=torch.long)
+    mask = torch.zeros_like(ids)
+    for index, sequence in enumerate(sequences):
+        length = len(sequence)
+        ids[index, maximum - length :] = torch.tensor(sequence)
+        mask[index, maximum - length :] = 1
+    position = mask.cumsum(dim=-1) - 1
+    position.masked_fill_(mask == 0, 0)
+    return ids, mask, position
+
+
 class Collator:
     def __init__(self, pad_token_id: int) -> None:
         self.pad_token_id = int(pad_token_id)
 
     def __call__(self, values: Sequence[dict[str, Any]]) -> dict[str, Any]:
         sequences = [value["document_ids"] for value in values] + [value["question_ids"] for value in values]
-        maximum = max(map(len, sequences))
-        ids = torch.full((len(sequences), maximum), self.pad_token_id, dtype=torch.long)
-        mask = torch.zeros_like(ids)
-        for index, sequence in enumerate(sequences):
-            length = len(sequence)
-            ids[index, maximum - length :] = torch.tensor(sequence)
-            mask[index, maximum - length :] = 1
-        position = mask.cumsum(dim=-1) - 1
-        position.masked_fill_(mask == 0, 0)
+        ids, mask, position = pad_sequences(sequences, self.pad_token_id)
         rows = [value["row"] for value in values]
         return {
             "input_ids": ids,
@@ -242,6 +267,27 @@ class Collator:
             "frozen_no_rag_probabilities": torch.tensor([row["frozen_no_rag_probabilities"] for row in rows], dtype=torch.float32),
             "question_repeat_weights": torch.tensor([float(row["question_repeat_weight"]) for row in rows], dtype=torch.float32),
             "rows": rows,
+        }
+
+
+class BranchCollator:
+    """Pad only one prompt branch during evaluation."""
+
+    def __init__(self, pad_token_id: int, field: str) -> None:
+        if field not in {"document_ids", "question_ids"}:
+            raise ValueError(f"Unsupported evaluation field: {field}")
+        self.pad_token_id = int(pad_token_id)
+        self.field = field
+
+    def __call__(self, values: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        ids, mask, position = pad_sequences(
+            [value[self.field] for value in values], self.pad_token_id
+        )
+        return {
+            "input_ids": ids,
+            "attention_mask": mask,
+            "position_ids": position,
+            "rows": [value["row"] for value in values],
         }
 
 
@@ -266,6 +312,17 @@ def forward_logits(model: Any, batch: dict[str, Any], selected_ids: torch.Tensor
     logits = outputs.logits[:, -1].index_select(-1, selected_ids).float()
     count = len(batch["rows"])
     return logits[:count], logits[count:]
+
+
+def forward_single_logits(model: Any, batch: dict[str, Any], selected_ids: torch.Tensor, device: torch.device) -> torch.Tensor:
+    outputs = model(
+        input_ids=batch["input_ids"].to(device, non_blocking=True),
+        attention_mask=batch["attention_mask"].to(device, non_blocking=True),
+        position_ids=batch["position_ids"].to(device, non_blocking=True),
+        use_cache=False,
+        logits_to_keep=1,
+    )
+    return outputs.logits[:, -1].index_select(-1, selected_ids).float()
 
 
 def objective_loss(args: argparse.Namespace, document: torch.Tensor, question: torch.Tensor, batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
@@ -319,14 +376,15 @@ def wilson_interval(correct: int, count: int, z: float = 1.96) -> list[float] | 
     return [center - radius, center + radius]
 
 
-def finalize_eval(rows: list[dict[str, Any]], document_logits: list[torch.Tensor], question_logits: list[torch.Tensor]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def finalize_eval(
+    rows: list[dict[str, Any]],
+    document_logits: list[torch.Tensor],
+    question_predictions: dict[str, tuple[int, int, int]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     document = torch.cat(document_logits).float()
-    question = torch.cat(question_logits).float()
     doc_pred = document.argmax(-1).tolist()
-    q_pred = question.argmax(-1).tolist()
     gold = [CHOICES.index(str(row["gold_answer"])) for row in rows]
     groups: dict[str, dict[str, int]] = defaultdict(lambda: Counter(count=0, student_correct=0, frozen_correct=0, improved=0, regressed=0))
-    q_by_sample: dict[str, tuple[int, int, int]] = {}
     predictions: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
         student_correct = doc_pred[index] == gold[index]
@@ -346,10 +404,12 @@ def finalize_eval(rows: list[dict[str, Any]], document_logits: list[torch.Tensor
             value["improved"] += int(student_correct and not frozen_correct)
             value["regressed"] += int(frozen_correct and not student_correct)
         sample_id = str(row["sample_id"])
-        current_q = (q_pred[index], gold[index], CHOICES.index(str(row["frozen_no_rag_prediction"])))
-        previous = q_by_sample.setdefault(sample_id, current_q)
-        if previous != current_q:
-            raise RuntimeError(f"Inconsistent no-RAG predictions across repeated question: {sample_id}")
+        if sample_id not in question_predictions:
+            raise RuntimeError(f"Missing question-level No-RAG prediction: {sample_id}")
+        q_pred, q_gold, q_frozen = question_predictions[sample_id]
+        expected = (gold[index], CHOICES.index(str(row["frozen_no_rag_prediction"])))
+        if (q_gold, q_frozen) != expected:
+            raise RuntimeError(f"Question-level gold/frozen contract mismatch: {sample_id}")
         predictions.append(
             {
                 "sample_id": sample_id,
@@ -358,7 +418,7 @@ def finalize_eval(rows: list[dict[str, Any]], document_logits: list[torch.Tensor
                 "frozen_transition": row["frozen_transition"],
                 "gold_answer": row["gold_answer"],
                 "student_document_prediction": CHOICES[doc_pred[index]],
-                "student_no_rag_prediction": CHOICES[q_pred[index]],
+                "student_no_rag_prediction": CHOICES[q_pred],
                 "frozen_document_prediction": row["frozen_document_prediction"],
                 "frozen_no_rag_prediction": row["frozen_no_rag_prediction"],
             }
@@ -377,10 +437,10 @@ def finalize_eval(rows: list[dict[str, Any]], document_logits: list[torch.Tensor
             "improved_pairs": int(value["improved"]),
             "regressed_pairs": int(value["regressed"]),
         }
-    q_count = len(q_by_sample)
-    student_q_correct = sum(value[0] == value[1] for value in q_by_sample.values())
-    frozen_q_correct = sum(value[2] == value[1] for value in q_by_sample.values())
-    q_changed = sum(value[0] != value[2] for value in q_by_sample.values())
+    q_count = len(question_predictions)
+    student_q_correct = sum(value[0] == value[1] for value in question_predictions.values())
+    frozen_q_correct = sum(value[2] == value[1] for value in question_predictions.values())
+    q_changed = sum(value[0] != value[2] for value in question_predictions.values())
     return {
         "question_level_no_rag": {
             "n": q_count,
@@ -394,20 +454,48 @@ def finalize_eval(rows: list[dict[str, Any]], document_logits: list[torch.Tensor
 
 
 @torch.no_grad()
-def evaluate(model: Any, loader: DataLoader, selected_ids: torch.Tensor, device: torch.device, stage: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def evaluate(
+    model: Any,
+    document_loader: DataLoader,
+    question_loader: DataLoader,
+    selected_ids: torch.Tensor,
+    device: torch.device,
+    stage: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     model.eval()
     rows: list[dict[str, Any]] = []
     documents: list[torch.Tensor] = []
-    questions: list[torch.Tensor] = []
-    progress = StageProgress(len(loader.dataset), stage)
-    for batch in loader:
-        document, question = forward_logits(model, batch, selected_ids, device)
+    logging.info(
+        "%s evaluation plan: document_pairs=%d unique_no_rag_questions=%d",
+        stage,
+        len(document_loader.dataset),
+        len(question_loader.dataset),
+    )
+    progress = StageProgress(len(document_loader.dataset), f"{stage} documents")
+    for batch in document_loader:
+        document = forward_single_logits(model, batch, selected_ids, device)
         rows.extend(batch["rows"])
         documents.append(document.cpu())
-        questions.append(question.cpu())
         progress.update(len(batch["rows"]))
     progress.close()
-    return finalize_eval(rows, documents, questions)
+
+    question_predictions: dict[str, tuple[int, int, int]] = {}
+    progress = StageProgress(len(question_loader.dataset), f"{stage} no-RAG questions")
+    for batch in question_loader:
+        logits = forward_single_logits(model, batch, selected_ids, device)
+        predicted = logits.argmax(-1).tolist()
+        for index, row in enumerate(batch["rows"]):
+            sample_id = str(row["sample_id"])
+            if sample_id in question_predictions:
+                raise RuntimeError(f"Duplicate canonical No-RAG question: {sample_id}")
+            question_predictions[sample_id] = (
+                int(predicted[index]),
+                CHOICES.index(str(row["gold_answer"])),
+                CHOICES.index(str(row["frozen_no_rag_prediction"])),
+            )
+        progress.update(len(batch["rows"]))
+    progress.close()
+    return finalize_eval(rows, documents, question_predictions)
 
 
 def selection(metrics: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -590,11 +678,15 @@ def main() -> None:
         return
 
     collator = Collator(tokenizer.pad_token_id)
+    document_collator = BranchCollator(tokenizer.pad_token_id, "document_ids")
+    question_collator = BranchCollator(tokenizer.pad_token_id, "question_ids")
     generator = torch.Generator().manual_seed(args.seed)
     loaders = {
         "train": DataLoader(encoded["train"], batch_size=args.train_examples_per_batch, shuffle=True, generator=generator, collate_fn=collator, num_workers=0, pin_memory=True),
-        "val": DataLoader(encoded["val"], batch_size=args.eval_examples_per_batch, shuffle=False, collate_fn=collator, num_workers=0, pin_memory=True),
-        "test": DataLoader(encoded["test"], batch_size=args.eval_examples_per_batch, shuffle=False, collate_fn=collator, num_workers=0, pin_memory=True),
+        "val_document": DataLoader(encoded["val"], batch_size=args.eval_examples_per_batch, shuffle=False, collate_fn=document_collator, num_workers=0, pin_memory=True),
+        "val_question": DataLoader(QuestionDataset(encoded["val"]), batch_size=args.eval_examples_per_batch, shuffle=False, collate_fn=question_collator, num_workers=0, pin_memory=True),
+        "test_document": DataLoader(encoded["test"], batch_size=args.eval_examples_per_batch, shuffle=False, collate_fn=document_collator, num_workers=0, pin_memory=True),
+        "test_question": DataLoader(QuestionDataset(encoded["test"]), batch_size=args.eval_examples_per_batch, shuffle=False, collate_fn=question_collator, num_workers=0, pin_memory=True),
     }
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     logging.info("Loading target Llama for LoRA: %s", args.model_name_or_path)
@@ -617,8 +709,12 @@ def main() -> None:
     scheduler = get_linear_schedule_with_warmup(optimizer, int(round(total_updates * args.warmup_ratio)), total_updates)
 
     checkpoint_path = output_dir / "checkpoint_last.pt"
+    phase_checkpoint_path = output_dir / "checkpoint_after_train.pt"
     best_path = output_dir / "best_adapter_state.pt"
     start_epoch = 1
+    resume_validation_epoch: int | None = None
+    resumed_train_loss = 0.0
+    resumed_train_duration = 0.0
     best_rank: tuple[float, ...] | None = None
     best_epoch = 0
     bad_epochs = 0
@@ -635,46 +731,116 @@ def main() -> None:
                     state[key] = value.to(device)
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = int(checkpoint["epoch"]) + 1
-        best_rank = tuple(checkpoint["best_rank"])
+        best_rank = tuple(checkpoint["best_rank"]) if checkpoint["best_rank"] is not None else None
         best_epoch = int(checkpoint["best_epoch"])
         bad_epochs = int(checkpoint["bad_epochs"])
         history = list(checkpoint["history"])
         logging.info("Resuming after durable epoch %d", start_epoch - 1)
+    if args.resume and phase_checkpoint_path.is_file():
+        phase = torch.load(phase_checkpoint_path, map_location="cpu", weights_only=False)
+        if phase.get("contract_fingerprint") != contract_hash:
+            raise RuntimeError("Post-train checkpoint contract mismatch")
+        phase_epoch = int(phase["epoch"])
+        completed_epoch = start_epoch - 1
+        if phase_epoch > completed_epoch:
+            if phase_epoch != completed_epoch + 1:
+                raise RuntimeError(
+                    f"Non-contiguous post-train checkpoint: completed={completed_epoch} phase={phase_epoch}"
+                )
+            set_peft_model_state_dict(model, phase["adapter"])
+            optimizer.load_state_dict(phase["optimizer"])
+            for state in optimizer.state.values():
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        state[key] = value.to(device)
+            scheduler.load_state_dict(phase["scheduler"])
+            start_epoch = phase_epoch
+            resume_validation_epoch = phase_epoch
+            best_rank = tuple(phase["best_rank"]) if phase["best_rank"] is not None else None
+            best_epoch = int(phase["best_epoch"])
+            bad_epochs = int(phase["bad_epochs"])
+            history = list(phase["history"])
+            resumed_train_loss = float(phase["train_loss"])
+            resumed_train_duration = float(phase["train_duration_seconds"])
+            logging.info(
+                "Resuming epoch %d after completed training; validation will run without repeating optimization",
+                phase_epoch,
+            )
 
     measured_epoch_seconds: list[float] = []
     last_validation_seconds = 0.0
     for epoch in range(start_epoch, args.epochs + 1):
-        epoch_started = time.time()
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        progress = StageProgress(len(encoded["train"]), f"[train epoch {epoch}/{args.epochs}:{args.dataset}]")
-        loss_sum = 0.0
-        count_sum = 0
-        accumulation = 0
-        for batch_index, batch in enumerate(loaders["train"], 1):
-            document, question = forward_logits(model, batch, selected_ids, device)
-            losses = objective_loss(args, document, question, batch, device)
-            (losses["loss"] / args.gradient_accumulation_steps).backward()
-            accumulation += 1
-            count = len(batch["rows"])
-            count_sum += count
-            loss_sum += float(losses["loss"].detach()) * count
-            if accumulation == args.gradient_accumulation_steps or batch_index == len(loaders["train"]):
-                if accumulation != args.gradient_accumulation_steps:
-                    factor = args.gradient_accumulation_steps / accumulation
-                    for parameter in trainable:
-                        if parameter.grad is not None:
-                            parameter.grad.mul_(factor)
-                torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                accumulation = 0
-            progress.set_detail(f"batch={batch_index}/{len(loaders['train'])} loss={float(losses['loss'].detach()):.4f}")
-            progress.update(count)
-        progress.close()
+        if resume_validation_epoch == epoch:
+            train_loss = resumed_train_loss
+            train_duration = resumed_train_duration
+            logging.info(
+                "Epoch %d training already complete: duration=%s loss=%.4f; starting validation",
+                epoch,
+                format_duration(train_duration),
+                train_loss,
+            )
+        else:
+            train_started = time.time()
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            progress = StageProgress(len(encoded["train"]), f"[train epoch {epoch}/{args.epochs}:{args.dataset}]")
+            loss_sum = 0.0
+            count_sum = 0
+            accumulation = 0
+            for batch_index, batch in enumerate(loaders["train"], 1):
+                document, question = forward_logits(model, batch, selected_ids, device)
+                losses = objective_loss(args, document, question, batch, device)
+                (losses["loss"] / args.gradient_accumulation_steps).backward()
+                accumulation += 1
+                count = len(batch["rows"])
+                count_sum += count
+                loss_sum += float(losses["loss"].detach()) * count
+                if accumulation == args.gradient_accumulation_steps or batch_index == len(loaders["train"]):
+                    if accumulation != args.gradient_accumulation_steps:
+                        factor = args.gradient_accumulation_steps / accumulation
+                        for parameter in trainable:
+                            if parameter.grad is not None:
+                                parameter.grad.mul_(factor)
+                    torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulation = 0
+                progress.set_detail(f"batch={batch_index}/{len(loaders['train'])} loss={float(losses['loss'].detach()):.4f}")
+                progress.update(count)
+            progress.close()
+            train_duration = time.time() - train_started
+            train_loss = loss_sum / max(1, count_sum)
+            atomic_torch(
+                phase_checkpoint_path,
+                {
+                    "contract_fingerprint": contract_hash,
+                    "epoch": epoch,
+                    "best_rank": list(best_rank) if best_rank is not None else None,
+                    "best_epoch": best_epoch,
+                    "bad_epochs": bad_epochs,
+                    "history": history,
+                    "train_loss": train_loss,
+                    "train_duration_seconds": train_duration,
+                    "adapter": get_peft_model_state_dict(model),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                },
+            )
+            logging.info(
+                "Epoch %d training checkpoint saved before validation: %s",
+                epoch,
+                phase_checkpoint_path,
+            )
         validation_started = time.time()
-        val_metrics, _ = evaluate(model, loaders["val"], selected_ids, device, f"[validation epoch {epoch}/{args.epochs}:{args.dataset}]")
+        val_metrics, _ = evaluate(
+            model,
+            loaders["val_document"],
+            loaders["val_question"],
+            selected_ids,
+            device,
+            f"[validation epoch {epoch}/{args.epochs}:{args.dataset}]",
+        )
         last_validation_seconds = time.time() - validation_started
         current_selection = selection(val_metrics, args)
         current_rank = tuple(float(value) for value in current_selection["rank"])
@@ -686,7 +852,7 @@ def main() -> None:
             atomic_torch(best_path, {"adapter": get_peft_model_state_dict(model), "epoch": epoch, "selection": current_selection})
         else:
             bad_epochs += 1
-        measured_epoch_seconds.append(time.time() - epoch_started)
+        measured_epoch_seconds.append(train_duration + last_validation_seconds)
         will_stop = bad_epochs >= args.patience
         remaining_epochs = 0 if will_stop else args.epochs - epoch
         average_epoch_seconds = sum(measured_epoch_seconds) / len(measured_epoch_seconds)
@@ -698,14 +864,16 @@ def main() -> None:
             "epoch": epoch,
             "duration_seconds": measured_epoch_seconds[-1],
             "estimated_remaining_seconds": estimated_remaining,
-            "train_loss": loss_sum / max(1, count_sum),
+            "train_loss": train_loss,
             "validation": val_metrics,
             "selection": current_selection,
             "best": improved,
         }
         history.append(record)
         atomic_json(output_dir / "history.json", history)
-        atomic_torch(checkpoint_path, {"contract_fingerprint": contract_hash, "epoch": epoch, "best_rank": list(best_rank), "best_epoch": best_epoch, "bad_epochs": bad_epochs, "history": history, "adapter": get_peft_model_state_dict(model), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()})
+        atomic_torch(checkpoint_path, {"contract_fingerprint": contract_hash, "epoch": epoch, "best_rank": list(best_rank) if best_rank is not None else None, "best_epoch": best_epoch, "bad_epochs": bad_epochs, "history": history, "adapter": get_peft_model_state_dict(model), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()})
+        phase_checkpoint_path.unlink(missing_ok=True)
+        resume_validation_epoch = None
         logging.info(
             "Epoch %d complete: duration=%s loss=%.4f primary_DS_given_noRAG_wrong=%.4f "
             "noRAG_delta=%+.4f feasible=%s best=%d estimated_remaining=%s",
@@ -726,7 +894,14 @@ def main() -> None:
         raise RuntimeError("No best checkpoint was written")
     best = torch.load(best_path, map_location="cpu", weights_only=False)
     set_peft_model_state_dict(model, best["adapter"])
-    test_metrics, predictions = evaluate(model, loaders["test"], selected_ids, device, f"[held-out test:{args.dataset}]")
+    test_metrics, predictions = evaluate(
+        model,
+        loaders["test_document"],
+        loaders["test_question"],
+        selected_ids,
+        device,
+        f"[held-out test:{args.dataset}]",
+    )
     final_dir = output_dir / "final_model"
     model.save_pretrained(final_dir, safe_serialization=True)
     tokenizer.save_pretrained(final_dir)

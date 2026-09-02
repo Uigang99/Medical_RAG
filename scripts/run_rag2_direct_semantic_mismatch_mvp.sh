@@ -53,7 +53,7 @@ announce_stage 1 2 "preflight, cache joins, and versioned train/validation/test 
   --resume
 
 announce_stage 2 2 "Llama-3-8B LoRA training objective=${OBJECTIVE}; active bars report current epoch progress/rate/ETA"
-run_name="${DATASET}_${MODE}_direct_semantic_mismatch_${OBJECTIVE}_v1"
+run_name="${DATASET}_${MODE}_direct_semantic_mismatch_${OBJECTIVE}_v2"
 "$PYTHON_BIN" "$PROJECT/scripts/train_rag2_direct_semantic_mismatch_lora.py" \
   --dataset "$DATASET" \
   --pair-root "$PAIR_ROOT" \
@@ -64,7 +64,7 @@ run_name="${DATASET}_${MODE}_direct_semantic_mismatch_${OBJECTIVE}_v1"
   --epochs "$EPOCHS" \
   --patience "${PATIENCE:-2}" \
   --train-examples-per-batch "${TRAIN_EXAMPLES_PER_BATCH:-8}" \
-  --eval-examples-per-batch "${EVAL_EXAMPLES_PER_BATCH:-16}" \
+  --eval-examples-per-batch "${EVAL_EXAMPLES_PER_BATCH:-32}" \
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
   --learning-rate "${LEARNING_RATE:-5e-5}" \
   --warmup-ratio "${WARMUP_RATIO:-0.03}" \
