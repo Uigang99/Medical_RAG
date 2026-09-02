@@ -43,9 +43,15 @@ from medrag.training.direct_semantic_mismatch import (  # noqa: E402
     TRAIN_CASES,
     semantic_mismatch_losses,
 )
+from medrag.training.direct_semantic_contrastive import (  # noqa: E402
+    balanced_epoch_samples,
+    build_training_groups,
+    semantic_contrastive_losses,
+)
 
 
 RUN_VERSION = "rag2_direct_semantic_mismatch_lora_v2"
+CONTRASTIVE_RUN_VERSION = "rag2_direct_semantic_contrastive_lora_v3"
 PAIR_VERSION = "rag2_direct_semantic_mismatch_mvp_pairs_v1"
 BASE = PROJECT_ROOT / "datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
 
@@ -57,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name-or-path", type=Path, default=WORKSPACE_ROOT / "models/Llama-3-8B-Instruct")
     parser.add_argument("--output-root", type=Path, default=WORKSPACE_ROOT / "models/RAG2-Direct-Semantic-Mismatch-LoRA")
     parser.add_argument("--run-name", required=True)
-    parser.add_argument("--objective", choices=("mismatch", "question_only", "rag_ce"), default="mismatch")
+    parser.add_argument("--objective", choices=("mismatch", "question_only", "rag_ce", "semantic_contrastive"), default="mismatch")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--train-examples-per-batch", type=int, default=8)
@@ -73,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-rag-preservation-weight", type=float, default=2.0)
     parser.add_argument("--failure-case-weight", type=float, default=1.0)
     parser.add_argument("--normal-case-weight", type=float, default=0.1)
+    parser.add_argument("--examples-per-group-batch", type=int, default=4)
+    parser.add_argument("--min-pair-teacher-gap", type=float, default=0.5)
+    parser.add_argument("--pair-margin", type=float, default=0.5)
+    parser.add_argument("--expected-train-seconds", type=float, default=900.0)
+    parser.add_argument("--expected-eval-seconds", type=float, default=540.0)
+    parser.add_argument("--prior-workflow-seconds", type=float, default=0.0)
     parser.add_argument("--max-no-rag-accuracy-drop", type=float, default=0.005)
     parser.add_argument("--max-destruction-rate-increase", type=float, default=0.0)
     parser.add_argument("--lora-rank", type=int, default=16)
@@ -90,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--smoke-test-only", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -138,6 +151,11 @@ def sha256_file(path: Path) -> str:
 
 def fingerprint(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def semantic_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Exclude repository provenance from cache/checkpoint identity."""
+    return {key: value for key, value in contract.items() if key != "code_commit"}
 
 
 def git_commit() -> str:
@@ -366,6 +384,121 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}h{minutes:02d}m{secs:02d}s"
 
 
+def progress_detail(
+    *, workflow_started: float, stage_started: float, done: int, total: int, future_seconds: float
+) -> str:
+    elapsed = time.time() - stage_started
+    stage_eta = elapsed / max(1, done) * max(0, total - done)
+    overall_eta = stage_eta + max(0.0, future_seconds)
+    return (
+        f"overall_elapsed={format_duration(time.time() - workflow_started)} "
+        f"overall_eta={format_duration(overall_eta)}"
+    )
+
+
+def train_contrastive_epoch(
+    *,
+    args: argparse.Namespace,
+    model: Any,
+    groups: dict[str, list[Any]],
+    epoch: int,
+    collator: BranchCollator,
+    selected_ids: torch.Tensor,
+    device: torch.device,
+    optimizer: Any,
+    scheduler: Any,
+    trainable: list[torch.nn.Parameter],
+    workflow_started: float,
+    phase_index: int,
+    phase_total: int,
+    future_seconds: float,
+) -> tuple[float, float]:
+    target, selected = balanced_epoch_samples(groups, epoch=epoch, seed=args.seed)
+    group_batch = int(args.examples_per_group_batch)
+    total_steps = math.ceil(target / group_batch)
+    progress = StageProgress(
+        target * 4,
+        f"[overall {phase_index}/{phase_total}] train epoch {epoch}/{args.epochs}:{args.dataset}",
+    )
+    stage_started = time.time()
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    accumulation = 0
+    loss_sum = 0.0
+    count_sum = 0
+    for step, start in enumerate(range(0, target, group_batch), 1):
+        stop = min(target, start + group_batch)
+        correction = selected["direct_support_correction"][start:stop]
+        preservation = selected["direct_support_preservation"][start:stop]
+        invariance = selected["no_evidence_invariance"][start:stop]
+        pairs = selected["same_question_contrast"][start:stop]
+        pair_direct = [pair[0] for pair in pairs]
+        pair_no_evidence = [pair[1] for pair in pairs]
+        width = stop - start
+        flat = correction + preservation + invariance + pair_direct + pair_no_evidence
+        batch = collator(flat)
+        logits = forward_single_logits(model, batch, selected_ids, device)
+        c, p, n, pd, pn = logits.split([width] * 5)
+        correction_rows = [value["row"] for value in correction]
+        preservation_rows = [value["row"] for value in preservation]
+        invariance_rows = [value["row"] for value in invariance]
+        pair_rows = [value["row"] for value in pair_direct]
+        losses = semantic_contrastive_losses(
+            correction_logits=c,
+            correction_gold=torch.tensor(
+                [CHOICES.index(str(row["gold_answer"])) for row in correction_rows], device=device
+            ),
+            preservation_logits=p,
+            preservation_teacher=torch.tensor(
+                [row["frozen_document_probabilities"] for row in preservation_rows],
+                dtype=torch.float32,
+                device=device,
+            ),
+            invariance_logits=n,
+            invariance_teacher=torch.tensor(
+                [row["frozen_no_rag_probabilities"] for row in invariance_rows],
+                dtype=torch.float32,
+                device=device,
+            ),
+            pair_direct_logits=pd,
+            pair_no_evidence_logits=pn,
+            pair_gold=torch.tensor(
+                [CHOICES.index(str(row["gold_answer"])) for row in pair_rows], device=device
+            ),
+            boundary_margin=args.boundary_margin,
+            pair_margin=args.pair_margin,
+        )
+        (losses["loss"] / args.gradient_accumulation_steps).backward()
+        accumulation += 1
+        loss_sum += float(losses["loss"].detach()) * width
+        count_sum += width
+        if accumulation == args.gradient_accumulation_steps or step == total_steps:
+            if accumulation != args.gradient_accumulation_steps:
+                factor = args.gradient_accumulation_steps / accumulation
+                for parameter in trainable:
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(factor)
+            torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            accumulation = 0
+        completed = stop * 4
+        detail = progress_detail(
+            workflow_started=workflow_started,
+            stage_started=stage_started,
+            done=completed,
+            total=target * 4,
+            future_seconds=future_seconds,
+        )
+        progress.set_detail(
+            f"{detail} step={step}/{total_steps} forwarded_docs={len(flat)} loss={float(losses['loss'].detach()):.4f}"
+        )
+        progress.update(width * 4)
+    progress.close()
+    return loss_sum / max(1, count_sum), time.time() - stage_started
+
+
 def wilson_interval(correct: int, count: int, z: float = 1.96) -> list[float] | None:
     if count <= 0:
         return None
@@ -391,7 +524,8 @@ def finalize_eval(
         frozen_correct = bool(row["frozen_document_correct"])
         no_rag_correct = bool(row["frozen_no_rag_correct"])
         semantic = str(row["semantic_label"])
-        keys = ["all", f"semantic:{semantic}"]
+        transition = str(row["frozen_transition"])
+        keys = ["all", f"semantic:{semantic}", f"transition:{semantic}:{transition}"]
         if semantic == "direct_support":
             keys.append("direct_support:no_rag_correct" if no_rag_correct else "direct_support:no_rag_wrong")
         elif semantic == "no_evidence":
@@ -457,10 +591,16 @@ def finalize_eval(
 def evaluate(
     model: Any,
     document_loader: DataLoader,
-    question_loader: DataLoader,
+    question_loader: DataLoader | None,
     selected_ids: torch.Tensor,
     device: torch.device,
     stage: str,
+    *,
+    frozen_no_rag_only: bool = False,
+    workflow_started: float | None = None,
+    phase_index: int | None = None,
+    phase_total: int | None = None,
+    future_seconds: float = 0.0,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     model.eval()
     rows: list[dict[str, Any]] = []
@@ -469,32 +609,68 @@ def evaluate(
         "%s evaluation plan: document_pairs=%d unique_no_rag_questions=%d",
         stage,
         len(document_loader.dataset),
-        len(question_loader.dataset),
+        (
+            len({str(value["row"]["sample_id"]) for value in document_loader.dataset.values})
+            if frozen_no_rag_only
+            else len(question_loader.dataset) if question_loader is not None else 0
+        ),
     )
-    progress = StageProgress(len(document_loader.dataset), f"{stage} documents")
+    phase_prefix = (
+        f"[overall {phase_index}/{phase_total}] "
+        if phase_index is not None and phase_total is not None
+        else ""
+    )
+    progress = StageProgress(len(document_loader.dataset), f"{phase_prefix}{stage} documents")
+    stage_started = time.time()
+    completed = 0
     for batch in document_loader:
         document = forward_single_logits(model, batch, selected_ids, device)
         rows.extend(batch["rows"])
         documents.append(document.cpu())
+        completed += len(batch["rows"])
+        if workflow_started is not None:
+            progress.set_detail(
+                progress_detail(
+                    workflow_started=workflow_started,
+                    stage_started=stage_started,
+                    done=completed,
+                    total=len(document_loader.dataset),
+                    future_seconds=future_seconds,
+                )
+            )
         progress.update(len(batch["rows"]))
     progress.close()
 
     question_predictions: dict[str, tuple[int, int, int]] = {}
-    progress = StageProgress(len(question_loader.dataset), f"{stage} no-RAG questions")
-    for batch in question_loader:
-        logits = forward_single_logits(model, batch, selected_ids, device)
-        predicted = logits.argmax(-1).tolist()
-        for index, row in enumerate(batch["rows"]):
+    if frozen_no_rag_only:
+        for row in rows:
             sample_id = str(row["sample_id"])
-            if sample_id in question_predictions:
-                raise RuntimeError(f"Duplicate canonical No-RAG question: {sample_id}")
-            question_predictions[sample_id] = (
-                int(predicted[index]),
+            current = (
+                CHOICES.index(str(row["frozen_no_rag_prediction"])),
                 CHOICES.index(str(row["gold_answer"])),
                 CHOICES.index(str(row["frozen_no_rag_prediction"])),
             )
-        progress.update(len(batch["rows"]))
-    progress.close()
+            previous = question_predictions.setdefault(sample_id, current)
+            if previous != current:
+                raise RuntimeError(f"Inconsistent cached No-RAG target: {sample_id}")
+    else:
+        if question_loader is None:
+            raise RuntimeError("A question loader is required for trainable No-RAG evaluation")
+        progress = StageProgress(len(question_loader.dataset), f"{phase_prefix}{stage} no-RAG questions")
+        for batch in question_loader:
+            logits = forward_single_logits(model, batch, selected_ids, device)
+            predicted = logits.argmax(-1).tolist()
+            for index, row in enumerate(batch["rows"]):
+                sample_id = str(row["sample_id"])
+                if sample_id in question_predictions:
+                    raise RuntimeError(f"Duplicate canonical No-RAG question: {sample_id}")
+                question_predictions[sample_id] = (
+                    int(predicted[index]),
+                    CHOICES.index(str(row["gold_answer"])),
+                    CHOICES.index(str(row["frozen_no_rag_prediction"])),
+                )
+            progress.update(len(batch["rows"]))
+        progress.close()
     return finalize_eval(rows, documents, question_predictions)
 
 
@@ -523,6 +699,42 @@ def selection(metrics: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     feasible = all(value <= 1e-12 for value in violations.values())
     rank = [1.0, primary_acc] if feasible else [0.0, -normalized, primary_acc]
     return {"feasible": feasible, "primary_accuracy": primary_acc, "measured": measured, "limits": limits, "violations": violations, "rank": rank}
+
+
+def contrastive_selection(metrics: dict[str, Any]) -> dict[str, Any]:
+    groups = metrics["pair_groups"]
+    primary = groups["direct_support:no_rag_wrong"]
+    direct_w2c = groups["transition:direct_support:W2C"]
+    direct_c2c = groups["transition:direct_support:C2C"]
+    primary_delta = float(primary["absolute_accuracy_delta"])
+    w2c_drop = max(0.0, -float(direct_w2c["absolute_accuracy_delta"]))
+    c2c_drop = max(0.0, -float(direct_c2c["absolute_accuracy_delta"]))
+    limits = {"direct_support_W2C_drop": 0.01, "direct_support_C2C_drop": 0.002}
+    measured = {"direct_support_W2C_drop": w2c_drop, "direct_support_C2C_drop": c2c_drop}
+    violations = {key: max(0.0, measured[key] - limits[key]) for key in limits}
+    feasible = all(value <= 1e-12 for value in violations.values())
+    normalized = sum(violations[key] / limits[key] for key in limits)
+    rank = [1.0, primary_delta] if feasible else [0.0, -normalized, primary_delta]
+    return {
+        "feasible": feasible,
+        "primary_accuracy": float(primary["student_accuracy"]),
+        "primary_accuracy_delta": primary_delta,
+        "measured": measured,
+        "limits": limits,
+        "violations": violations,
+        "rank": rank,
+    }
+
+
+def contrastive_pilot_success(metrics: dict[str, Any]) -> dict[str, Any]:
+    selected = contrastive_selection(metrics)
+    criteria = {
+        "direct_support_no_rag_wrong_accuracy_gain_at_least_0p02": selected["primary_accuracy_delta"] >= 0.02,
+        "direct_support_W2C_accuracy_drop_at_most_0p01": selected["measured"]["direct_support_W2C_drop"] <= 0.01,
+        "direct_support_C2C_accuracy_drop_at_most_0p002": selected["measured"]["direct_support_C2C_drop"] <= 0.002,
+        "no_rag_is_frozen_by_construction": metrics["question_level_no_rag"]["answer_change_rate"] == 0.0,
+    }
+    return {"passed": all(criteria.values()), "criteria": criteria, "measured": selected}
 
 
 def write_summary_markdown(path: Path, summary: dict[str, Any]) -> None:
@@ -555,8 +767,26 @@ def write_summary_markdown(path: Path, summary: dict[str, Any]) -> None:
                     value["absolute_accuracy_delta"],
                 )
             )
+    if summary["objective"] == "semantic_contrastive":
+        for transition in ("C2C", "C2W", "W2C", "W2W"):
+            value = groups.get(f"transition:direct_support:{transition}")
+            if value is not None:
+                rows.append(
+                    (
+                        f"Direct Support transition {transition}",
+                        value["n"],
+                        value["frozen_accuracy"],
+                        value["student_accuracy"],
+                        value["absolute_accuracy_delta"],
+                    )
+                )
+    title = (
+        "Direct semantic-contrastive MVP"
+        if summary["objective"] == "semantic_contrastive"
+        else "Direct semantic-mismatch MVP"
+    )
     lines = [
-        f"# Direct semantic-mismatch MVP — {summary['dataset']}",
+        f"# {title} — {summary['dataset']}",
         "",
         f"- Best epoch: {summary['best_epoch']}",
         f"- Objective: `{summary['objective']}`",
@@ -616,9 +846,23 @@ def pilot_success(metrics: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    workflow_started = time.time() - max(0.0, float(args.prior_workflow_seconds))
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     set_seed(args.seed)
     configure_attention_backend(args.attn_implementation)
+    phase_total = 2 * args.epochs + 4
+    expected_total = (
+        35.0
+        + args.epochs * (args.expected_train_seconds + args.expected_eval_seconds)
+        + args.expected_eval_seconds
+        + 15.0
+    )
+    logging.info(
+        "Workflow plan: phases=%d preflight -> model load -> %d x (train, validation) -> test -> save; initial overall ETA=%s",
+        phase_total,
+        args.epochs,
+        format_duration(expected_total),
+    )
     pair_dir = args.pair_root / args.dataset
     pair_manifest_path = pair_dir / "manifest.json"
     pair_manifest = json.loads(pair_manifest_path.read_text(encoding="utf-8"))
@@ -626,8 +870,9 @@ def main() -> None:
         raise RuntimeError("Prepared-pair version mismatch")
     raw = {split: list(iter_jsonl(pair_dir / f"{split}.jsonl")) for split in ("train", "val", "test")}
     output_dir = args.output_root / args.dataset / args.run_name
+    run_version = CONTRASTIVE_RUN_VERSION if args.objective == "semantic_contrastive" else RUN_VERSION
     contract = {
-        "run_version": RUN_VERSION,
+        "run_version": run_version,
         "dataset": args.dataset,
         "objective": args.objective,
         "hypothesis": pair_manifest["hypothesis"],
@@ -636,15 +881,16 @@ def main() -> None:
         "prompt_policy_version": PROMPT_POLICY_VERSION,
         "epochs": args.epochs,
         "patience": args.patience,
-        "batch": {"train": args.train_examples_per_batch, "eval": args.eval_examples_per_batch, "accumulation": args.gradient_accumulation_steps},
+        "batch": {"train": args.train_examples_per_batch, "eval": args.eval_examples_per_batch, "accumulation": args.gradient_accumulation_steps, "examples_per_contrastive_group": args.examples_per_group_batch},
         "optimizer": {"learning_rate": args.learning_rate, "weight_decay": args.weight_decay, "warmup_ratio": args.warmup_ratio, "max_grad_norm": args.max_grad_norm},
-        "loss": {"boundary_margin": args.boundary_margin, "gain_margin": args.gain_margin, "no_rag_preservation_weight": args.no_rag_preservation_weight, "failure_case_weight": args.failure_case_weight, "normal_case_weight": args.normal_case_weight},
+        "loss": {"boundary_margin": args.boundary_margin, "gain_margin": args.gain_margin, "pair_margin": args.pair_margin, "min_pair_teacher_gap": args.min_pair_teacher_gap, "no_rag_preservation_weight": args.no_rag_preservation_weight, "failure_case_weight": args.failure_case_weight, "normal_case_weight": args.normal_case_weight},
         "checkpoint_constraints": {"max_no_rag_accuracy_drop": args.max_no_rag_accuracy_drop, "max_destruction_rate_increase": args.max_destruction_rate_increase},
         "lora": {"rank": args.lora_rank, "alpha": args.lora_alpha, "dropout": args.lora_dropout, "targets": list(args.lora_target_modules)},
         "max_input_tokens": args.max_input_tokens,
         "seed": args.seed,
         "dtype": args.dtype,
         "attn_implementation": args.attn_implementation,
+        "deployment_contract": "semantic_contrastive uses the frozen base model for No-RAG and enables the LoRA adapter only when evidence is present" if args.objective == "semantic_contrastive" else "LoRA adapter is active for both No-RAG and evidence inputs",
         "code_sha256": sha256_file(Path(__file__)),
         "code_commit": git_commit(),
         "environment": {
@@ -653,7 +899,7 @@ def main() -> None:
             "peft": __import__("peft").__version__,
         },
     }
-    contract_hash = fingerprint(contract)
+    contract_hash = fingerprint(semantic_contract(contract))
     contract_path = output_dir / "run_contract.json"
     if contract_path.is_file():
         previous = json.loads(contract_path.read_text(encoding="utf-8"))
@@ -670,12 +916,38 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     encoded = {
-        split: EncodedDataset(rows, tokenizer, args.max_input_tokens, f"[preflight {index}/3 tokenize:{args.dataset}:{split}]")
+        split: EncodedDataset(
+            rows,
+            tokenizer,
+            args.max_input_tokens,
+            f"[overall 1/{phase_total}] preflight {index}/3 tokenize:{args.dataset}:{split}",
+        )
         for index, (split, rows) in enumerate(raw.items(), 1)
     }
     logging.info("Preflight complete: encoded=%s overlength=%s max_tokens=%s", {key: len(value) for key, value in encoded.items()}, {key: value.excluded_overlength for key, value in encoded.items()}, {key: value.max_observed_tokens for key, value in encoded.items()})
+    contrastive_groups = None
+    contrastive_target = 0
+    if args.objective == "semantic_contrastive":
+        contrastive_groups = build_training_groups(encoded["train"].values, args.min_pair_teacher_gap)
+        contrastive_target, _ = balanced_epoch_samples(contrastive_groups, epoch=1, seed=args.seed)
+        logging.info(
+            "Semantic-contrastive groups ready: raw=%s balanced_per_epoch=%d objective_share=25%% each",
+            {key: len(value) for key, value in contrastive_groups.items()},
+            contrastive_target,
+        )
     if args.preflight_only:
         return
+
+    logging.info(
+        "[overall 1/%d complete | elapsed %s | overall ETA %s] preflight and training-group construction complete",
+        phase_total,
+        format_duration(time.time() - workflow_started),
+        format_duration(
+            args.epochs * (args.expected_train_seconds + args.expected_eval_seconds)
+            + args.expected_eval_seconds
+            + 15.0
+        ),
+    )
 
     collator = Collator(tokenizer.pad_token_id)
     document_collator = BranchCollator(tokenizer.pad_token_id, "document_ids")
@@ -689,7 +961,17 @@ def main() -> None:
         "test_question": DataLoader(QuestionDataset(encoded["test"]), batch_size=args.eval_examples_per_batch, shuffle=False, collate_fn=question_collator, num_workers=0, pin_memory=True),
     }
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    logging.info("Loading target Llama for LoRA: %s", args.model_name_or_path)
+    logging.info(
+        "[overall 2/%d | elapsed %s | overall ETA %s] loading target Llama for LoRA: %s",
+        phase_total,
+        format_duration(time.time() - workflow_started),
+        format_duration(
+            args.epochs * (args.expected_train_seconds + args.expected_eval_seconds)
+            + args.expected_eval_seconds
+            + 15.0
+        ),
+        args.model_name_or_path,
+    )
     base_model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, dtype=dtype, attn_implementation=args.attn_implementation, low_cpu_mem_usage=True)
     model = get_peft_model(
         base_model,
@@ -704,9 +986,40 @@ def main() -> None:
     selected_ids = choice_ids(tokenizer, device)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=args.weight_decay)
-    updates_per_epoch = math.ceil(len(loaders["train"]) / args.gradient_accumulation_steps)
+    if args.objective == "semantic_contrastive":
+        contrastive_steps = math.ceil(contrastive_target / args.examples_per_group_batch)
+        updates_per_epoch = math.ceil(contrastive_steps / args.gradient_accumulation_steps)
+    else:
+        updates_per_epoch = math.ceil(len(loaders["train"]) / args.gradient_accumulation_steps)
     total_updates = max(1, args.epochs * updates_per_epoch)
     scheduler = get_linear_schedule_with_warmup(optimizer, int(round(total_updates * args.warmup_ratio)), total_updates)
+
+    if args.smoke_test_only:
+        if args.objective != "semantic_contrastive" or contrastive_groups is None:
+            raise RuntimeError("--smoke-test-only requires --objective semantic_contrastive")
+        smoke_groups = {name: values[:4] for name, values in contrastive_groups.items()}
+        smoke_loss, smoke_seconds = train_contrastive_epoch(
+            args=args,
+            model=model,
+            groups=smoke_groups,
+            epoch=1,
+            collator=document_collator,
+            selected_ids=selected_ids,
+            device=device,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            trainable=trainable,
+            workflow_started=workflow_started,
+            phase_index=3,
+            phase_total=phase_total,
+            future_seconds=0.0,
+        )
+        logging.info(
+            "Smoke test complete: four_groups=4 examples_per_group=4 forwarded_documents=20 loss=%.6f duration=%s",
+            smoke_loss,
+            format_duration(smoke_seconds),
+        )
+        return
 
     checkpoint_path = output_dir / "checkpoint_last.pt"
     phase_checkpoint_path = output_dir / "checkpoint_after_train.pt"
@@ -769,7 +1082,10 @@ def main() -> None:
 
     measured_epoch_seconds: list[float] = []
     last_validation_seconds = 0.0
+    train_seconds_estimate = float(args.expected_train_seconds)
+    eval_seconds_estimate = float(args.expected_eval_seconds)
     for epoch in range(start_epoch, args.epochs + 1):
+        train_phase = 3 + 2 * (epoch - 1)
         if resume_validation_epoch == epoch:
             train_loss = resumed_train_loss
             train_duration = resumed_train_duration
@@ -780,37 +1096,63 @@ def main() -> None:
                 train_loss,
             )
         else:
-            train_started = time.time()
-            model.train()
-            optimizer.zero_grad(set_to_none=True)
-            progress = StageProgress(len(encoded["train"]), f"[train epoch {epoch}/{args.epochs}:{args.dataset}]")
-            loss_sum = 0.0
-            count_sum = 0
-            accumulation = 0
-            for batch_index, batch in enumerate(loaders["train"], 1):
-                document, question = forward_logits(model, batch, selected_ids, device)
-                losses = objective_loss(args, document, question, batch, device)
-                (losses["loss"] / args.gradient_accumulation_steps).backward()
-                accumulation += 1
-                count = len(batch["rows"])
-                count_sum += count
-                loss_sum += float(losses["loss"].detach()) * count
-                if accumulation == args.gradient_accumulation_steps or batch_index == len(loaders["train"]):
-                    if accumulation != args.gradient_accumulation_steps:
-                        factor = args.gradient_accumulation_steps / accumulation
-                        for parameter in trainable:
-                            if parameter.grad is not None:
-                                parameter.grad.mul_(factor)
-                    torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    accumulation = 0
-                progress.set_detail(f"batch={batch_index}/{len(loaders['train'])} loss={float(losses['loss'].detach()):.4f}")
-                progress.update(count)
-            progress.close()
-            train_duration = time.time() - train_started
-            train_loss = loss_sum / max(1, count_sum)
+            future_after_train = (
+                eval_seconds_estimate
+                + (args.epochs - epoch) * (train_seconds_estimate + eval_seconds_estimate)
+                + eval_seconds_estimate
+                + 15.0
+            )
+            if args.objective == "semantic_contrastive":
+                if contrastive_groups is None:
+                    raise AssertionError("Semantic-contrastive groups were not initialized")
+                train_loss, train_duration = train_contrastive_epoch(
+                    args=args,
+                    model=model,
+                    groups=contrastive_groups,
+                    epoch=epoch,
+                    collator=document_collator,
+                    selected_ids=selected_ids,
+                    device=device,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    trainable=trainable,
+                    workflow_started=workflow_started,
+                    phase_index=train_phase,
+                    phase_total=phase_total,
+                    future_seconds=future_after_train,
+                )
+            else:
+                train_started = time.time()
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+                progress = StageProgress(len(encoded["train"]), f"[train epoch {epoch}/{args.epochs}:{args.dataset}]")
+                loss_sum = 0.0
+                count_sum = 0
+                accumulation = 0
+                for batch_index, batch in enumerate(loaders["train"], 1):
+                    document, question = forward_logits(model, batch, selected_ids, device)
+                    losses = objective_loss(args, document, question, batch, device)
+                    (losses["loss"] / args.gradient_accumulation_steps).backward()
+                    accumulation += 1
+                    count = len(batch["rows"])
+                    count_sum += count
+                    loss_sum += float(losses["loss"].detach()) * count
+                    if accumulation == args.gradient_accumulation_steps or batch_index == len(loaders["train"]):
+                        if accumulation != args.gradient_accumulation_steps:
+                            factor = args.gradient_accumulation_steps / accumulation
+                            for parameter in trainable:
+                                if parameter.grad is not None:
+                                    parameter.grad.mul_(factor)
+                        torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        accumulation = 0
+                    progress.set_detail(f"batch={batch_index}/{len(loaders['train'])} loss={float(losses['loss'].detach()):.4f}")
+                    progress.update(count)
+                progress.close()
+                train_duration = time.time() - train_started
+                train_loss = loss_sum / max(1, count_sum)
             atomic_torch(
                 phase_checkpoint_path,
                 {
@@ -832,17 +1174,33 @@ def main() -> None:
                 epoch,
                 phase_checkpoint_path,
             )
+        train_seconds_estimate = train_duration
         validation_started = time.time()
+        future_after_validation = (
+            (args.epochs - epoch) * (train_seconds_estimate + eval_seconds_estimate)
+            + eval_seconds_estimate
+            + 15.0
+        )
         val_metrics, _ = evaluate(
             model,
             loaders["val_document"],
-            loaders["val_question"],
+            None if args.objective == "semantic_contrastive" else loaders["val_question"],
             selected_ids,
             device,
             f"[validation epoch {epoch}/{args.epochs}:{args.dataset}]",
+            frozen_no_rag_only=args.objective == "semantic_contrastive",
+            workflow_started=workflow_started,
+            phase_index=train_phase + 1,
+            phase_total=phase_total,
+            future_seconds=future_after_validation,
         )
         last_validation_seconds = time.time() - validation_started
-        current_selection = selection(val_metrics, args)
+        eval_seconds_estimate = last_validation_seconds
+        current_selection = (
+            contrastive_selection(val_metrics)
+            if args.objective == "semantic_contrastive"
+            else selection(val_metrics, args)
+        )
         current_rank = tuple(float(value) for value in current_selection["rank"])
         improved = best_rank is None or current_rank > best_rank
         if improved:
@@ -897,10 +1255,21 @@ def main() -> None:
     test_metrics, predictions = evaluate(
         model,
         loaders["test_document"],
-        loaders["test_question"],
+        None if args.objective == "semantic_contrastive" else loaders["test_question"],
         selected_ids,
         device,
         f"[held-out test:{args.dataset}]",
+        frozen_no_rag_only=args.objective == "semantic_contrastive",
+        workflow_started=workflow_started,
+        phase_index=3 + 2 * args.epochs,
+        phase_total=phase_total,
+        future_seconds=15.0,
+    )
+    logging.info(
+        "[overall %d/%d | elapsed %s | overall ETA 00h00m15s] save final adapter and reports",
+        phase_total,
+        phase_total,
+        format_duration(time.time() - workflow_started),
     )
     final_dir = output_dir / "final_model"
     model.save_pretrained(final_dir, safe_serialization=True)
@@ -916,8 +1285,16 @@ def main() -> None:
         "best_validation": history[best_epoch - 1]["validation"],
         "best_validation_selection": history[best_epoch - 1]["selection"],
         "test": test_metrics,
-        "pilot_success": pilot_success(test_metrics),
-        "test_selection_audit": selection(test_metrics, args),
+        "pilot_success": (
+            contrastive_pilot_success(test_metrics)
+            if args.objective == "semantic_contrastive"
+            else pilot_success(test_metrics)
+        ),
+        "test_selection_audit": (
+            contrastive_selection(test_metrics)
+            if args.objective == "semantic_contrastive"
+            else selection(test_metrics, args)
+        ),
         "final_model": str(final_dir.resolve()),
     }
     atomic_json(output_dir / "summary.json", summary)

@@ -127,6 +127,27 @@ def fingerprint(value: Any) -> str:
     ).hexdigest()
 
 
+def semantic_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Return fields that determine prepared-data meaning, excluding provenance."""
+    return {
+        key: value
+        for key, value in contract.items()
+        if key not in {"code_commit", "code_sha256"}
+    }
+
+
+def prepared_contract_matches(
+    stored: dict[str, Any], current: dict[str, Any], current_fingerprint: str
+) -> bool:
+    if stored.get("contract_fingerprint") == current_fingerprint:
+        return True
+    # Legacy manifests included the repository commit in their fingerprint.
+    # Semantic preparation changes must bump RUN_VERSION; source hash and
+    # repository commit are provenance and may change after compatibility fixes.
+    expected = semantic_contract(current)
+    return all(stored.get(key) == value for key, value in expected.items())
+
+
 def git_commit() -> str:
     return subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -361,18 +382,18 @@ def main() -> None:
         "code_sha256": sha256_file(Path(__file__)),
         "code_commit": git_commit(),
     }
-    contract_hash = fingerprint(contract)
+    contract_hash = fingerprint(semantic_contract(contract))
     contract_path = output_dir / "run_contract.json"
     completed_path = output_dir / "manifest.json"
     if args.resume and completed_path.is_file() and all(path.is_file() for path in outputs.values()):
         current = json.loads(completed_path.read_text(encoding="utf-8"))
-        if current.get("contract_fingerprint") == contract_hash:
+        if prepared_contract_matches(current, contract, contract_hash):
             logging.info("Prepared MVP data are complete and reusable: %s", output_dir)
             return
         raise RuntimeError("Prepared MVP contract mismatch; use a versioned output root")
     if contract_path.is_file():
         previous = json.loads(contract_path.read_text(encoding="utf-8"))
-        if previous.get("contract_fingerprint") != contract_hash:
+        if not prepared_contract_matches(previous, contract, contract_hash):
             raise RuntimeError("Incomplete prepared-data contract mismatch; use a new output root")
     atomic_json(contract_path, {**contract, "contract_fingerprint": contract_hash})
     logging.info(

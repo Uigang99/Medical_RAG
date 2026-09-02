@@ -141,12 +141,14 @@ venv/
 !/scripts/materialize_rag2_semantic_subset_plan.py
 !/scripts/generate_rag2_anchored_semantic_subset_traces.py
 !/scripts/run_rag2_anchored_semantic_subset_rationale_generation.sh
+!/scripts/run_rag2_direct_semantic_contrastive_mvp.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
 !/medrag/generation/learned_semantic_attention.py
 !/medrag/training/rag2_semantic_attention_data.py
 !/medrag/training/__init__.py
+!/medrag/training/direct_semantic_contrastive.py
 !/medrag/attribution/
 !/medrag/attribution/__init__.py
 !/medrag/attribution/target_llm_predictor.py
@@ -174,3 +176,4 @@ venv/
 !/tests/test_rag2_target_llm_attribution.py
 !/tests/test_rag2_gold_free_subset_policies.py
 !/tests/test_rag2_semantic_subset_traces.py
+!/tests/test_direct_semantic_contrastive.py
