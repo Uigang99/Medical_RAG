@@ -2,10 +2,12 @@
 """Cache exact direct-choice outcomes for every train question and Top-8 document.
 
 For each immutable reranked candidate row this script evaluates the frozen
-target Llama at the *same* direct-choice decision point:
+target Llama at a direct-choice decision point that shares the anchored
+rationale pipeline's question, option, document, chat-template, and terminal
+answer layout:
 
-  * no-RAG:       ``Q + options -> Final answer:``
-  * single-doc:   ``Q + options + document D_i -> Final answer:``
+  * no-RAG:       ``Q + options -> Final answer: (``
+  * single-doc:   ``Q + options + document D_i -> Final answer: (``
 
 The model is not asked to generate a rationale.  The answer is the greedy
 maximum among the four permitted next-token choices A/B/C/D.  Raw vocabulary
@@ -38,6 +40,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file as save_safetensors
 from tqdm.auto import tqdm
@@ -56,18 +59,29 @@ from generate_rag2_anchored_layer_pilot import (  # noqa: E402
     atomic_write_jsonl,
 )
 from medrag.core import BenchmarkSample  # noqa: E402
-from medrag.filtering.rag2_preanswer_text_hidden import (  # noqa: E402
+from medrag.rag2_anchored_trace import (  # noqa: E402
     CHOICES,
-    FINAL_ANSWER_PREFILL,
-    PREANSWER_PROMPT_VERSION,
-    build_preanswer_user_prompt,
+    FINAL_ANSWER_PREFIX,
+    PROMPT_VERSION as ANCHORED_RATIONALE_PROMPT_VERSION,
+    render_chat_prompt as render_anchored_chat_prompt,
 )
+from medrag.rag2_mcq import clean_text, format_question  # noqa: E402
 
 
-RUN_VERSION = "rag2_direct_choice_single_document_outcomes_v1"
-PROMPT_POLICY_VERSION = "rag2_fixed_direct_choice_context_v1"
-SCORE_POLICY_VERSION = "exact_four_choice_next_token_logits_v1"
+RUN_VERSION = "rag2_anchored_direct_choice_single_document_outcomes_v1"
+PROMPT_POLICY_VERSION = "rag2_paper_compatible_three_anchor_direct_choice_v1"
+SCORE_POLICY_VERSION = "exact_four_choice_next_token_logits_after_open_parenthesis_v2"
 FEATURE_POLICY_VERSION = "direct_choice_outcome_features_v1"
+DIRECT_CHOICE_INSTRUCTION = (
+    "The following are multiple choice questions about medical knowledge. "
+    "Select the single best option from the given options."
+)
+DIRECT_CHOICE_FORMAT_INSTRUCTION = (
+    "Use exactly this response structure:\n"
+    "Final answer: (<OPTION LETTER>) <EXACT OPTION TEXT>\n"
+    "Do not provide a rationale or explanation. "
+    "Do not write anything before or after the final answer."
+)
 DEFAULT_MODEL = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 DEFAULT_CANDIDATE_ROOT = (
     PROJECT_ROOT
@@ -77,7 +91,7 @@ DEFAULT_CANDIDATE_ROOT = (
 DEFAULT_OUTPUT_ROOT = (
     PROJECT_ROOT
     / "datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1"
-    / "direct_choice_single_document_outcomes_source_balanced32_rerank8_v1"
+    / "anchored_direct_choice_single_document_outcomes_source_balanced32_rerank8_v1"
 )
 SUPPORTED_DATASETS = ("medmcqa", "medqa")
 
@@ -103,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
-    parser.add_argument("--attn-implementation", choices=["sdpa", "eager", "flash_attention_2"], default="sdpa")
+    parser.add_argument("--attn-implementation", choices=["sdpa", "eager", "flash_attention_2"], default="eager")
     parser.add_argument(
         "--questions-for-prompt-sample",
         type=int,
@@ -240,10 +254,13 @@ def immutable_contract(args: argparse.Namespace, candidates: dict[str, dict[str,
         "prompt_policy_version": PROMPT_POLICY_VERSION,
         "score_policy_version": SCORE_POLICY_VERSION,
         "feature_policy_version": FEATURE_POLICY_VERSION,
-        "preanswer_prompt_version": PREANSWER_PROMPT_VERSION,
-        "final_answer_prefill": FINAL_ANSWER_PREFILL,
+        "anchored_rationale_prompt_version_reference": ANCHORED_RATIONALE_PROMPT_VERSION,
+        "shared_input_layout": "format_question_then_optional_documents_v1",
+        "direct_choice_instruction": DIRECT_CHOICE_INSTRUCTION,
+        "direct_choice_format_instruction": DIRECT_CHOICE_FORMAT_INSTRUCTION,
+        "final_answer_prefix": FINAL_ANSWER_PREFIX,
         "choice_labels": list(CHOICES),
-        "choice_tokenization": "leading_space_single_token_after_final_answer_colon_v1",
+        "choice_tokenization": "plain_single_token_after_open_parenthesis_v1",
         "datasets": list(args.datasets),
         "split": args.split,
         "docs_per_question": int(args.docs_per_question),
@@ -290,29 +307,45 @@ def make_sample(row: dict[str, Any]) -> BenchmarkSample:
 
 
 def render_chat_prompt(tokenizer: Any, user_prompt: str) -> str:
-    messages = [{"role": "user", "content": user_prompt}]
-    try:
-        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    except TypeError:
-        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return str(rendered) + FINAL_ANSWER_PREFILL
+    return render_anchored_chat_prompt(tokenizer, user_prompt) + FINAL_ANSWER_PREFIX
+
+
+def build_anchored_direct_choice_user_prompt(sample: BenchmarkSample, document_text: str | None) -> str:
+    """Mirror the anchored rationale input layout while omitting its rationale block."""
+    row = {"question": sample.question, "options": sample.options}
+    prompt = (
+        f"{DIRECT_CHOICE_INSTRUCTION}\n"
+        f"{DIRECT_CHOICE_FORMAT_INSTRUCTION}\n"
+        f"Here is the question: {format_question(row)}"
+    )
+    evidence = str(document_text or "").strip()
+    if evidence:
+        prompt += f"\n\nDocuments:\n{evidence}"
+    return prompt
 
 
 def sequence_for_prompt(tokenizer: Any, sample: BenchmarkSample, document_text: str | None) -> tuple[list[int], str]:
-    user_prompt = build_preanswer_user_prompt(sample, document_text)
+    user_prompt = build_anchored_direct_choice_user_prompt(sample, document_text)
     prompt = render_chat_prompt(tokenizer, user_prompt)
     token_ids = list(tokenizer.encode(prompt, add_special_tokens=False))
-    marker_ids = list(tokenizer.encode(FINAL_ANSWER_PREFILL, add_special_tokens=False))
+    marker_ids = list(tokenizer.encode(FINAL_ANSWER_PREFIX, add_special_tokens=False))
     if token_ids[-len(marker_ids) :] != marker_ids:
-        raise RuntimeError("Rendered prompt does not end in the fixed Final answer: marker")
+        raise RuntimeError("Rendered prompt does not end in the fixed 'Final answer: (' prefix")
     return token_ids, prompt
 
 
 def document_text(document: dict[str, Any]) -> str:
-    value = " ".join(str(document.get("text") or document.get("title") or "").split())
+    value = str(document.get("text") or "").strip()
     if not value:
         raise ValueError("Encountered an empty reranked document")
     return value
+
+
+def canonical_direct_response(prediction: str, options: dict[str, str]) -> str:
+    label = str(prediction).strip().upper()
+    if label not in CHOICES or label not in options:
+        raise ValueError(f"Invalid constrained direct-choice answer: {prediction!r}")
+    return f"{FINAL_ANSWER_PREFIX}{label}) {clean_text(options[label])}"
 
 
 def document_metadata(document: dict[str, Any], text: str) -> dict[str, Any]:
@@ -404,9 +437,7 @@ class ExactDirectChoiceScorer:
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.choice_token_ids = {
-            choice: self._leading_space_choice_token_id(choice) for choice in CHOICES
-        }
+        self.choice_token_ids = {choice: self._choice_token_id(choice) for choice in CHOICES}
         self.choice_ids = torch.tensor([self.choice_token_ids[choice] for choice in CHOICES], dtype=torch.long)
         logging.info(
             "Loading frozen direct-choice scorer: model=%s device=%s dtype=%s attention=%s choice_token_ids=%s",
@@ -427,13 +458,13 @@ class ExactDirectChoiceScorer:
         except (ImportError, ValueError) as exc:
             if args.attn_implementation != "flash_attention_2":
                 raise
-            logging.warning("flash_attention_2 unavailable (%s); retrying with SDPA", exc)
+            logging.warning("flash_attention_2 unavailable (%s); retrying with eager attention", exc)
             self.model = AutoModelForCausalLM.from_pretrained(
                 str(args.model_name_or_path),
                 dtype=self.dtype,
                 low_cpu_mem_usage=True,
                 local_files_only=True,
-                attn_implementation="sdpa",
+                attn_implementation="eager",
             )
         self.model.requires_grad_(False)
         self.model.eval().to(self.device)
@@ -443,11 +474,20 @@ class ExactDirectChoiceScorer:
         self.output_embeddings = self.model.get_output_embeddings()
         if self.output_embeddings is None:
             raise RuntimeError("Causal LM has no output embedding head")
+        output_weight = getattr(self.output_embeddings, "weight", None)
+        if output_weight is None:
+            raise RuntimeError("Causal LM output head does not expose token weights")
+        device_choice_ids = self.choice_ids.to(output_weight.device)
+        self.choice_output_weight = output_weight.index_select(0, device_choice_ids).detach()
+        output_bias = getattr(self.output_embeddings, "bias", None)
+        self.choice_output_bias = (
+            output_bias.index_select(0, device_choice_ids).detach() if output_bias is not None else None
+        )
 
-    def _leading_space_choice_token_id(self, choice: str) -> int:
-        ids = self.tokenizer.encode(f" {choice}", add_special_tokens=False)
+    def _choice_token_id(self, choice: str) -> int:
+        ids = self.tokenizer.encode(choice, add_special_tokens=False)
         if len(ids) != 1:
-            raise RuntimeError(f"Choice continuation {choice!r} is not exactly one leading-space token: {ids}")
+            raise RuntimeError(f"Choice continuation {choice!r} is not exactly one token after '(': {ids}")
         return int(ids[0])
 
     def score(self, sequences: Sequence[Sequence[int]]) -> np.ndarray:
@@ -480,8 +520,10 @@ class ExactDirectChoiceScorer:
                         return_dict=True,
                     )
                     last_hidden = outputs.last_hidden_state[:, -1, :]
-                    four_logits = self.output_embeddings(last_hidden).index_select(
-                        dim=-1, index=self.choice_ids.to(last_hidden.device)
+                    four_logits = F.linear(
+                        last_hidden,
+                        self.choice_output_weight,
+                        self.choice_output_bias,
                     )
                 values = four_logits.float().cpu().numpy()
                 for row_index, value in zip(batch_indices, values):
@@ -750,6 +792,7 @@ def score_question_shard(
                 "probability_tensor_key": "no_rag_choice_probabilities",
                 **features,
             }
+            record["canonical_response"] = canonical_direct_response(record["prediction"], sample.options)
             question_records.append(record)
             question_state[q_index] = (record, current_logits, current_probabilities, gold_index)
             continue
@@ -786,6 +829,7 @@ def score_question_shard(
             "document": spec["document"],
             **features,
         }
+        record["canonical_response"] = canonical_direct_response(record["prediction"], sample.options)
         pair_records.append(record)
         pair_offset += 1
     if len(question_records) != len(rows) or len(pair_records) != len(rows) * 8:
@@ -1005,7 +1049,7 @@ def main() -> None:
             "total_single_document_pairs": total_pairs,
             "total_direct_choice_prompts": total_questions + total_pairs,
             "choice_token_ids": scorer.choice_token_ids if scorer is not None else {
-                choice: int(tokenizer.encode(f" {choice}", add_special_tokens=False)[0]) for choice in CHOICES
+                choice: int(tokenizer.encode(choice, add_special_tokens=False)[0]) for choice in CHOICES
             },
             "stored_features": {
                 "safetensors": [
@@ -1014,12 +1058,14 @@ def main() -> None:
                 ],
                 "no_rag_jsonl": [
                     "argmax prediction/correctness",
+                    "canonical Final answer: (<letter>) <exact option text> response",
                     "gold probability, gold margin, gold rank",
                     "top-1 probability, top-1 margin, entropy",
                     "prompt token count and prompt hash",
                 ],
                 "single_document_jsonl": [
                     "all no-RAG features",
+                    "canonical Final answer: (<letter>) <exact option text> response",
                     "gold probability/margin deltas",
                     "four-choice logit/probability deltas",
                     "prediction change and C2C/C2W/W2C/W2W transition",

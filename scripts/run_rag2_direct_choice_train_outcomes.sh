@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Cache frozen Llama direct-choice logits for train No-RAG and every reranked Top-8 document.
+# Cache frozen Llama anchored direct-choice logits for train No-RAG and every reranked Top-8 document.
+# Relative to the anchored rationale pipeline, only the rationale block is omitted.
 # The Python workflow prints its own per-stage, per-dataset progress, rate, and ETA.
 
 set -euo pipefail
@@ -12,7 +13,7 @@ PYTHON="/home/user/Uiheon/.venv_vllm/bin/python"
 SCRIPT="$PROJECT/scripts/cache_rag2_direct_choice_train_outcomes.py"
 MODEL="/home/user/Uiheon/models/Llama-3-8B-Instruct"
 CANDIDATES="$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1/candidates/source_balanced32_rerank8_v1"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1/direct_choice_single_document_outcomes_source_balanced32_rerank8_v1}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT/datasets/filtering/rag2/llama3_8b_paper_compatible_three_anchor_v1/anchored_direct_choice_single_document_outcomes_source_balanced32_rerank8_v1}"
 
 # Eager attention is deliberate here. PyTorch 2.11/cuDNN SDPA cannot build an
 # execution plan for some of the variable-length left-padded train batches.
@@ -28,7 +29,8 @@ test -f "$CANDIDATES/medmcqa/train/candidates_top8.jsonl"
 test -f "$CANDIDATES/medqa/train/candidates_top8.jsonl"
 
 echo "[overall 0/2 | elapsed 00h00m00s | ETA unknown until the first scoring shard]"
-echo "direct-choice train cache: datasets=medmcqa,medqa; questions=192995; single-document pairs=1543960; prompts=1736955"
+echo "anchored direct-choice train cache: datasets=medmcqa,medqa; questions=192995; single-document pairs=1543960; prompts=1736955"
+echo "comparison contract: same question/options/Documents/chat/final-answer layout as anchored rationale; rationale block omitted"
 echo "GPU logical device=${CUDA_VISIBLE_DEVICES}; initial_prompt_batch_size=${PROMPT_BATCH_SIZE}; questions_per_shard=${QUESTIONS_PER_SHARD}"
 
 exec "$PYTHON" "$SCRIPT" \
