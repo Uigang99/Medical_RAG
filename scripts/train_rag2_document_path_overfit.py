@@ -46,7 +46,7 @@ from medrag.training.document_path_lora import DocumentPathAdapter  # noqa: E402
 from medrag.training.semantic_behavior_lora import gold_margins  # noqa: E402
 
 
-RUN_VERSION = "rag2_document_path_lora_overfit256_v2"
+RUN_VERSION = "rag2_document_path_lora_overfit256_v3"
 DATA_VERSION = "rag2_document_path_overfit256_data_v1"
 BASE = (
     PROJECT_ROOT
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=WORKSPACE_ROOT / "models/RAG2-Document-Path-LoRA",
     )
-    parser.add_argument("--run-name", default="medmcqa_document_first_overfit256_v2")
+    parser.add_argument("--run-name", default="medmcqa_document_first_overfit256_v3")
     parser.add_argument("--questions", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--attn-implementation", choices=("eager",), default="eager")
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recompute layer activations during backward to keep eager-attention training within H200 memory.",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--log-level", default="INFO")
@@ -732,6 +738,7 @@ def main() -> None:
         },
         "dtype": args.dtype,
         "attention_implementation": args.attn_implementation,
+        "gradient_checkpointing": args.gradient_checkpointing,
         "seed": args.seed,
     }
     contract_hash = fingerprint(contract)
@@ -801,6 +808,13 @@ def main() -> None:
         ).to(args.device)
         model._document_path_tokenizer = tokenizer
         model.config.use_cache = False
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            logging.info(
+                "Gradient checkpointing enabled: eager-attention activations will be recomputed during backward"
+            )
         adapter = DocumentPathAdapter(
             model, rank=args.lora_rank, alpha=args.lora_alpha, dropout=args.lora_dropout
         )

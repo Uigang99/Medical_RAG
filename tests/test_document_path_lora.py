@@ -2,8 +2,9 @@ import unittest
 
 import torch
 from torch import nn
+from transformers import LlamaConfig, LlamaForCausalLM
 
-from medrag.training.document_path_lora import DocumentPathLoRALinear
+from medrag.training.document_path_lora import DocumentPathAdapter, DocumentPathLoRALinear
 from scripts.train_rag2_document_path_overfit import collate
 
 
@@ -44,6 +45,34 @@ class DocumentPathLoRATest(unittest.TestCase):
         # The first B rows must be positive, next B negative, final B swap.
         lengths = batch["attention_mask"].sum(-1).tolist()
         self.assertEqual(lengths, [2, 5, 3, 6, 4, 7])
+
+    def test_gradient_checkpointing_backpropagates_to_document_adapter(self):
+        config = LlamaConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            pad_token_id=0,
+        )
+        model = LlamaForCausalLM(config)
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        adapter = DocumentPathAdapter(model, rank=2, alpha=4, dropout=0)
+        adapter.set_document_mask(torch.tensor([[False, True, True, False]]))
+        model.train()
+        output = model.model(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=torch.ones(1, 4, dtype=torch.long),
+            use_cache=False,
+            return_dict=True,
+        )
+        output.last_hidden_state.square().sum().backward()
+        self.assertTrue(any(module.lora_b.weight.grad is not None for module in adapter.modules))
 
 
 if __name__ == "__main__":
