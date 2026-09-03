@@ -18,7 +18,7 @@ import random
 import subprocess
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -93,11 +93,171 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--attn-implementation", choices=("sdpa", "eager", "flash_attention_2"), default="sdpa")
-    parser.add_argument("--expected-candidate-seconds", type=float, default=30.0)
+    parser.add_argument("--expected-candidate-seconds", type=float, default=20.0)
+    parser.add_argument("--expected-preflight-seconds", type=float, default=10.0)
     parser.add_argument("--expected-scoring-seconds", type=float, default=240.0)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
+
+
+class HierarchicalProgress:
+    """Two-line, time-weighted workflow and active-stage progress display."""
+
+    def __init__(self, stage_names: Sequence[str], stage_estimates: Sequence[float]) -> None:
+        if len(stage_names) != len(stage_estimates) or not stage_names:
+            raise ValueError("Stage names and estimates must have the same non-zero length")
+        self.stage_names = list(stage_names)
+        self.stage_estimates = [max(0.1, float(value)) for value in stage_estimates]
+        self.started = time.time()
+        self.stage_index = 0
+        self.stage_started = self.started
+        self.stage_total = 1
+        self.stage_done = 0
+        self.stage_unit = "item"
+        self.history: deque[tuple[float, int]] = deque()
+        self.stage_bar: tqdm[Any] | None = None
+        self.last_rendered = 0.0
+        self.overall_bar = tqdm(
+            total=1000,
+            desc="Overall",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+            mininterval=1.0,
+            bar_format="{desc}: {percentage:3.0f}%|{bar:10}| [initializing]",
+        )
+
+    @property
+    def stage_count(self) -> int:
+        return len(self.stage_names)
+
+    def start_stage(self, index: int, total: int, unit: str) -> None:
+        if self.stage_bar is not None:
+            self.stage_bar.close()
+        self.stage_index = index
+        self.stage_started = time.time()
+        self.stage_total = max(1, int(total))
+        self.stage_done = 0
+        self.stage_unit = unit
+        self.history.clear()
+        self.history.append((self.stage_started, 0))
+        self.stage_bar = tqdm(
+            total=int(total),
+            desc=f"Stage {index}/{self.stage_count} - {self.stage_names[index-1]}",
+            unit=unit,
+            position=1,
+            leave=False,
+            dynamic_ncols=True,
+            mininterval=1.0,
+            bar_format=(
+                "{desc}: {percentage:3.0f}%|{bar:10}| {n_fmt}/{total_fmt} "
+                f"[calibrating, ETA {format_duration(self.stage_estimates[index-1])}]"
+            ),
+        )
+        self._refresh(force=True)
+
+    def _rolling_rate(self, now: float) -> float | None:
+        while len(self.history) > 2 and self.history[1][0] < now - 30.0:
+            self.history.popleft()
+        if len(self.history) < 2:
+            return None
+        seconds = self.history[-1][0] - self.history[0][0]
+        completed = self.history[-1][1] - self.history[0][1]
+        return completed / seconds if seconds > 0 and completed > 0 else None
+
+    def _remaining_seconds(self, now: float) -> tuple[float, float, float | None]:
+        rate = self._rolling_rate(now)
+        remaining_items = max(0, self.stage_total - self.stage_done)
+        if remaining_items == 0:
+            stage_eta = 0.0
+        elif rate is not None:
+            stage_eta = remaining_items / rate
+        else:
+            expected = self.stage_estimates[self.stage_index - 1]
+            stage_fraction = self.stage_done / self.stage_total
+            stage_eta = max(0.0, expected * (1.0 - stage_fraction))
+        future_eta = sum(self.stage_estimates[self.stage_index:])
+        return stage_eta, stage_eta + future_eta, rate
+
+    def _refresh(self, *, force: bool = False) -> None:
+        now = time.time()
+        stage_eta, remaining, rate = self._remaining_seconds(now)
+        elapsed = now - self.started
+        fraction = 1.0 if remaining <= 0 else elapsed / max(elapsed + remaining, 1e-9)
+        estimated_n = min(self.overall_bar.total, int(round(self.overall_bar.total * fraction)))
+        self.overall_bar.n = max(self.overall_bar.n, estimated_n)
+        self.overall_bar.bar_format = (
+            "{desc}: {percentage:3.0f}%|{bar:10}| "
+            f"[stage {self.stage_index}/{self.stage_count}, elapsed {format_duration(elapsed)}, "
+            f"ETA {format_duration(remaining)}]"
+        )
+        if self.stage_bar is not None:
+            rate_text = "calibrating" if rate is None else f"{rate:,.1f} {self.stage_unit}/s"
+            self.stage_bar.bar_format = (
+                "{desc}: {percentage:3.0f}%|{bar:10}| {n_fmt}/{total_fmt} "
+                f"[{rate_text}, ETA {format_duration(stage_eta)}]"
+            )
+        if not force and now - self.last_rendered < 1.0:
+            return
+        self.last_rendered = now
+        self.overall_bar.refresh()
+        if self.stage_bar is not None:
+            self.stage_bar.refresh()
+
+    def set_absolute(self, completed: int, *, force: bool = False) -> None:
+        value = min(max(0, int(completed)), self.stage_total)
+        self.stage_done = value
+        now = time.time()
+        self.history.append((now, value))
+        if self.stage_bar is not None:
+            self.stage_bar.n = value
+        self._refresh(force=force)
+
+    def set_initial(self, completed: int) -> None:
+        """Restore durable work without treating cached items as live throughput."""
+        value = min(max(0, int(completed)), self.stage_total)
+        self.stage_done = value
+        now = time.time()
+        self.history.clear()
+        self.history.append((now, value))
+        if self.stage_bar is not None:
+            self.stage_bar.n = value
+        self._refresh(force=True)
+
+    def update(self, amount: int = 1) -> None:
+        self.set_absolute(self.stage_done + amount)
+
+    def complete_stage(self, detail: str = "") -> None:
+        self.set_absolute(self.stage_total, force=True)
+        duration = time.time() - self.stage_started
+        if self.stage_bar is not None:
+            self.stage_bar.close()
+            self.stage_bar = None
+        suffix = f" | {detail}" if detail else ""
+        tqdm.write(
+            f"[stage {self.stage_index}/{self.stage_count} complete | duration {format_duration(duration)}] "
+            f"{self.stage_names[self.stage_index-1]}{suffix}"
+        )
+        self._refresh(force=True)
+
+    def log(self, message: str) -> None:
+        tqdm.write(message)
+
+    def finish(self, detail: str = "") -> None:
+        if self.stage_bar is not None:
+            self.stage_bar.close()
+            self.stage_bar = None
+        self.overall_bar.n = self.overall_bar.total
+        self.overall_bar.bar_format = (
+            "{desc}: {percentage:3.0f}%|{bar:10}| "
+            f"[stage {self.stage_count}/{self.stage_count}, "
+            f"elapsed {format_duration(time.time()-self.started)}, ETA 00h00m00s]"
+        )
+        self.overall_bar.refresh()
+        self.overall_bar.close()
+        suffix = f" | {detail}" if detail else ""
+        print(f"[workflow complete | elapsed {format_duration(time.time()-self.started)}]{suffix}", flush=True)
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -142,18 +302,10 @@ def select_cohort(records: Sequence[dict[str, Any]], maximum: int, seed: int) ->
 
 
 def load_selected_candidates(
-    path: Path, wanted: set[str], expected_rows: int, workflow_started: float, future_seconds: float,
+    path: Path, wanted: set[str], expected_rows: int, progress: HierarchicalProgress,
 ) -> tuple[dict[str, list[dict[str, Any]]], int]:
     found: dict[str, list[dict[str, Any]]] = {}
     rows_seen = 0
-    bar = tqdm(
-        total=expected_rows,
-        desc="[overall 2/4 | candidate join 1/2]",
-        unit="question",
-        dynamic_ncols=True,
-        mininterval=1.0,
-    )
-    stage_started = time.time()
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
@@ -167,18 +319,9 @@ def load_selected_candidates(
                     raise RuntimeError(f"Invalid Top-8 candidate layout: {sample_id}")
                 found[sample_id] = documents
             if rows_seen % 4096 == 0 or rows_seen == expected_rows:
-                elapsed = max(1e-9, time.time() - stage_started)
-                rate = rows_seen / elapsed
-                stage_eta = max(0, expected_rows - rows_seen) / max(rate, 1e-9)
-                bar.set_postfix_str(
-                    f"found={len(found)}/{len(wanted)} rate={rate:.0f}/s stage_eta={format_duration(stage_eta)} "
-                    f"overall_eta={format_duration(stage_eta+future_seconds)}",
-                    refresh=False,
-                )
-                bar.update(rows_seen - bar.n)
+                progress.set_absolute(rows_seen)
     if rows_seen != expected_rows:
         raise RuntimeError(f"Candidate row count mismatch: expected={expected_rows} actual={rows_seen}")
-    bar.close()
     missing = sorted(wanted - set(found))
     if missing:
         raise RuntimeError(f"Missing selected candidates: count={len(missing)} first={missing[:5]}")
@@ -241,7 +384,9 @@ def pack_top8(
 
     def evidence_for(values: Sequence[int]) -> str:
         return "\n\n".join(
-            tokenizer.decode(ids[:amount], skip_special_tokens=True).strip()
+            tokenizer.decode(
+                ids[:amount], skip_special_tokens=True, clean_up_tokenization_spaces=False
+            ).strip()
             for ids, amount in zip(raw_ids, values)
         )
 
@@ -347,7 +492,7 @@ def valid_shard(path: Path, expected: set[tuple[str, str, str]]) -> list[dict[st
 def score(
     args: argparse.Namespace, model: Any, tokenizer: Any, selected_ids: torch.Tensor,
     records: Sequence[dict[str, Any]], shuffled: dict[str, dict[str, Any]], candidates: dict[str, list[dict[str, Any]]],
-    top8_evidence: dict[str, str], workflow_started: float,
+    top8_evidence: dict[str, str], progress: HierarchicalProgress,
 ) -> list[dict[str, Any]]:
     shards = [records[start:start + args.questions_per_shard] for start in range(0, len(records), args.questions_per_shard)]
     cached: dict[int, list[dict[str, Any]]] = {}
@@ -365,16 +510,11 @@ def score(
             cached[index] = rows
             complete += len(rows)
     total = len(records) * (1 + 2 * len(DOCUMENT_CONDITIONS))
-    bar = tqdm(
-        total=total,
-        initial=complete,
-        desc="[overall 3/4 | frozen-Llama scoring]",
-        unit="prompt",
-        dynamic_ncols=True,
-        mininterval=1.0,
+    progress.set_initial(complete)
+    progress.log(
+        f"[stage {progress.stage_index}/{progress.stage_count} resume] "
+        f"cached={complete}/{total} remaining={total-complete} durable_cache={args.output_dir/'score_shards'}"
     )
-    stage_started = time.time()
-    initial = complete
     for index, shard in enumerate(shards):
         if index in cached:
             continue
@@ -415,20 +555,9 @@ def score(
                     "prompt_sha256": task["prompt_sha256"], "document": task["document"],
                 })
             complete += len(batch)
-            elapsed = max(1e-9, time.time() - stage_started)
-            new = max(1, complete - initial)
-            rate = new / elapsed
-            stage_eta = (total - complete) / max(rate, 1e-9)
-            bar.set_postfix_str(
-                f"elapsed={format_duration(time.time()-workflow_started)} rate={rate:.1f}/s "
-                f"stage_eta={format_duration(stage_eta)} "
-                f"overall_eta={format_duration(stage_eta+REPORT_ESTIMATE_SECONDS)}",
-                refresh=False,
-            )
-            bar.update(len(batch))
+            progress.set_absolute(complete)
         atomic_jsonl(shard_path(args.output_dir, index), output)
         cached[index] = output
-    bar.close()
     return [row for index in range(len(shards)) for row in cached[index]]
 
 
@@ -592,16 +721,24 @@ def write_markdown(path: Path, summary: dict[str, Any]) -> None:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s | %(levelname)s | %(message)s")
-    started = time.time()
     required = [args.pair_file, args.candidate_file, args.candidate_manifest, args.model / "config.json"]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Missing required inputs: {missing}")
-    expected_total = args.expected_candidate_seconds + args.expected_scoring_seconds + REPORT_ESTIMATE_SECONDS
-    print(
-        f"[overall 1/4 | elapsed 00h00m00s | overall ETA {format_duration(expected_total)}] "
-        "select fixed validation cohort and validate immutable contracts", flush=True,
-    )
+    stage_names = [
+        "validate contracts and select MedMCQA cohort",
+        "join immutable Top-8 candidate cache",
+        "validate prompt hashes, packing, and token lengths",
+    ]
+    stage_estimates = [1.0, args.expected_candidate_seconds, args.expected_preflight_seconds]
+    if not args.preflight_only:
+        stage_names.extend([
+            "score both prompt orders with frozen Llama-3-8B",
+            "aggregate paired metrics and write report",
+        ])
+        stage_estimates.extend([args.expected_scoring_seconds, REPORT_ESTIMATE_SECONDS])
+    progress = HierarchicalProgress(stage_names, stage_estimates)
+    progress.start_stage(1, 1, "step")
     all_records, _, source_stats = load_cohort(args.pair_file, 0)
     records = select_cohort(all_records, args.max_questions, args.seed)
     shuffled = source_matched_derangement(records)
@@ -648,13 +785,12 @@ def main() -> None:
          "direct_pair_id": value["direct"]["pair_id"], "no_evidence_pair_id": value["no_evidence"]["pair_id"]}
         for value in records
     ])
-    print(
-        f"[overall 2/4 | elapsed {format_duration(time.time()-started)} | overall ETA "
-        f"{format_duration(args.expected_candidate_seconds+args.expected_scoring_seconds+REPORT_ESTIMATE_SECONDS)}] "
-        "stream 5.5-GiB candidate file and join selected Top-8 documents", flush=True,
+    progress.complete_stage(
+        f"eligible={len(all_records)} selected={len(records)} output={args.output_dir/'cohort.jsonl'}"
     )
+    progress.start_stage(2, args.expected_candidate_rows, "question")
     candidates, candidate_rows = load_selected_candidates(
-        args.candidate_file, wanted, args.expected_candidate_rows, started, args.expected_scoring_seconds + 60
+        args.candidate_file, wanted, args.expected_candidate_rows, progress
     )
     # Pair rows must point into the immutable Top-8 candidate set.
     for record in records:
@@ -662,19 +798,14 @@ def main() -> None:
         for name in ("direct", "no_evidence"):
             if str(record[name]["document_stable_id"]) not in stable_ids:
                 raise RuntimeError(f"Selected semantic document is absent from Top-8: {record['sample_id']}/{name}")
+    progress.complete_stage(f"matched={len(candidates)}/{len(records)} candidate_rows={candidate_rows}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     top8_evidence: dict[str, str] = {}
     packing = {}
-    preflight = tqdm(
-        total=len(records),
-        desc="[overall 2/4 | prompt preflight 2/2]",
-        unit="question",
-        dynamic_ncols=True,
-        mininterval=1.0,
-    )
+    progress.start_stage(3, len(records), "question")
     max_tokens = 0
     for record in records:
         sample = make_sample(record["question"])
@@ -687,8 +818,7 @@ def main() -> None:
             tokenizer, record, shuffled, candidates, args.dummy_evidence, top8_evidence, args.max_input_tokens
         )
         max_tokens = max(max_tokens, max(len(value["token_ids"]) for value in tasks))
-        preflight.update()
-    preflight.close()
+        progress.update()
     atomic_json(args.output_dir / "packing_summary.json", {
         "questions": len(records), "maximum_prompt_tokens": max_tokens,
         "mean_top8_kept_tokens": float(np.mean([sum(value["kept_tokens"]) for value in packing.values()])),
@@ -702,9 +832,12 @@ def main() -> None:
         "candidate_rows": candidate_rows, "source_cohort": source_stats,
     }
     atomic_json(args.output_dir / "cohort_summary.json", cohort)
-    logging.info("Preflight complete: cohort=%s max_tokens=%s candidate_rows=%s", cohort, max_tokens, candidate_rows)
+    progress.complete_stage(
+        f"max_prompt_tokens={max_tokens}/{args.max_input_tokens} "
+        f"mean_top8_kept_tokens={np.mean([sum(value['kept_tokens']) for value in packing.values()]):.1f}"
+    )
     if args.preflight_only:
-        print(f"[overall 2/4 complete | elapsed {format_duration(time.time()-started)}] preflight-only requested", flush=True)
+        progress.finish(f"preflight_only=true output={args.output_dir}")
         return
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for frozen-Llama scoring")
@@ -714,10 +847,11 @@ def main() -> None:
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(True)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    print(
-        f"[overall 3/4 | elapsed {format_duration(time.time()-started)} | overall ETA "
-        f"{format_duration(args.expected_scoring_seconds+REPORT_ESTIMATE_SECONDS)}] load and score frozen Llama",
-        flush=True,
+    total_prompts = len(records) * (1 + 2 * len(DOCUMENT_CONDITIONS))
+    progress.start_stage(4, total_prompts, "prompt")
+    progress.log(
+        f"[stage 4/{progress.stage_count} setup] model={args.model} dtype={args.dtype} "
+        f"batch_size={args.batch_size} prompts={total_prompts}"
     )
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=dtype, attn_implementation=args.attn_implementation,
@@ -725,18 +859,15 @@ def main() -> None:
     ).to(args.device)
     model.eval()
     selected_ids = choice_token_ids(tokenizer, torch.device(args.device))
-    rows = score(args, model, tokenizer, selected_ids, records, shuffled, candidates, top8_evidence, started)
-    print(
-        f"[overall 4/4 | elapsed {format_duration(time.time()-started)} | overall ETA "
-        f"{format_duration(REPORT_ESTIMATE_SECONDS)}] "
-        "paired aggregation and bootstrap decision", flush=True,
-    )
+    rows = score(args, model, tokenizer, selected_ids, records, shuffled, candidates, top8_evidence, progress)
+    progress.complete_stage(f"scored_rows={len(rows)} cache={args.output_dir/'score_shards'}")
+    progress.start_stage(5, 1, "report")
     evaluation = summarize(rows, args.bootstrap_replicates, args.seed)
     current_index = {(row["sample_id"], row["order"], row["condition"]): row for row in rows}
     current_correct = sum(current_index[(value["sample_id"], "shared", "no_rag")]["correct"] for value in records)
     summary = {
         "run_version": RUN_VERSION, "completed_at": datetime.now(timezone.utc).isoformat(),
-        "code_commit": git_commit(), "elapsed_seconds": time.time() - started,
+        "code_commit": git_commit(), "elapsed_seconds": time.time() - progress.started,
         "cohort": cohort,
         "evaluation_counts": {"no_rag_correct": current_correct, "no_rag_wrong": len(records)-current_correct},
         "evaluation": evaluation,
@@ -744,11 +875,11 @@ def main() -> None:
     atomic_json(args.output_dir / "summary.json", summary)
     write_markdown(args.output_dir / "summary.md", summary)
     decision = evaluation["decision"]
-    print(
-        f"[overall 4/4 complete | elapsed {format_duration(time.time()-started)} | overall ETA 00h00m00s] "
-        f"passed={decision['passed']} measured={json.dumps(decision['measured'], sort_keys=True)} "
-        f"report={args.output_dir/'summary.md'}", flush=True,
+    progress.update()
+    progress.complete_stage(
+        f"passed={decision['passed']} report={args.output_dir/'summary.md'}"
     )
+    progress.finish(f"measured={json.dumps(decision['measured'], sort_keys=True)}")
 
 
 if __name__ == "__main__":

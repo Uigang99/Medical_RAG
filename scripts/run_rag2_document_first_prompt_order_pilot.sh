@@ -3,9 +3,10 @@ set -euo pipefail
 
 PROJECT=/home/user/Uiheon/Medical_RAG
 PYTHON_BIN=/home/user/Uiheon/.venv_vllm/bin/python
-EXPECTED_CANDIDATE_SECONDS=${EXPECTED_CANDIDATE_SECONDS:-30}
+EXPECTED_CANDIDATE_SECONDS=${EXPECTED_CANDIDATE_SECONDS:-20}
+EXPECTED_PREFLIGHT_SECONDS=${EXPECTED_PREFLIGHT_SECONDS:-10}
 EXPECTED_SCORING_SECONDS=${EXPECTED_SCORING_SECONDS:-240}
-EXPECTED_TOTAL_SECONDS=$((EXPECTED_CANDIDATE_SECONDS + EXPECTED_SCORING_SECONDS + 15))
+EXPECTED_TOTAL_SECONDS=$((EXPECTED_CANDIDATE_SECONDS + EXPECTED_PREFLIGHT_SECONDS + EXPECTED_SCORING_SECONDS + 15))
 STARTED=$(date +%s)
 
 format_duration() {
@@ -33,6 +34,7 @@ printf '[command plan | expected wall time %s] 1) cohort 2) Top-8 join/preflight
   --top8-document-token-budget "${TOP8_DOCUMENT_TOKEN_BUDGET:-1500}" \
   --bootstrap-replicates "${BOOTSTRAP_REPLICATES:-3000}" \
   --expected-candidate-seconds "$EXPECTED_CANDIDATE_SECONDS" \
+  --expected-preflight-seconds "$EXPECTED_PREFLIGHT_SECONDS" \
   --expected-scoring-seconds "$EXPECTED_SCORING_SECONDS" \
   --attn-implementation "${ATTN_IMPLEMENTATION:-sdpa}" \
   --dtype "${DTYPE:-bfloat16}" \
