@@ -247,8 +247,13 @@ def prepare_record(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     positive = documents[str(row["behaviorally_underused_positive_pair_id"])]
     negative = documents[str(row["behaviorally_disruptive_negative_pair_id"])]
     donor = row.get("cross_question_support_donor")
-    if not donor or donor.get("donor_split") != "train" or donor.get("donor_sample_id") == row["sample_id"]:
-        raise RuntimeError(f"Invalid cross-question train donor: {row['sample_id']}")
+    row_split = str(row["split"])
+    if (
+        not donor
+        or str(donor.get("donor_split")) != row_split
+        or donor.get("donor_sample_id") == row["sample_id"]
+    ):
+        raise RuntimeError(f"Invalid same-split cross-question donor: {row['sample_id']}")
     if positive["document"]["semantic_label"] != "direct_support":
         raise RuntimeError(f"D+ is not Direct Support: {row['sample_id']}")
     if negative["document"]["semantic_label"] not in {"no_evidence", "misleading_evidence"}:
@@ -259,7 +264,7 @@ def prepare_record(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     prepared = {
         "data_version": DATA_VERSION,
         "dataset": row["dataset"],
-        "split": "train",
+        "split": row_split,
         "sample_id": row["sample_id"],
         "row_idx": int(row["row_idx"]),
         "question": row["question"],
@@ -393,7 +398,15 @@ def encode_document_prompt(tokenizer: Any, row: dict[str, Any], text: str) -> di
 
 
 class EncodedDataset(Dataset[dict[str, Any]]):
-    def __init__(self, rows: Sequence[dict[str, Any]], tokenizer: Any, max_tokens: int, progress: HierarchicalProgress) -> None:
+    def __init__(
+        self,
+        rows: Sequence[dict[str, Any]],
+        tokenizer: Any,
+        max_tokens: int,
+        progress: HierarchicalProgress,
+        *,
+        progress_offset: int = 0,
+    ) -> None:
         self.values = []
         self.max_tokens = 0
         for index, row in enumerate(rows, 1):
@@ -407,7 +420,7 @@ class EncodedDataset(Dataset[dict[str, Any]]):
                 raise RuntimeError(f"Overfit prompt exceeds {max_tokens}: {row['sample_id']} tokens={current_max}")
             self.max_tokens = max(self.max_tokens, current_max)
             self.values.append({"row": row, "conditions": conditions})
-            progress.set_absolute(index)
+            progress.set_absolute(progress_offset + index)
 
     def __len__(self) -> int:
         return len(self.values)
@@ -528,6 +541,7 @@ def evaluate(
     choice_bias: torch.Tensor | None,
     args: argparse.Namespace,
     progress: HierarchicalProgress | None = None,
+    prediction_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     model.eval()
     device = torch.device(args.device)
@@ -545,6 +559,10 @@ def evaluate(
         m0 = gold_margins(no_logits, gold)
         negative_kl = F.kl_div(F.log_softmax(negative, dim=-1), no_probs, reduction="none").sum(-1)
         swap_kl = F.kl_div(F.log_softmax(swap, dim=-1), no_probs, reduction="none").sum(-1)
+        positive_predictions = positive.argmax(-1)
+        negative_predictions = negative.argmax(-1)
+        swap_predictions = swap.argmax(-1)
+        no_predictions = no_logits.argmax(-1)
         for index, row in enumerate(batch["rows"]):
             values = {
                 "positive_gt_negative": float(pm[index] > nm[index]),
@@ -556,6 +574,22 @@ def evaluate(
                 "positive_margin": float(pm[index]),
                 "negative_margin": float(nm[index]),
                 "swap_margin": float(sm[index]),
+                "positive_correct": float(positive_predictions[index] == gold[index]),
+                "negative_correct": float(negative_predictions[index] == gold[index]),
+                "swap_correct": float(swap_predictions[index] == gold[index]),
+                "no_rag_correct": float(no_predictions[index] == gold[index]),
+                "positive_w2c": float(
+                    no_predictions[index] != gold[index] and positive_predictions[index] == gold[index]
+                ),
+                "positive_c2w": float(
+                    no_predictions[index] == gold[index] and positive_predictions[index] != gold[index]
+                ),
+                "negative_w2c": float(
+                    no_predictions[index] != gold[index] and negative_predictions[index] == gold[index]
+                ),
+                "negative_c2w": float(
+                    no_predictions[index] == gold[index] and negative_predictions[index] != gold[index]
+                ),
             }
             for key, value in values.items():
                 sums[key] += value
@@ -564,6 +598,48 @@ def evaluate(
             current["questions"] += 1
             current["positive_gt_negative"] += values["positive_gt_negative"]
             current["positive_gt_swap"] += values["positive_gt_swap"]
+            current["positive_correct"] += values["positive_correct"]
+            current["negative_correct"] += values["negative_correct"]
+            if prediction_rows is not None:
+                prediction_rows.append(
+                    {
+                        "sample_id": row["sample_id"],
+                        "split": row["split"],
+                        "stratum": row["stratum"],
+                        "gold_answer": row["gold_answer"],
+                        "positive": {
+                            "prediction": CHOICES[int(positive_predictions[index])],
+                            "correct": bool(values["positive_correct"]),
+                            "gold_margin": values["positive_margin"],
+                            "probabilities": [float(value) for value in F.softmax(positive[index], dim=-1).cpu()],
+                        },
+                        "negative": {
+                            "prediction": CHOICES[int(negative_predictions[index])],
+                            "correct": bool(values["negative_correct"]),
+                            "gold_margin": values["negative_margin"],
+                            "kl_from_no_rag": values["negative_kl"],
+                            "probabilities": [float(value) for value in F.softmax(negative[index], dim=-1).cpu()],
+                        },
+                        "swap": {
+                            "prediction": CHOICES[int(swap_predictions[index])],
+                            "correct": bool(values["swap_correct"]),
+                            "gold_margin": values["swap_margin"],
+                            "kl_from_no_rag": values["swap_kl"],
+                            "probabilities": [float(value) for value in F.softmax(swap[index], dim=-1).cpu()],
+                        },
+                        "no_rag": {
+                            "prediction": CHOICES[int(no_predictions[index])],
+                            "correct": bool(values["no_rag_correct"]),
+                            "gold_margin": float(m0[index]),
+                            "probabilities": [float(value) for value in no_probs[index].cpu()],
+                        },
+                        "relations": {
+                            "positive_gt_negative": bool(values["positive_gt_negative"]),
+                            "positive_gt_swap": bool(values["positive_gt_swap"]),
+                            "both_preferences": bool(values["both_preferences"]),
+                        },
+                    }
+                )
         if progress is not None:
             progress.update(batch_size)
     count = totals["questions"]
@@ -574,6 +650,8 @@ def evaluate(
             "questions": int(values["questions"]),
             "positive_gt_negative_accuracy": float(values["positive_gt_negative"]) / max(1, values["questions"]),
             "positive_gt_swap_accuracy": float(values["positive_gt_swap"]) / max(1, values["questions"]),
+            "positive_accuracy": float(values["positive_correct"]) / max(1, values["questions"]),
+            "negative_accuracy": float(values["negative_correct"]) / max(1, values["questions"]),
         }
         for name, values in subgroup.items()
     }
