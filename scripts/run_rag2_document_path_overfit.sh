@@ -16,7 +16,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 EPOCHS="${EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-RUN_NAME="${RUN_NAME:-medmcqa_document_first_overfit256_v1}"
+RUN_NAME="${RUN_NAME:-medmcqa_document_first_overfit256_v2}"
 
 test -x "$PYTHON_BIN"
 test -f "$SCRIPT"

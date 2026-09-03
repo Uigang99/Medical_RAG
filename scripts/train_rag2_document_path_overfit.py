@@ -46,7 +46,7 @@ from medrag.training.document_path_lora import DocumentPathAdapter  # noqa: E402
 from medrag.training.semantic_behavior_lora import gold_margins  # noqa: E402
 
 
-RUN_VERSION = "rag2_document_path_lora_overfit256_v1"
+RUN_VERSION = "rag2_document_path_lora_overfit256_v2"
 DATA_VERSION = "rag2_document_path_overfit256_data_v1"
 BASE = (
     PROJECT_ROOT
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=WORKSPACE_ROOT / "models/RAG2-Document-Path-LoRA",
     )
-    parser.add_argument("--run-name", default="medmcqa_document_first_overfit256_v1")
+    parser.add_argument("--run-name", default="medmcqa_document_first_overfit256_v2")
     parser.add_argument("--questions", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -89,7 +89,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--early-stop-accuracy", type=float, default=0.95)
     parser.add_argument("--early-stop-epochs", type=int, default=2)
-    parser.add_argument("--base-logit-tolerance", type=float, default=0.08)
+    parser.add_argument(
+        "--base-logit-tolerance",
+        type=float,
+        default=0.5,
+        help=(
+            "Raw-logit replay tolerance for the BF16 cache. The source cache used "
+            "length-sorted batches of 64 whereas this audit uses condition batches; "
+            "the observed batch-shape replay drift is 0.375. This is not a training "
+            "or behavioral decision threshold."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
