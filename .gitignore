@@ -144,6 +144,8 @@ venv/
 !/scripts/run_rag2_direct_semantic_contrastive_mvp.sh
 !/scripts/evaluate_rag2_semantic_contrastive_document_dependence.py
 !/scripts/run_rag2_semantic_contrastive_document_dependence.sh
+!/scripts/evaluate_rag2_document_first_prompt_order.py
+!/scripts/run_rag2_document_first_prompt_order_pilot.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
@@ -180,3 +182,4 @@ venv/
 !/tests/test_rag2_semantic_subset_traces.py
 !/tests/test_direct_semantic_contrastive.py
 !/tests/test_semantic_contrastive_document_dependence.py
+!/tests/test_document_first_prompt_order.py
