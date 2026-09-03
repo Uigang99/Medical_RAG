@@ -14,6 +14,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -39,7 +40,9 @@ from train_rag2_document_path_overfit import (  # noqa: E402
     fingerprint,
     forward_choice_logits,
     git_commit,
-    losses,
+    batch_targets,
+    gold_margins,
+    losses as joint_losses,
     no_rag_logit_error,
     prepare_record,
     selected_choice_head,
@@ -85,6 +88,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--positive-baseline-weight", type=float, default=0.5)
     parser.add_argument("--negative-invariance-weight", type=float, default=1.0)
     parser.add_argument("--swap-invariance-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--objective",
+        choices=("joint", "support_only", "non_support_only"),
+        default="joint",
+        help="Train the original joint objective or one isolated learnability objective.",
+    )
+    parser.add_argument("--support-ce-weight", type=float, default=1.0)
+    parser.add_argument("--support-improvement-weight", type=float, default=0.5)
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--base-logit-tolerance", type=float, default=0.5)
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
@@ -101,6 +112,77 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
+
+
+def _condition_batch(batch: dict[str, Any], condition: str) -> dict[str, Any]:
+    """Select one condition from condition-major [D+, D-, Dswap] tensors."""
+    batch_size = len(batch["rows"])
+    starts = {"positive": 0, "negative": batch_size, "swap": 2 * batch_size}
+    start = starts[condition]
+    stop = start + batch_size
+    return {
+        "rows": batch["rows"],
+        "input_ids": batch["input_ids"][start:stop],
+        "attention_mask": batch["attention_mask"][start:stop],
+        "position_ids": batch["position_ids"][start:stop],
+        "document_mask": batch["document_mask"][start:stop],
+    }
+
+
+def isolated_losses(
+    logits: torch.Tensor,
+    rows: Sequence[dict[str, Any]],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Losses that isolate support use from non-support suppression."""
+    gold, no_logits, no_probs = batch_targets(rows, device)
+    zero = logits.sum() * 0.0
+    if args.objective == "support_only":
+        per_example_ce = F.cross_entropy(logits, gold, reduction="none")
+        support_margin = gold_margins(logits, gold)
+        no_rag_margin = gold_margins(no_logits, gold)
+        no_rag_wrong = no_logits.argmax(dim=-1).ne(gold)
+        no_rag_correct = ~no_rag_wrong
+        support_ce = (
+            per_example_ce[no_rag_wrong].mean() if no_rag_wrong.any() else zero
+        )
+        support_cross_boundary = (
+            F.relu(args.positive_baseline_margin - support_margin[no_rag_wrong]).mean()
+            if no_rag_wrong.any()
+            else zero
+        )
+        support_preserve = (
+            F.relu(no_rag_margin[no_rag_correct] - support_margin[no_rag_correct]).mean()
+            if no_rag_correct.any()
+            else zero
+        )
+        support_improvement = support_cross_boundary + support_preserve
+        total = (
+            args.support_ce_weight * support_ce
+            + args.support_improvement_weight * support_improvement
+        )
+        return {
+            "loss": total,
+            "support_ce": support_ce,
+            "support_improvement": support_improvement,
+            "support_cross_boundary": support_cross_boundary,
+            "support_preserve": support_preserve,
+            "negative_invariance": zero,
+        }
+    if args.objective == "non_support_only":
+        negative_invariance = F.kl_div(
+            F.log_softmax(logits, dim=-1), no_probs, reduction="batchmean"
+        )
+        return {
+            "loss": negative_invariance,
+            "support_ce": zero,
+            "support_improvement": zero,
+            "support_cross_boundary": zero,
+            "support_preserve": zero,
+            "negative_invariance": negative_invariance,
+        }
+    raise ValueError(f"Not an isolated objective: {args.objective}")
 
 
 def select_split(
@@ -321,13 +403,11 @@ def main() -> None:
             "negative_invariance_weight": args.negative_invariance_weight,
             "swap_invariance_weight": args.swap_invariance_weight,
         },
-        "primary_metric": "test both_preferences delta versus frozen baseline",
-        "pass_threshold": {
-            "both_preferences_delta": 0.05,
-            "positive_accuracy_min_delta": 0.0,
-            "negative_kl_max_increase": 0.0,
-            "swap_kl_max_increase": 0.0,
-        },
+        "primary_metric": {
+            "joint": "test both_preferences delta versus frozen baseline",
+            "support_only": "test positive-document accuracy delta versus frozen baseline",
+            "non_support_only": "test non-support KL reduction versus frozen baseline",
+        }[args.objective],
         "dtype": args.dtype,
         "attention_implementation": args.attn_implementation,
         "gradient_checkpointing": args.gradient_checkpointing,
@@ -336,6 +416,36 @@ def main() -> None:
         "bootstrap_replicates": args.bootstrap_replicates,
         "seed": args.seed,
     }
+    if args.objective != "joint":
+        contract["objective"] = args.objective
+        contract["loss"].update(
+            {
+                "support_ce_weight": args.support_ce_weight,
+                "support_improvement_weight": args.support_improvement_weight,
+                "support_only_subgroups": {
+                    "no_rag_wrong": "gold CE plus positive-margin boundary crossing",
+                    "no_rag_correct": "hinge preventing support margin degradation",
+                },
+            }
+        )
+    contract["pass_threshold"] = {
+        "joint": {
+            "both_preferences_delta": 0.05,
+            "positive_accuracy_min_delta": 0.0,
+            "negative_kl_max_increase": 0.0,
+            "swap_kl_max_increase": 0.0,
+        },
+        "support_only": {
+            "positive_accuracy_delta": 0.02,
+            "positive_w2c_delta": 0.02,
+            "positive_c2w_max_increase": 0.01,
+            "positive_gt_swap_delta": 0.03,
+        },
+        "non_support_only": {
+            "negative_kl_relative_reduction": 0.25,
+            "negative_c2w_max_increase": 0.0,
+        },
+    }[args.objective]
     contract_hash = fingerprint(contract)
     contract_path = output_dir / "run_contract.json"
     if contract_path.is_file():
@@ -368,10 +478,11 @@ def main() -> None:
         "evaluate frozen and selected models on held-out test",
         "write paired report and completion manifest",
     )
-    stage_estimates = (30.0, 45.0, 20.0, 120.0, 3300.0, 300.0, 10.0)
+    training_estimate = 3300.0 if args.objective == "joint" else 1800.0
+    stage_estimates = (30.0, 45.0, 20.0, 120.0, training_estimate, 300.0, 10.0)
     progress = HierarchicalProgress(stage_names, stage_estimates)
     progress.log(
-        f"[workflow plan] dataset={args.dataset} train={args.train_questions} "
+        f"[workflow plan] objective={args.objective} dataset={args.dataset} train={args.train_questions} "
         f"val={args.val_questions} test={args.test_questions} epochs={args.epochs} "
         f"batch={args.batch_size} output={output_dir}"
     )
@@ -483,10 +594,18 @@ def main() -> None:
             progress.log(f"[stage 5/7 | train epoch {epoch}/{args.epochs}] starting")
             for batch in train_loader:
                 optimizer.zero_grad(set_to_none=True)
-                logits = forward_choice_logits(
-                    model, adapter, batch, choice_weight, choice_bias, device
-                )
-                current = losses(logits, batch["rows"], args, device)
+                if args.objective == "joint":
+                    logits = forward_choice_logits(
+                        model, adapter, batch, choice_weight, choice_bias, device
+                    )
+                    current = joint_losses(logits, batch["rows"], args, device)
+                else:
+                    condition = "positive" if args.objective == "support_only" else "negative"
+                    logits = forward_choice_logits(
+                        model, adapter, _condition_batch(batch, condition),
+                        choice_weight, choice_bias, device,
+                    )
+                    current = isolated_losses(logits, batch["rows"], args, device)
                 current["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1.0)
                 optimizer.step()
@@ -498,7 +617,11 @@ def main() -> None:
             validation = evaluate(
                 model, adapter, validation_loader, choice_weight, choice_bias, args, progress
             )
-            score = float(validation["both_preferences"])
+            score = {
+                "joint": float(validation["both_preferences"]),
+                "support_only": float(validation["positive_correct"]),
+                "non_support_only": -float(validation["negative_kl"]),
+            }[args.objective]
             epoch_row = {
                 "epoch": epoch,
                 "train": {key: value / trained for key, value in train_sums.items()},
@@ -515,6 +638,7 @@ def main() -> None:
                 )
             progress.log(
                 f"[epoch {epoch}/{args.epochs}] loss={epoch_row['train']['loss']:.4f} "
+                f"objective={args.objective} "
                 f"val_both={validation['both_preferences']:.4f} "
                 f"baseline={frozen_validation['both_preferences']:.4f} "
                 f"delta={validation['both_preferences']-frozen_validation['both_preferences']:+.4f} "
@@ -572,7 +696,8 @@ def main() -> None:
             for key in (
                 "positive_gt_negative", "positive_gt_swap", "both_preferences",
                 "positive_correct", "negative_correct", "swap_correct",
-                "negative_kl", "swap_kl", "positive_c2w", "negative_c2w",
+                "negative_kl", "swap_kl", "positive_w2c", "positive_c2w",
+                "negative_w2c", "negative_c2w",
             )
         }
         paired_intervals = {
@@ -594,11 +719,29 @@ def main() -> None:
             ),
         }
         thresholds = contract["pass_threshold"]
+        if args.objective == "joint":
+            passed = bool(
+                scalar_deltas["both_preferences"] >= thresholds["both_preferences_delta"]
+                and scalar_deltas["positive_correct"] >= thresholds["positive_accuracy_min_delta"]
+                and scalar_deltas["negative_kl"] <= thresholds["negative_kl_max_increase"]
+                and scalar_deltas["swap_kl"] <= thresholds["swap_kl_max_increase"]
+            )
+        elif args.objective == "support_only":
+            passed = bool(
+                scalar_deltas["positive_correct"] >= thresholds["positive_accuracy_delta"]
+                and scalar_deltas["positive_w2c"] >= thresholds["positive_w2c_delta"]
+                and scalar_deltas["positive_c2w"] <= thresholds["positive_c2w_max_increase"]
+                and scalar_deltas["positive_gt_swap"] >= thresholds["positive_gt_swap_delta"]
+            )
+        else:
+            baseline_negative_kl = float(frozen_test["negative_kl"])
+            trained_negative_kl = float(trained_test["negative_kl"])
+            passed = bool(
+                trained_negative_kl <= 0.75 * baseline_negative_kl
+                and scalar_deltas["negative_c2w"] <= thresholds["negative_c2w_max_increase"]
+            )
         passed = bool(
-            scalar_deltas["both_preferences"] >= thresholds["both_preferences_delta"]
-            and scalar_deltas["positive_correct"] >= thresholds["positive_accuracy_min_delta"]
-            and scalar_deltas["negative_kl"] <= thresholds["negative_kl_max_increase"]
-            and scalar_deltas["swap_kl"] <= thresholds["swap_kl_max_increase"]
+            passed
             and final_no_rag_error <= args.base_logit_tolerance
             and adapter.audit()["max_non_document_delta"] == 0.0
         )
