@@ -150,6 +150,8 @@ venv/
 !/scripts/run_rag2_document_attribution_faithfulness_mvp.sh
 !/scripts/evaluate_rag2_direct_choice_document_mask_validity.py
 !/scripts/run_rag2_direct_choice_document_mask_validity.sh
+!/scripts/train_rag2_semantic_influence_pilot.py
+!/scripts/run_rag2_semantic_influence_bounded_pilot.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
@@ -189,3 +191,4 @@ venv/
 !/tests/test_document_first_prompt_order.py
 !/tests/test_document_attribution_faithfulness.py
 !/tests/test_direct_choice_document_mask_validity.py
+!/tests/test_semantic_influence_pilot.py
