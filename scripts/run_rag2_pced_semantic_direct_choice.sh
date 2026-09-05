@@ -16,14 +16,14 @@ PROMPT_BATCH_SIZE="${PROMPT_BATCH_SIZE:-64}"
 SEMANTIC_BATCH_SIZE="${SEMANTIC_BATCH_SIZE:-128}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-0}"
 if [[ -z "${OUTPUT_DIR:-}" ]]; then
-  OUTPUT_DIR="$PROJECT/results/rag2_pced_direct_choice_v1/all_mcq_source_balanced32_rerank8"
+  OUTPUT_DIR="$PROJECT/results/rag2_pced_direct_choice_v2/all_mcq_source_balanced32_rerank8_rerank_prior"
   if [[ "$MAX_QUESTIONS" != "0" ]]; then
     OUTPUT_DIR="${OUTPUT_DIR}_pilot${MAX_QUESTIONS}"
   fi
 fi
 
 echo "[workflow plan] stage 1/4 contracts -> stage 2/4 semantic probabilities -> stage 3/4 Llama expert logits -> stage 4/4 paired report"
-echo "[comparison] No-RAG | concatenated Top-${TOP_K} Base-RAG | PCED retrieval prior | PCED semantic-support prior"
+echo "[comparison] No-RAG | concatenated Top-${TOP_K} Base-RAG | PCED rerank-score prior | PCED semantic-support prior"
 echo "[scope] constrained Direct-Choice A/B/C/D; one decoding step; no multi-token expert-switch claim"
 echo "[settings] GPU=${CUDA_VISIBLE_DEVICES} top_k=${TOP_K} gamma=${GAMMA} question_batch=${QUESTION_BATCH_SIZE} prompt_batch=${PROMPT_BATCH_SIZE} semantic_batch=${SEMANTIC_BATCH_SIZE} max_questions=${MAX_QUESTIONS}"
 if [[ "$MAX_QUESTIONS" == "0" ]]; then

@@ -4,7 +4,7 @@
 The target Llama, benchmark cohort, Top-8 documents, prompt, constrained
 A/B/C/D answer space, contrastive term, and gamma are shared by every PCED
 condition.  The proposed condition changes only the document prior from the
-retrieval/reranker fusion to the trained Semantic-Support probability.
+reranker score to the trained Semantic-Support probability.
 
 This is the one-decoding-step MCQ specialization of PCED.  It tests independent
 document experts and retrieval-aware contrastive logit fusion, but it cannot
@@ -48,11 +48,11 @@ from medrag.filtering.rag2_filter import Rag2FlanT5Filter  # noqa: E402
 from medrag.rag2_anchored_trace import CHOICES  # noqa: E402
 
 
-RUN_VERSION = "rag2_direct_choice_pced_semantic_prior_v1"
+RUN_VERSION = "rag2_direct_choice_pced_semantic_prior_rerank_only_v2"
 PCED_RULE_VERSION = "pced_eq2_eq3_dynamic_mean_adacad_jsd_first_token_gamma2p5_v1"
-RETRIEVAL_PRIOR_VERSION = "question_minmax_dense_and_reranker_then_harmonic_mean_v1"
+RERANK_PRIOR_VERSION = "question_minmax_reranker_only_v2"
 SEMANTIC_PRIOR_VERSION = "binary_support_classifier_raw_probability_v1"
-MATCHED_PRIOR_VERSION = "retrieval_prior_values_ranked_by_semantic_probability_v1"
+MATCHED_PRIOR_VERSION = "rerank_prior_values_ranked_by_semantic_probability_v2"
 
 DATASETS = (
     "medmcqa",
@@ -87,7 +87,7 @@ DEFAULT_MEDQA_SEMANTIC = (
 )
 DEFAULT_OUTPUT = (
     PROJECT_ROOT
-    / "results/rag2_pced_direct_choice_v1/all_mcq_source_balanced32_rerank8"
+    / "results/rag2_pced_direct_choice_v2/all_mcq_source_balanced32_rerank8_rerank_prior"
 )
 
 
@@ -351,7 +351,7 @@ def contract(args: argparse.Namespace, samples: Sequence[BenchmarkSample]) -> di
         "run_version": RUN_VERSION,
         "pced_rule_version": PCED_RULE_VERSION,
         "prompt_policy_version": PROMPT_POLICY_VERSION,
-        "retrieval_prior_version": RETRIEVAL_PRIOR_VERSION,
+        "rerank_prior_version": RERANK_PRIOR_VERSION,
         "semantic_prior_version": SEMANTIC_PRIOR_VERSION,
         "matched_prior_version": MATCHED_PRIOR_VERSION,
         "scope": "one-step constrained Direct-Choice MCQ specialization; no multi-token expert-switch claim",
@@ -760,17 +760,15 @@ def minmax(values: Sequence[float], epsilon: float) -> np.ndarray:
     return epsilon + normalized * (1.0 - 2.0 * epsilon)
 
 
-def retrieval_prior(documents: Sequence[dict[str, Any]], epsilon: float) -> np.ndarray:
-    dense = minmax([float(document["retrieval_score"]) for document in documents], epsilon)
-    rerank = minmax([float(document["rerank_score"]) for document in documents], epsilon)
-    denominator = np.maximum(dense + rerank, epsilon)
-    return np.clip(2.0 * dense * rerank / denominator, epsilon, 1.0 - epsilon)
+def rerank_prior(documents: Sequence[dict[str, Any]], epsilon: float) -> np.ndarray:
+    """Map within-question reranker scores to the bounded PCED prior range."""
+    return minmax([float(document["rerank_score"]) for document in documents], epsilon)
 
 
-def matched_semantic_prior(retrieval: np.ndarray, semantic: np.ndarray) -> np.ndarray:
-    """Keep the retrieval-prior value distribution and replace only its ordering."""
-    result = np.empty_like(retrieval)
-    result[np.argsort(semantic, kind="stable")] = np.sort(retrieval)
+def matched_semantic_prior(rerank: np.ndarray, semantic: np.ndarray) -> np.ndarray:
+    """Keep the rerank-prior value distribution and replace only its ordering."""
+    result = np.empty_like(rerank)
+    result[np.argsort(semantic, kind="stable")] = np.sort(rerank)
     return result
 
 
@@ -856,7 +854,7 @@ def render_table(summary: dict[str, Any]) -> str:
     names = {
         "no_rag": "No-RAG",
         "base_rag_top8": "Base-RAG Top-8 (concatenated)",
-        "pced_retrieval": "PCED (retrieval prior)",
+        "pced_rerank": "PCED (rerank-score prior)",
         "pced_semantic": "PCED (semantic-support prior)",
         "pced_semantic_matched": "PCED (semantic rank, matched scale; diagnostic)",
     }
@@ -923,12 +921,12 @@ def aggregate(
         if raw is None:
             raise RuntimeError(f"Missing Llama scores: {sample.id}")
         documents = list(candidate["reranked_documents"])[: args.top_k]
-        retrieval = retrieval_prior(documents, args.prior_epsilon)
+        rerank = rerank_prior(documents, args.prior_epsilon)
         semantic = np.asarray(
             [semantic_scores[pair_key(sample, document)] for document in documents], dtype=np.float64
         )
         semantic = np.clip(semantic, args.prior_epsilon, 1.0 - args.prior_epsilon)
-        matched = matched_semantic_prior(retrieval, semantic)
+        matched = matched_semantic_prior(rerank, semantic)
         no_logits = np.asarray(raw["no_rag_choice_logits"], dtype=np.float64)
         base_logits = np.asarray(raw["base_rag_choice_logits"], dtype=np.float64)
         expert_logits = np.asarray(raw["expert_choice_logits"], dtype=np.float64)
@@ -939,7 +937,7 @@ def aggregate(
         expert_indices: dict[str, int] = {}
         best_scores: dict[str, list[float]] = {}
         for condition, prior in (
-            ("pced_retrieval", retrieval),
+            ("pced_rerank", rerank),
             ("pced_semantic", semantic),
             ("pced_semantic_matched", matched),
         ):
@@ -960,7 +958,7 @@ def aggregate(
             "predictions": predictions,
             "beta": float(raw["beta"]),
             "expert_jsd": raw["expert_jsd"],
-            "retrieval_prior": retrieval.tolist(),
+            "rerank_prior": rerank.tolist(),
             "semantic_support_probability": semantic.tolist(),
             "semantic_matched_prior": matched.tolist(),
             "selected_expert_index": expert_indices,
@@ -976,14 +974,14 @@ def aggregate(
         })
         progress.update(1)
     conditions = (
-        "no_rag", "base_rag_top8", "pced_retrieval", "pced_semantic", "pced_semantic_matched"
+        "no_rag", "base_rag_top8", "pced_rerank", "pced_semantic", "pced_semantic_matched"
     )
     condition_metrics = {condition: condition_summary(results, condition) for condition in conditions}
     comparisons: dict[str, Any] = {}
     specifications = (
-        ("PCED retrieval vs No-RAG", "pced_retrieval", "no_rag"),
-        ("PCED retrieval vs Base-RAG", "pced_retrieval", "base_rag_top8"),
-        ("PCED semantic vs PCED retrieval", "pced_semantic", "pced_retrieval"),
+        ("PCED rerank vs No-RAG", "pced_rerank", "no_rag"),
+        ("PCED rerank vs Base-RAG", "pced_rerank", "base_rag_top8"),
+        ("PCED semantic vs PCED rerank", "pced_semantic", "pced_rerank"),
         ("PCED semantic vs Base-RAG", "pced_semantic", "base_rag_top8"),
     )
     for index, (label, condition, baseline) in enumerate(specifications):
@@ -997,7 +995,7 @@ def aggregate(
             "selected_source_counts": dict(selected_sources[condition]),
             "mean_selected_semantic_support_probability": float(np.mean(selected_semantic[condition])),
         }
-        for condition in ("pced_retrieval", "pced_semantic", "pced_semantic_matched")
+        for condition in ("pced_rerank", "pced_semantic", "pced_semantic_matched")
     }
     summary = {
         "run_version": RUN_VERSION,
@@ -1007,17 +1005,17 @@ def aggregate(
         "expert_selection_diagnostics": expert_diagnostics,
         "pre_registered_success": {
             "pced_reproduction": {
-                "rule": "PCED retrieval minus Base-RAG micro accuracy >= +1.0%p and paired 95% CI lower bound > 0",
+                "rule": "PCED rerank minus Base-RAG micro accuracy >= +1.0%p and paired 95% CI lower bound > 0",
                 "passed": (
-                    comparisons["PCED retrieval vs Base-RAG"]["accuracy_delta"] >= 0.01
-                    and comparisons["PCED retrieval vs Base-RAG"]["paired_bootstrap_95ci"][0] > 0
+                    comparisons["PCED rerank vs Base-RAG"]["accuracy_delta"] >= 0.01
+                    and comparisons["PCED rerank vs Base-RAG"]["paired_bootstrap_95ci"][0] > 0
                 ),
             },
             "semantic_prior": {
-                "rule": "PCED semantic minus PCED retrieval micro accuracy >= +0.5%p and paired 95% CI lower bound > 0",
+                "rule": "PCED semantic minus PCED rerank micro accuracy >= +0.5%p and paired 95% CI lower bound > 0",
                 "passed": (
-                    comparisons["PCED semantic vs PCED retrieval"]["accuracy_delta"] >= 0.005
-                    and comparisons["PCED semantic vs PCED retrieval"]["paired_bootstrap_95ci"][0] > 0
+                    comparisons["PCED semantic vs PCED rerank"]["accuracy_delta"] >= 0.005
+                    and comparisons["PCED semantic vs PCED rerank"]["paired_bootstrap_95ci"][0] > 0
                 ),
             },
         },

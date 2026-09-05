@@ -13,17 +13,19 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def test_minmax_and_harmonic_prior_are_bounded() -> None:
+def test_rerank_prior_is_bounded_and_ignores_dense_retrieval_scale() -> None:
     documents = [
         {"retrieval_score": 10.0, "rerank_score": -1.0},
         {"retrieval_score": 20.0, "rerank_score": 2.0},
         {"retrieval_score": 30.0, "rerank_score": 1.0},
     ]
-    prior = MODULE.retrieval_prior(documents, 1e-4)
+    prior = MODULE.rerank_prior(documents, 1e-4)
     assert prior.shape == (3,)
     assert np.all(prior > 0.0)
     assert np.all(prior < 1.0)
-    assert prior[1] > prior[0]
+    assert prior[1] > prior[2] > prior[0]
+    documents[0]["retrieval_score"] = 1e9
+    assert np.allclose(prior, MODULE.rerank_prior(documents, 1e-4))
 
 
 def test_pced_prior_can_change_winning_expert_without_changing_logits() -> None:
