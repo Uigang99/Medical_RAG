@@ -48,7 +48,7 @@ from medrag.filtering.rag2_filter import Rag2FlanT5Filter  # noqa: E402
 from medrag.rag2_anchored_trace import CHOICES  # noqa: E402
 
 
-RUN_VERSION = "rag2_direct_choice_pced_semantic_prior_dynamic_topk_v3"
+RUN_VERSION = "rag2_direct_choice_pced_semantic_labeled_three_anchor_topk_v4"
 PCED_RULE_VERSION = "pced_eq2_eq3_dynamic_mean_adacad_jsd_first_token_gamma2p5_v1"
 RERANK_PRIOR_VERSION = "question_minmax_reranker_only_v2"
 SEMANTIC_PRIOR_VERSION = "binary_support_classifier_raw_probability_v1"
@@ -68,9 +68,8 @@ MMLU_DATASETS = tuple(name for name in DATASETS if name.startswith("mmlu_"))
 
 DEFAULT_CANDIDATES = (
     PROJECT_ROOT
-    / "databases/run_cache/rag2_llama3_paper_exact_terminal_v1/"
-    "all_mcq_source_balanced32_rationale_full_rerank32/candidates/"
-    "07083d5bac341d9b/candidates.jsonl"
+    / "databases/run_cache/rag2_pced_semantic_labeled_dynamic_topk_v2/"
+    "top8/candidates.jsonl"
 )
 DEFAULT_LLAMA = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 DEFAULT_MEDMCQA_SEMANTIC = (
@@ -336,16 +335,19 @@ def contract(args: argparse.Namespace, samples: Sequence[BenchmarkSample]) -> di
         raise FileNotFoundError(manifest)
     candidate_manifest = json.loads(manifest.read_text(encoding="utf-8"))
     expected = {
+        "type": "rag2_pced_exact_semantic_labeled_dynamic_topk_v2",
         "rows": 6545,
         "per_source_top_k": args.top_k,
         "candidate_pool_top_k": 4 * args.top_k,
         "rerank_top_k": args.top_k,
         "candidate_layout": "source_balanced",
+        "prompt_profile": "paper_compatible_three_anchor",
+        "candidate_protocol": "rag2_paper_balanced_dynamic_topk_union_v1",
     }
     mismatches = {
         key: {"expected": value, "actual": candidate_manifest.get(key)}
         for key, value in expected.items()
-        if candidate_manifest.get(key, "source_balanced" if key == "candidate_layout" else None) != value
+        if candidate_manifest.get(key) != value
     }
     if mismatches:
         raise RuntimeError(f"Candidate manifest mismatch: {mismatches}")
@@ -361,7 +363,10 @@ def contract(args: argparse.Namespace, samples: Sequence[BenchmarkSample]) -> di
         "split": args.split,
         "question_count": len(samples),
         "top_k": args.top_k,
-        "candidate_projection": "dense Top-k per each of four corpora, rerank 4k, select final Top-k",
+        "candidate_projection": (
+            "exact stored selected_document_ids_by_top_k from the three-anchor "
+            "pseudo-semantic-label candidate union; no retrieval or reranking"
+        ),
         "gamma": args.gamma,
         "dynamic_beta": (
             "mean over Top-k per-expert full-vocabulary JSD(expert, no-context) at the first/only token; "

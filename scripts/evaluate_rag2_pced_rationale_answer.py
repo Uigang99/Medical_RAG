@@ -63,7 +63,7 @@ from medrag.rag2_anchored_trace import (  # noqa: E402
 )
 
 
-RUN_VERSION = "rag2_rationale_answer_pced_dynamic_topk_v1"
+RUN_VERSION = "rag2_rationale_answer_pced_semantic_labeled_three_anchor_topk_v2"
 GENERATION_RULE = "tokenwise_pced_full_vocab_rationale_then_same_beta_constrained_choice_v1"
 DEFAULT_LLAMA = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 DEFAULT_NO_RAG = (
@@ -186,11 +186,15 @@ def build_contract(args: argparse.Namespace, samples: Sequence[BenchmarkSample])
         raise FileNotFoundError(candidate_manifest)
     value = json.loads(candidate_manifest.read_text(encoding="utf-8"))
     expected = {
+        "type": "rag2_pced_exact_semantic_labeled_dynamic_topk_v2",
         "rows": 6545,
         "per_source_top_k": args.top_k,
         "candidate_pool_top_k": 4 * args.top_k,
         "rerank_top_k": args.top_k,
         "evaluation_top_k": args.top_k,
+        "candidate_layout": "source_balanced",
+        "prompt_profile": "paper_compatible_three_anchor",
+        "candidate_protocol": "rag2_paper_balanced_dynamic_topk_union_v1",
     }
     mismatch = {key: (wanted, value.get(key)) for key, wanted in expected.items() if value.get(key) != wanted}
     if mismatch:
@@ -204,6 +208,10 @@ def build_contract(args: argparse.Namespace, samples: Sequence[BenchmarkSample])
         "top_k": args.top_k,
         "gamma": args.gamma,
         "dynamic_beta": "mean full-vocabulary JSD(expert, no-context) at first rationale token; fixed thereafter",
+        "candidate_projection": (
+            "exact stored selected_document_ids_by_top_k from the three-anchor "
+            "pseudo-semantic-label candidate union; no retrieval or reranking"
+        ),
         "candidate_cache": {"path": str(args.candidate_cache.resolve()), "sha256": sha256_file(args.candidate_cache)},
         "candidate_manifest_sha256": sha256_file(candidate_manifest),
         "semantic_score_cache": {"path": str(args.semantic_score_cache.resolve()), "sha256": sha256_file(args.semantic_score_cache)},
