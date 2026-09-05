@@ -873,6 +873,21 @@ def render_table(summary: dict[str, Any]) -> str:
             f"{percent(metrics['mmlu_pooled_accuracy'])} | {percent(metrics['micro_accuracy'])} | "
             f"{percent(metrics['macro8_accuracy'])} | {percent(metrics['macro3_accuracy'])} |"
         )
+    lines.extend([
+        "",
+        "| Condition | Anatomy | Clinical knowledge | College biology | College medicine | Medical genetics | Professional medicine |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for condition, metrics in summary["conditions"].items():
+        per_dataset = metrics["per_dataset_accuracy"]
+        lines.append(
+            f"| {names[condition]} | {percent(per_dataset['mmlu_anatomy'])} | "
+            f"{percent(per_dataset['mmlu_clinical_knowledge'])} | "
+            f"{percent(per_dataset['mmlu_college_biology'])} | "
+            f"{percent(per_dataset['mmlu_college_medicine'])} | "
+            f"{percent(per_dataset['mmlu_medical_genetics'])} | "
+            f"{percent(per_dataset['mmlu_professional_medicine'])} |"
+        )
     lines.extend(["", "Paired changes on the identical cohort:", ""])
     for name, comparison in summary["paired_comparisons"].items():
         interval = comparison["paired_bootstrap_95ci"]
