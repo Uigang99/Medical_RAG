@@ -66,7 +66,7 @@ from medrag.rag2_anchored_trace import (  # noqa: E402
 )
 
 
-RUN_VERSION = "rag2_pced_history_rationale_answer_batched_pilot_v1"
+RUN_VERSION = "rag2_pced_history_rationale_answer_batched_pilot_v2"
 HISTORY_RULE = "bounded_ema_selected_token_logprob_ratio_to_no_rag_v1"
 DEFAULT_LLAMA = WORKSPACE_ROOT / "models/Llama-3-8B-Instruct"
 DEFAULT_CANDIDATES = (
@@ -99,6 +99,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--questions-per-dataset", type=int, default=64)
     parser.add_argument("--fidelity-per-dataset", type=int, default=8)
+    parser.add_argument("--full-cohort", action="store_true")
+    parser.add_argument("--fidelity-only", action="store_true")
+    parser.add_argument("--force-regenerate-baselines", action="store_true")
     parser.add_argument("--gamma", type=float, default=2.5)
     parser.add_argument("--prior-epsilon", type=float, default=1e-4)
     parser.add_argument("--history-strength", type=float, default=0.10)
@@ -904,6 +907,7 @@ def aggregate(
         "run_version": RUN_VERSION,
         "questions": len(samples),
         "questions_per_dataset": args.questions_per_dataset,
+        "cohort_mode": "all_6545" if args.full_cohort else "balanced_bounded",
         "top_k": args.top_k,
         "baseline_source": baseline_source,
         "fidelity": {key: value for key, value in fidelity.items() if key != "rows"},
@@ -1036,9 +1040,14 @@ def build_contract(args: argparse.Namespace, samples: Sequence[BenchmarkSample])
         "attn_implementation": args.attn_implementation,
         "seed": args.seed,
         "selection_policy": (
-            "seeded uniform sample of N rows per dataset; generation batches ordered by legacy rationale "
-            "length for scheduling efficiency only; no metric-based input or score change"
+            "all canonical benchmark rows; generation batches ordered by legacy rationale length for "
+            "scheduling efficiency only"
+            if args.full_cohort
+            else "seeded uniform sample of N rows per dataset; generation batches ordered by legacy "
+            "rationale length for scheduling efficiency only; no metric-based input or score change"
         ),
+        "fidelity_only": args.fidelity_only,
+        "force_regenerate_baselines": args.force_regenerate_baselines,
         "test_tuning": "none; one preregistered history setting in a bounded audit cohort",
         "script_sha256": sha256_file(Path(__file__)),
     }
@@ -1119,9 +1128,12 @@ def main() -> None:
         args.max_questions = 0
         all_samples, all_candidates = load_inputs(args)
         progress.update(1)
-        samples, candidates = select_balanced(
-            all_samples, all_candidates, args.questions_per_dataset, args.seed
-        )
+        if args.full_cohort:
+            samples, candidates = list(all_samples), list(all_candidates)
+        else:
+            samples, candidates = select_balanced(
+                all_samples, all_candidates, args.questions_per_dataset, args.seed
+            )
         progress.update(1)
         semantic = load_semantic(args.semantic_score_cache)
         expected_pairs = {
@@ -1177,7 +1189,7 @@ def main() -> None:
         contract_hash = ensure_contract(args, contract)
         progress.update(1)
         progress.complete(
-            f"questions={len(samples)} ({args.questions_per_dataset} x {len(DATASETS)} datasets) "
+            f"questions={len(samples)} cohort={'all_6545' if args.full_cohort else f'{args.questions_per_dataset} x {len(DATASETS)} datasets'} "
             f"documents={len(samples)*args.top_k} manifest={args.output_dir/'experiment_manifest.json'}"
         )
         if args.preflight_only:
@@ -1212,8 +1224,15 @@ def main() -> None:
             f"exact_pass={fidelity['exact_pass']}",
             flush=True,
         )
+        if args.fidelity_only:
+            print(
+                f"[fidelity-only complete | exact_pass={fidelity['exact_pass']}] "
+                f"report={args.output_dir/'legacy_fidelity.json'}",
+                flush=True,
+            )
+            return
 
-        if fidelity["exact_pass"]:
+        if fidelity["exact_pass"] and not args.force_regenerate_baselines:
             no_rag_rows = [cached_no_rag[sample.id] for sample in samples]
             base_rows = [legacy["base_rag"][sample.id] for sample in samples]
             semantic_rows = [legacy["pced_semantic"][sample.id] for sample in samples]
@@ -1222,10 +1241,14 @@ def main() -> None:
                 progress.start(stage_index, len(samples), initial=len(samples), detail=condition)
                 progress.complete(f"exact fidelity passed; reused {condition} legacy output")
         else:
+            reason = (
+                "full regeneration was explicitly requested"
+                if args.force_regenerate_baselines
+                else "exact legacy match failed"
+            )
             print(
-                "[fidelity decision] exact legacy match failed; regenerating all remaining baselines with "
-                "the same batched engine. The new-engine rerank control remains the causal baseline.",
-                flush=True,
+                f"[baseline decision] {reason}; regenerating all remaining baselines with the same "
+                "batched engine. The new-engine rerank control is the causal baseline.", flush=True,
             )
             # Every baseline is separately resumable and reports its own
             # active-stage rate and ETA.
