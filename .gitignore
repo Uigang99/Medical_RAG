@@ -154,6 +154,9 @@ venv/
 !/scripts/run_rag2_semantic_influence_bounded_pilot.sh
 !/scripts/evaluate_rag2_pced_history_pilot.py
 !/scripts/run_rag2_pced_history_rationale_pilot.sh
+!/scripts/build_rag2_medical_kg_mvp.py
+!/scripts/setup_rag2_medical_kg_mvp.sh
+!/scripts/run_rag2_medical_kg_mvp.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
@@ -164,6 +167,9 @@ venv/
 !/medrag/attribution/
 !/medrag/attribution/__init__.py
 !/medrag/attribution/target_llm_predictor.py
+!/medrag/kg/
+!/medrag/kg/__init__.py
+!/medrag/kg/biomedical_mvp.py
 
 /tests/*
 !/tests/test_rag2_hidden_score_gold_margin.py
@@ -195,3 +201,4 @@ venv/
 !/tests/test_direct_choice_document_mask_validity.py
 !/tests/test_semantic_influence_pilot.py
 !/tests/test_rag2_pced_history_pilot.py
+!/tests/test_rag2_medical_kg_mvp.py
