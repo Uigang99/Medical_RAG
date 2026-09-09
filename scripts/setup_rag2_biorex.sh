@@ -39,6 +39,7 @@ echo "[setup 2/4] installing the minimal official-compatible inference stack"
   'datasets==3.2.0' \
   'sentencepiece!=0.1.92' \
   'protobuf==5.29.2' \
+  'click>=8.1,<9' \
   'scispacy==0.5.5'
 
 if [[ ! -s "${MODEL_DIR}/config.json" ]]; then
@@ -71,4 +72,3 @@ if not gpus:
     raise SystemExit("ERROR: TensorFlow cannot see GPU 1")
 print(f"[setup complete] tensorflow={tf.__version__} transformers={transformers.__version__} GPUs={gpus}")
 PY
-

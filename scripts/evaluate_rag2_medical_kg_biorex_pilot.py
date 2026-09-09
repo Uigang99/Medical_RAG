@@ -76,7 +76,7 @@ OFFICIAL_LABELS = [
     "INDIRECT-DOWNREGULATOR", "INDIRECT-UPREGULATOR", "INHIBITOR", "PART-OF",
     "PRODUCT-OF", "SUBSTRATE", "SUBSTRATE_PRODUCT-OF", "mechanism", "int",
     "effect", "advise", "AIMED-Association", "HPRD-Association", "EUADR-Association",
-    "None-EUADR", "Indirect_conversion", "Non_conversion",
+    "None-EUADR", "Indirect_conversion", "Non_conversion", "None-Conversion",
 ]
 GENERIC_SURFACES = {
     "background", "conclusion", "conclusions", "data", "day", "days", "figure",
