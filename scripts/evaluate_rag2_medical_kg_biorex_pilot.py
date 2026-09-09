@@ -288,9 +288,12 @@ def repository_commit(path: Path) -> str:
 
 def model_contract(path: Path) -> dict[str, Any]:
     files = sorted(
-        {"name": item.name, "size": item.stat().st_size}
-        for item in path.iterdir()
-        if item.is_file()
+        (
+            {"name": item.name, "size": item.stat().st_size}
+            for item in path.iterdir()
+            if item.is_file()
+        ),
+        key=lambda item: item["name"],
     )
     return {
         "path": str(path.resolve()),
