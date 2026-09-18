@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,25 @@ spec.loader.exec_module(module)
 
 
 class StatementGraphV2Test(unittest.TestCase):
+    def test_contract_hash_ignores_git_commit_but_keeps_code_content(self):
+        first = {"run_version": "v", "code": {"script": {"sha256": "abc"}, "git_commit": "one"}}
+        second = {"run_version": "v", "code": {"script": {"sha256": "abc"}, "git_commit": "two"}}
+        changed = {"run_version": "v", "code": {"script": {"sha256": "xyz"}, "git_commit": "two"}}
+        self.assertEqual(module.contract_payload(first), module.contract_payload(second))
+        self.assertNotEqual(module.contract_payload(first), module.contract_payload(changed))
+
+    def test_preflight_only_legacy_manifest_is_migrated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = {"run_version": "v", "code": {"script": {"mtime_ns": 1}, "git_commit": "one"}, "seed": 7}
+            previous["contract_sha256"] = "legacy"
+            (root / "manifest.json").write_text(json.dumps(previous), encoding="utf-8")
+            current = {"run_version": "v", "code": {"script": {"sha256": "abc"}, "git_commit": "two"}, "seed": 7}
+            current["contract_sha256"] = module.sha256_text(module.canonical_json(module.contract_payload(current)))
+            module.ensure_manifest(SimpleNamespace(output_root=root), current)
+            migrated = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(migrated["contract_sha256"], current["contract_sha256"])
+
     def test_clean_mentions_collapses_article_overlap(self):
         row = {
             "nodes": [

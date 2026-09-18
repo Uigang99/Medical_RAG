@@ -177,6 +177,32 @@ def file_identity(path: Path) -> dict[str, Any]:
     return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+def code_identity(path: Path) -> dict[str, Any]:
+    """Return a stable code identity; commits and mtimes are audit metadata only."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"path": str(path.resolve()), "size": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
+def contract_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Select fields that determine cache meaning, excluding mutable audit data."""
+    payload = json.loads(canonical_json(value))
+    payload.pop("contract_sha256", None)
+    code = dict(payload.get("code") or {})
+    code.pop("git_commit", None)
+    payload["code"] = code
+    return payload
+
+
+def legacy_contract_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare pre-fix manifests while ignoring their unstable code identity."""
+    payload = contract_payload(value)
+    payload.pop("code", None)
+    return payload
+
+
 def normalized_surface(value: str) -> str:
     value = value.casefold().replace("–", "-").replace("—", "-")
     value = re.sub(r"^[\s\"'`]+|[\s\"'`]+$", "", value)
@@ -261,13 +287,13 @@ def experiment_contract(args: argparse.Namespace, cohort: Mapping[str, Any]) -> 
             "max_verifier_output_tokens": args.max_verifier_output_tokens,
         },
         "code": {
-            "script": file_identity(Path(__file__).resolve()),
+            "script": code_identity(Path(__file__).resolve()),
             "git_commit": subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False).stdout.strip() or None,
         },
         "seed": args.seed,
         "uses_questions_answers_gold_or_semantic_labels": False,
     }
-    value["contract_sha256"] = sha256_text(canonical_json(value))
+    value["contract_sha256"] = sha256_text(canonical_json(contract_payload(value)))
     return value
 
 
@@ -277,7 +303,23 @@ def ensure_manifest(args: argparse.Namespace, value: Mapping[str, Any]) -> None:
     if path.exists():
         previous = json.loads(path.read_text(encoding="utf-8"))
         if previous.get("contract_sha256") != value.get("contract_sha256"):
-            raise RuntimeError("Statement Graph v2 resume contract mismatch; use a new output root")
+            expensive_outputs = [
+                "relation_shards", "normalization_shards", "verification_shards",
+                "raw_statements_v2.jsonl", "normalized_statements_v2.jsonl",
+                "verified_statements_v2.jsonl", "canonicalized_statements_v2.jsonl",
+                "summary.json", "COMPLETE.json",
+            ]
+            only_preflight_cache = not any((args.output_root / name).exists() for name in expensive_outputs)
+            same_legacy_contract = legacy_contract_payload(previous) == legacy_contract_payload(value)
+            if only_preflight_cache and same_legacy_contract:
+                atomic_json(path, value)
+                print(
+                    "[manifest migration] accepted preflight-only cache; experimental contract is unchanged "
+                    "and unstable git/mtime code identity was replaced by a content hash",
+                    flush=True,
+                )
+            else:
+                raise RuntimeError("Statement Graph v2 resume contract mismatch; use a new output root")
     else:
         atomic_json(path, value)
 
