@@ -157,6 +157,8 @@ venv/
 !/scripts/build_rag2_medical_kg_mvp.py
 !/scripts/setup_rag2_medical_kg_mvp.sh
 !/scripts/run_rag2_medical_kg_mvp.sh
+!/scripts/build_rag2_statement_graph_v2_pilot.py
+!/scripts/run_rag2_statement_graph_v2_pilot.sh
 
 !/medrag/filtering/rag2_margin_regressor.py
 !/medrag/filtering/semantic_features.py
@@ -202,3 +204,4 @@ venv/
 !/tests/test_semantic_influence_pilot.py
 !/tests/test_rag2_pced_history_pilot.py
 !/tests/test_rag2_medical_kg_mvp.py
+!/tests/test_rag2_statement_graph_v2_pilot.py
