@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="/home/user/Uiheon/Medical_RAG"
 PYTHON_BIN="${PYTHON_BIN:-/home/user/Uiheon/.venv_vllm/bin/python}"
+ENTITY_PYTHON="${ENTITY_PYTHON:-/home/user/Uiheon/.venv_rag2_kg_mvp_py312/bin/python}"
+SCISPACY_CACHE="${SCISPACY_CACHE:-/home/user/Uiheon/models/RAG2-Medical-KG-MVP/scispacy_cache}"
 TARGET_PROPOSITIONS="${TARGET_PROPOSITIONS:-600000}"
 GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-256}"
 NORMALIZATION_BATCH_SIZE="${NORMALIZATION_BATCH_SIZE:-2048}"
@@ -16,5 +18,7 @@ exec "${PYTHON_BIN}" "${ROOT}/scripts/build_rag2_context_graph_budgeted.py" \
   --generation-batch-size "${GENERATION_BATCH_SIZE}" \
   --generation-shard-size "${GENERATION_BATCH_SIZE}" \
   --normalization-batch-size "${NORMALIZATION_BATCH_SIZE}" \
+  --entity-python "${ENTITY_PYTHON}" \
+  --scispacy-cache "${SCISPACY_CACHE}" \
   --output-root "${OUTPUT_ROOT}" \
   "$@"

@@ -37,6 +37,8 @@ DEFAULT_QUALITY_ROOT = ROOT / "datasets/kg/rag2_train60k_test6545_standalone_v2_
 DEFAULT_OUTPUT = ROOT / "datasets/kg/rag2_context_graph_existing_propositions_600k_v1"
 DEFAULT_MODEL = WORKSPACE / "models/Qwen3.5-9B"
 DEFAULT_PYTHON = WORKSPACE / ".venv_vllm/bin/python"
+DEFAULT_ENTITY_PYTHON = WORKSPACE / ".venv_rag2_kg_mvp_py312/bin/python"
+DEFAULT_SCISPACY_CACHE = WORKSPACE / "models/RAG2-Medical-KG-MVP/scispacy_cache"
 DEFAULT_REFERENCE = ROOT / "datasets/kg/rag2_context_preserving_proposition_graph_pilot_768_v3/inputs.jsonl"
 PROGRESS_PREFIX = "@@BUDGET_CONTEXT_GRAPH_PROGRESS@@"
 GENERIC_SURFACES = pilot.GENERIC_BRIDGES | {
@@ -52,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--llm-python", type=Path, default=DEFAULT_PYTHON)
+    parser.add_argument("--entity-python", type=Path, default=DEFAULT_ENTITY_PYTHON)
+    parser.add_argument("--scispacy-cache", type=Path, default=DEFAULT_SCISPACY_CACHE)
     parser.add_argument("--reference-input", type=Path, default=DEFAULT_REFERENCE)
     parser.add_argument("--target-propositions", type=int, default=600_000)
     parser.add_argument("--generation-batch-size", type=int, default=256)
@@ -193,7 +197,10 @@ def ensure_manifest(args: argparse.Namespace, selection: Mapping[str, Any]) -> N
     if path.is_file():
         previous = json.loads(path.read_text(encoding="utf-8"))
         if previous.get("contract_sha256") != contract["contract_sha256"] and any((args.output_root / name).exists() for name in ("selected_propositions.jsonl", "participant_shards", "umls_cache.sqlite3", "graph")):
-            raise RuntimeError("Budgeted context graph resume contract mismatch; use a new output root")
+            previous_scientific = {key: value for key, value in previous.items() if key not in {"contract_sha256", "code_sha256"}}
+            current_scientific = {key: value for key, value in contract.items() if key not in {"contract_sha256", "code_sha256"}}
+            if previous_scientific != current_scientific:
+                raise RuntimeError("Budgeted context graph resume contract mismatch; use a new output root")
     common.atomic_json(path, contract)
 
 
@@ -456,10 +463,11 @@ def graph_worker(args: argparse.Namespace) -> None:
 
 
 def worker_command(args: argparse.Namespace, mode: str) -> list[str]:
+    python = args.entity_python if mode == "normalize" else args.llm_python
     return [
-        str(args.llm_python), str(Path(__file__).resolve()), "--mode", mode,
+        str(python), str(Path(__file__).resolve()), "--mode", mode,
         "--quality-root", str(args.quality_root), "--output-root", str(args.output_root),
-        "--model", str(args.model), "--llm-python", str(args.llm_python),
+        "--model", str(args.model), "--llm-python", str(args.llm_python), "--entity-python", str(args.entity_python),
         "--reference-input", str(args.reference_input), "--target-propositions", str(args.target_propositions),
         "--generation-batch-size", str(args.generation_batch_size), "--generation-shard-size", str(args.generation_shard_size),
         "--normalization-batch-size", str(args.normalization_batch_size), "--gpu-memory-utilization", str(args.gpu_memory_utilization),
@@ -473,6 +481,7 @@ def run_worker(args: argparse.Namespace, mode: str, progress: Any, stage: int) -
     environment.setdefault("TOKENIZERS_PARALLELISM", "false")
     environment.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
     environment.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    environment["SCISPACY_CACHE"] = str(args.scispacy_cache)
     process = subprocess.Popen(worker_command(args, mode), cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     assert process.stdout is not None
     started = False
@@ -497,11 +506,23 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
     required = [
         args.quality_root / "manifest.json", args.quality_root / "train/usable_propositions.jsonl",
         args.quality_root / "test/usable_propositions.jsonl", args.quality_root / "train/summary.json",
-        args.quality_root / "test/summary.json", args.model, args.llm_python, args.reference_input,
+        args.quality_root / "test/summary.json", args.model, args.llm_python, args.entity_python, args.reference_input,
     ]
     for path in required:
         if not path.exists():
             raise FileNotFoundError(path)
+    cache_datasets = args.scispacy_cache / "datasets"
+    required_cache_suffixes = (
+        ".nmslib_index.bin", ".tfidf_vectorizer.joblib",
+        ".tfidf_vectors_sparse.npz", ".concept_aliases.json",
+        ".umls_2022_ab_cat0129.jsonl", ".umls_semantic_type_tree.tsv",
+    )
+    if not cache_datasets.is_dir():
+        raise FileNotFoundError(cache_datasets)
+    cache_names = [path.name for path in cache_datasets.iterdir() if path.is_file()]
+    missing_suffixes = [suffix for suffix in required_cache_suffixes if sum(name.endswith(suffix) for name in cache_names) != 1]
+    if missing_suffixes:
+        raise RuntimeError(f"Incomplete local scispaCy UMLS cache under {cache_datasets}: {missing_suffixes}")
     selection = selection_metadata(args)
     ensure_manifest(args, selection)
     usage = os.statvfs(args.output_root)
