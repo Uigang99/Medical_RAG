@@ -205,3 +205,9 @@ venv/
 !/tests/test_rag2_pced_history_pilot.py
 !/tests/test_rag2_medical_kg_mvp.py
 !/tests/test_rag2_statement_graph_v2_pilot.py
+!/scripts/extract_rag2_top8_standalone_propositions.py
+!/scripts/compare_rag2_proposition_models.py
+!/tests/test_extract_rag2_top8_standalone_propositions.py
+!/tests/test_rag2_proposition_model_comparison.py
+!/scripts/extract_rag2_restored_gemma_propositions.py
+!/scripts/run_rag2_restored_gemma_propositions.sh
