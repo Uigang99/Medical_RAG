@@ -211,3 +211,4 @@ venv/
 !/tests/test_rag2_proposition_model_comparison.py
 !/scripts/extract_rag2_restored_gemma_propositions.py
 !/scripts/run_rag2_restored_gemma_propositions.sh
+!/tests/test_restored_proposition_oom_resume.py
