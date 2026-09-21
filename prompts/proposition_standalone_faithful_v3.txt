@@ -1,0 +1,21 @@
+Extract factual propositions from the passage for reuse individually in a cross-document evidence graph. Use only the supplied passage. Each claim must make sense when read without the passage or any other claim.
+
+Read the whole passage before writing. Resolve the topic, named people, study population, comparison groups and referents from the passage, not from outside knowledge. In EVERY claim, name the relevant disease, procedure, organism or other topic. For a case or experiment, repeat a short identifying description supported by the passage (for example, "In the reported experiment comparing X and Y, ..." or "The reported patient with X ..."). Do not leave bare "the patient", "the study", "both groups", "these", or unexplained criterion/phase references. If the passage does not supply a necessary referent, omit only that unrecoverable assertion. Never borrow an unrelated following heading as its subject. Preserve recoverable assertions elsewhere in the passage.
+
+Preserve meaning before splitting. One proposition may contain multiple clauses needed for one complete fact. Keep the subject, relation and affected object correctly connected. Keep necessary conditions, population, quantities, units, comparisons, time, negation, uncertainty and exceptions WITH the fact they qualify. A case observation remains a case observation; a study result remains a study result, not a universal rule. Preserve alternatives and the scope of quantifiers: "A or B" must not become two assertions that A and B each hold. Keep a diagnostic requirement with its exceptions. Do not turn association into causation, a possibility into a certainty, or a side effect into an intended purpose.
+
+Cover all substantive supported information, including methods and results. Avoid duplicates, outside explanations, unsupported abbreviation expansions, and guessed repairs to damaged text. A question or heading alone is not a factual answer; return an empty list if no factual assertions are recoverable. Copying a suitable source sentence is acceptable only if it already meets the independence requirements above.
+
+For each claim, copy ONE exact contiguous source span as evidence. Include enough context to support the claim and resolve its referents. Do not insert ellipses, rewrite the quote, or join separated fragments. Escape quotation marks and newlines correctly in JSON.
+
+Before returning, check each claim on its own: identifiable subject and object, preserved scope and logic, and no invented information. Return JSON only, with no additional fields or commentary:
+{"propositions":[{"claim":"standalone factual proposition","evidence":"exact contiguous source span"}]}
+
+Independence examples (illustrations only; never output these facts for another passage):
+SOURCE: "A pump with a damaged seal was tested. Its pressure was 20 kPa. It stopped after 5 minutes."
+CLAIMS: "The reported pump with a damaged seal had a pressure of 20 kPa during testing."; "The reported pump with a damaged seal stopped after 5 minutes of testing."
+NOT: "The pump stopped after 5 minutes." Repeating the description is intentional, not redundant.
+SOURCE: "In a trial of coating R on steel, corrosion fell by 12%. Both groups were inspected weekly."
+CLAIMS: "In the reported trial of coating R on steel, corrosion fell by 12%."; "In the reported trial of coating R on steel, both comparison groups were inspected weekly."
+Name a person when identified anywhere in the passage; otherwise reuse a source-supported case description in EVERY case-specific claim. An unresolved group identity must not be invented. Keep the named trial's scope, without claiming applicability to all trials.
+

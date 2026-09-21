@@ -1,0 +1,37 @@
+{
+  "version": "standalone_faithful_v3",
+  "status": "frozen_after_bounded_development_and_separate_extraction_check",
+  "system_prompt_file": "proposition_standalone_faithful_v3.txt",
+  "system_prompt_file_sha256": "1150a4738a1c4554f12d9689e72feadea5a40310289b991cb20747d01630584d",
+  "prompt_loading": "Read UTF-8 file and strip leading/trailing whitespace; preserve all internal content including examples",
+  "validated_model": "gemma-4-31B-it",
+  "checkpoint_revision": "842da3794eaa0b77d5f08bae87a17459d91ff475",
+  "engine": "vllm 0.24.0",
+  "chat_template": "checkpoint-native apply_chat_template; add_generation_prompt=true; enable_thinking=false",
+  "user_message_template": "SOURCE PASSAGE:\n{restored_text}",
+  "generation": {
+    "temperature": 0.0,
+    "max_output_tokens": 4096,
+    "max_model_len": 8192,
+    "dtype": "bfloat16",
+    "batch_size": 8,
+    "seed": 20260921,
+    "tensor_parallel_size": 1,
+    "enforce_eager": true,
+    "enable_prefix_caching": true,
+    "language_model_only": true,
+    "gpu_memory_utilization": 0.8
+  },
+  "source_input": "Sentence-restored original chunk only, no question/options/gold answer/semantic label",
+  "output_schema": {"propositions": [{"claim": "string", "evidence": "string"}]},
+  "preservation_requirements": [
+    "Keep stable document ID, full source text, original raw response and model/prompt versions",
+    "Keep each claim and its evidence linked to that source; case/study statements are not universal facts",
+    "Do not merge anonymous patients/studies across documents based on repeated descriptive phrases",
+    "A valid empty proposition list is permitted for a question-only title",
+    "Do not silently truncate inputs/outputs or silently repair semantic content",
+    "Flag malformed JSON, output truncation and non-exact evidence for review/retry; exact quotation does not prove entailment"
+  ],
+  "quality_scope": "32 development + 16 previously unseen extraction documents; direct assistant review, not expert gold or untouched QA-test evaluation",
+  "limits": "Not validated on other checkpoints or all 88294 documents. Missing antecedents, OCR, quantifier scope and omissions remain possible. Full corpus generation not launched."
+}
