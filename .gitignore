@@ -215,3 +215,11 @@ venv/
 !/scripts/retry_rag2_restored_top8_gemma_propositions.py
 !/scripts/run_rag2_restored_top8_gemma_proposition_repair.sh
 !/tests/test_rag2_restored_top8_proposition_repair.py
+!/scripts/prepare_rag2_gemma_relation_pilot.py
+!/scripts/run_rag2_gemma_relation_pilot.py
+!/scripts/normalize_rag2_gemma_relation_pilot.py
+!/scripts/prepare_rag2_train_relation_benchmark.py
+!/scripts/evaluate_rag2_train_relation_benchmark.py
+!/scripts/filter_rag2_kg_grounded_propositions.py
+!/scripts/prepare_rag2_kg_lexical_relation_pilot.py
+!/tests/test_rag2_gemma_relation_pilot.py
