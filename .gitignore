@@ -212,3 +212,6 @@ venv/
 !/scripts/extract_rag2_restored_gemma_propositions.py
 !/scripts/run_rag2_restored_gemma_propositions.sh
 !/tests/test_restored_proposition_oom_resume.py
+!/scripts/retry_rag2_restored_top8_gemma_propositions.py
+!/scripts/run_rag2_restored_top8_gemma_proposition_repair.sh
+!/tests/test_rag2_restored_top8_proposition_repair.py
