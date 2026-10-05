@@ -223,3 +223,6 @@ venv/
 !/scripts/filter_rag2_kg_grounded_propositions.py
 !/scripts/prepare_rag2_kg_lexical_relation_pilot.py
 !/tests/test_rag2_gemma_relation_pilot.py
+!/scripts/build_rag2_stage6_7_surface_kg_union_full.py
+!/scripts/run_rag2_stage6_7_surface_kg_union_full.sh
+!/tests/test_rag2_stage6_7_surface_kg.py
