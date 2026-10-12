@@ -229,3 +229,6 @@ venv/
 !/scripts/pilot_rag2_evidence_planning.py
 !/scripts/run_rag2_evidence_planning_pilot.sh
 !/tests/test_evidence_planning.py
+!/scripts/pilot_rag2_evidence_planning_v3.py
+!/scripts/run_rag2_evidence_planning_v3_pilot.sh
+!/tests/test_evidence_planning_v3.py
