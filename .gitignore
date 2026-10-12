@@ -226,3 +226,6 @@ venv/
 !/scripts/build_rag2_stage6_7_surface_kg_union_full.py
 !/scripts/run_rag2_stage6_7_surface_kg_union_full.sh
 !/tests/test_rag2_stage6_7_surface_kg.py
+!/scripts/pilot_rag2_evidence_planning.py
+!/scripts/run_rag2_evidence_planning_pilot.sh
+!/tests/test_evidence_planning.py
