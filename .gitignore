@@ -243,3 +243,8 @@ venv/
 !/scripts/train_rag2_shared_medical_lora.py
 !/scripts/run_rag2_shared_medical_lora.sh
 !/tests/test_shared_medical_lora.py
+
+# Frozen six-condition TEXT/KG evaluation (held-out pilot only).
+!/scripts/evaluate_rag2_text_graph_six_conditions.py
+!/scripts/run_rag2_text_graph_six_conditions.sh
+!/tests/test_text_graph_six_evaluation.py
