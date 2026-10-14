@@ -258,3 +258,8 @@ venv/
 !/scripts/evaluate_rag2_node_graph_input.py
 !/scripts/run_rag2_node_graph_input_evaluation.sh
 !/tests/test_node_graph_evaluation.py
+
+# Learned KG-attention overlay on the unchanged 2048/256/512 pilot.
+!/scripts/run_rag2_kg_attention_pilot.py
+!/scripts/run_rag2_kg_attention_pilot.sh
+!/tests/test_kg_structure_attention.py
