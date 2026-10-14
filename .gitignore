@@ -248,3 +248,8 @@ venv/
 !/scripts/evaluate_rag2_text_graph_six_conditions.py
 !/scripts/run_rag2_text_graph_six_conditions.sh
 !/tests/test_text_graph_six_evaluation.py
+
+# Node-wise KG input training; preserve prior pooled-graph experiments.
+!/scripts/train_rag2_node_graph_input.py
+!/scripts/run_rag2_node_graph_input_training.sh
+!/tests/test_node_graph_input.py
