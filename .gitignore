@@ -238,3 +238,8 @@ venv/
 !/scripts/run_rag2_text_input_training_pilot.sh
 !/scripts/run_rag2_graph_input_training_pilot.sh
 !/tests/test_graph_input_training.py
+
+# Shared medical-QA LoRA for the six-condition TEXT/KG comparison.
+!/scripts/train_rag2_shared_medical_lora.py
+!/scripts/run_rag2_shared_medical_lora.sh
+!/tests/test_shared_medical_lora.py
