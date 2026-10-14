@@ -232,3 +232,9 @@ venv/
 !/scripts/pilot_rag2_evidence_planning_v3.py
 !/scripts/run_rag2_evidence_planning_v3_pilot.sh
 !/tests/test_evidence_planning_v3.py
+
+# Paired TEXT/KG input adapter training (no final evaluation).
+!/scripts/train_rag2_text_kg_input_pilot.py
+!/scripts/run_rag2_text_input_training_pilot.sh
+!/scripts/run_rag2_graph_input_training_pilot.sh
+!/tests/test_graph_input_training.py
