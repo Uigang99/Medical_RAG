@@ -253,3 +253,8 @@ venv/
 !/scripts/train_rag2_node_graph_input.py
 !/scripts/run_rag2_node_graph_input_training.sh
 !/tests/test_node_graph_input.py
+
+# Fixed-pilot evaluation of the node-token graph adapter.
+!/scripts/evaluate_rag2_node_graph_input.py
+!/scripts/run_rag2_node_graph_input_evaluation.sh
+!/tests/test_node_graph_evaluation.py
