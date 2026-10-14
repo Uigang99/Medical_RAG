@@ -36,6 +36,7 @@ from medrag.training.graph_input_data import (  # noqa: E402
     identity, jsonl, load_population, pack_pair, sha_file, split_questions,
 )
 from medrag.training.graph_input_progress import Progress  # noqa: E402
+from medrag.training.graph_input_modules import training_attention_backend  # noqa: E402
 
 KG_ROOT = ROOT / "datasets/kg/rag2_test6545_union88294_stage7_surface_kg_v1"
 ENCODER_REPO = "sentence-transformers/all-roberta-large-v1"
@@ -51,7 +52,7 @@ def arguments():
     p.add_argument("--candidate-cache", type=Path, default=ROOT / "databases/run_cache/rag2_pced_semantic_labeled_dynamic_topk_v2/top8/candidates.jsonl")
     p.add_argument("--graph", type=Path, default=KG_ROOT / "graph.sqlite3")
     p.add_argument("--data-root", type=Path, default=ROOT / "datasets/pilots/rag2_text_kg_input_test_resplit_v1")
-    p.add_argument("--output-root", type=Path, default=ROOT / "results/rag2_text_kg_input_training_v1")
+    p.add_argument("--output-root", type=Path, default=ROOT / "results/rag2_text_kg_input_training_v1_sdpa_fix")
     p.add_argument("--train-size", type=int, default=2048)
     p.add_argument("--validation-size", type=int, default=256)
     p.add_argument("--pilot-evaluation-size", type=int, default=512, help="Reserve IDs only; never evaluate")
@@ -352,9 +353,9 @@ def restore_rng(state):
     torch.cuda.set_rng_state_all(state["cuda"])
 
 
+@training_attention_backend()
 def run_training(args, rows, data_hash, feature_contract, features, lookup, tokenizer, model_id, progress):
     import torch
-    from torch.nn.attention import sdpa_kernel, SDPBackend
     from transformers import AutoModelForCausalLM
     from medrag.training.graph_input_modules import GraphPrompt, TextPrompt, answer_losses
 
@@ -372,6 +373,7 @@ def run_training(args, rows, data_hash, feature_contract, features, lookup, toke
         "loss": "mean per-question teacher-forced gold answer CE; no rationale targets",
         "validation": "validation answer CE only; min CE checkpoint; NO generate or heldout scoring",
         "optimizer": "AdamW; 5% linear warmup then cosine; norm clip=1; LLM BF16, adapters FP32",
+        "attention_runtime": "SDPA flash/efficient/math only throughout forward, backward checkpoint recomputation, and validation; cuDNN disabled within run_training",
         "claim_limit": "TEST repartition development; unequal module capacity; not a pure topology causal estimate",
         "environment": {**versions(), "python": platform.python_version()},
         "code": {str(p.relative_to(ROOT)): sha_file(p) for p in
@@ -470,9 +472,7 @@ def run_training(args, rows, data_hash, feature_contract, features, lookup, toke
 
     def losses(batch):
         soft = soft_prompts(batch)
-        backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
-        with sdpa_kernel(backends):
-            return answer_losses(llm, emb, batch, soft, args.arm, tokenizer.pad_token_id)
+        return answer_losses(llm, emb, batch, soft, args.arm, tokenizer.pad_token_id)
 
     trainable = sum(p.numel() for p in adapter.parameters())
     if any(p.requires_grad for p in llm.parameters()):

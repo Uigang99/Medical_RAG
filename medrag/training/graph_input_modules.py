@@ -7,9 +7,23 @@ not a bit-identical reproduction of the upstream PyG implementation.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+@contextmanager
+def training_attention_backend():
+    """Keep checkpoint recomputation on the same non-cuDNN SDPA backends.
+
+    This context must cover backward(), not just the original forward().
+    Non-reentrant checkpointing recomputes attention during backward and does
+    not preserve the global SDPA selection context used by the first forward.
+    """
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        yield
 
 
 class EdgeAttention(nn.Module):

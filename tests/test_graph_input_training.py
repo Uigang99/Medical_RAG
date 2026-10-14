@@ -10,7 +10,8 @@ import torch
 
 from medrag.training.graph_input_data import (duplicate_groups, split_questions, graph_from_edges,
                                              graph_stats, pack_pair, ensure_contract)
-from medrag.training.graph_input_modules import GraphPrompt, TextPrompt, answer_losses
+from medrag.training.graph_input_modules import (GraphPrompt, TextPrompt, answer_losses,
+                                                 training_attention_backend)
 
 
 def edge(pid, s="A", o="B", relation="inhibits"):
@@ -111,6 +112,26 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(torch.allclose(expected, m(x, ei.flip(0), attrs)))
         self.assertEqual(m(x[:0], ei[:, :0], attrs[:0]).shape, (1, 16))
 
+    def test_checkpoint_recompute_keeps_non_cudnn_backend(self):
+        from torch.utils.checkpoint import checkpoint
+        observed = []
+        def operation(x):
+            observed.append(torch.backends.cuda.cudnn_sdp_enabled())
+            return x.sin().square()
+        before = torch.backends.cuda.cudnn_sdp_enabled()
+        try:
+            torch.backends.cuda.enable_cudnn_sdp(True)
+            with training_attention_backend():
+                x = torch.randn(8, requires_grad=True)
+                checkpoint(operation, x, use_reentrant=False).sum().backward()
+                self.assertTrue(torch.isfinite(x.grad).all())
+            self.assertGreaterEqual(len(observed), 2)
+            self.assertFalse(any(observed), "cuDNN must stay disabled during recomputation")
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+        finally:
+            torch.backends.cuda.enable_cudnn_sdp(before)
+
+    @training_attention_backend()
     def test_frozen_llama_both_arms_forward_backward_and_exact_loss(self):
         from transformers import LlamaConfig, LlamaForCausalLM
         torch.manual_seed(5)
