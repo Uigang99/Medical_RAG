@@ -14,6 +14,28 @@ import run_rag2_train_kg_stage as adapter
 
 
 class TrainDataTests(unittest.TestCase):
+    def test_throughput_profile_and_oom_recovery(self):
+        m=importlib.import_module('extract_rag2_stage2_relation_discovery_full')
+        old=m.BATCH_CHOICES
+        try:
+            adapter.cli('--batch-size','32')
+            adapter.throughput_profile(m,'step2')
+            args=m.parse_args()
+            self.assertEqual(args.batch_size,128)
+            self.assertEqual(args.gpu_memory_utilization,0.90)
+            self.assertEqual(args.max_num_batched_tokens,16384)
+            with tempfile.TemporaryDirectory() as t:
+                p=Path(t)
+                d.write_json(p/'manifest.json',{'contract_sha256':'fixture','contract':{'generation':{'requested_batch_size':128}}})
+                d.write_json(p/'generation_cursor.json',{'contract_sha256':'fixture','phase':'generate','start':0,'stop':128})
+                self.assertTrue(m.reduce_batch_after_oom(p))
+                self.assertEqual(m.runtime_batch(p,'fixture',128),64)
+                m.restore_batch(p,'fixture',128)
+                self.assertEqual(m.runtime_batch(p,'fixture',128),128)
+            prop=importlib.import_module('extract_rag2_restored_gemma_propositions')
+            spans=[(i,i+8,Path(str(i))) for i in range(0,128,8)]
+            self.assertEqual([len(x) for x in prop.pending_groups(spans,64)],[8,8])
+        finally:m.BATCH_CHOICES=old
     def upstream(self, root, stage, summary, records_name, records):
         ch=d.freeze(root/stage,{'fixture':stage})
         d.write_json(root/stage/'summary.json',summary)
@@ -114,10 +136,14 @@ class TrainDataTests(unittest.TestCase):
             m=importlib.import_module('extract_rag2_restored_gemma_propositions')
             m.TwoLineProgress=adapter.EventProgress
             adapter.cli('--input',p,'--source-scope',scope,'--output-dir',root/'out','--batch-size','32','--preflight-only')
+            adapter.throughput_profile(m,'propositions')
             m.main()
             c=d.load(root/'out/manifest.json')['contract']
             self.assertEqual(c['documents'],1);self.assertFalse(c['uses_question_answer_label'])
             self.assertEqual(c['effective_max_model_len'],16384)
+            self.assertEqual(c['effective_batch_size'],64)
+            self.assertEqual(c['effective_gpu_memory_utilization'],0.90)
+            self.assertEqual(c['max_num_batched_tokens'],16384)
 
     def test_step2_exact_preparation_and_frozen_prompt(self):
         with tempfile.TemporaryDirectory() as t:

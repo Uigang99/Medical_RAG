@@ -128,10 +128,14 @@ def main():
     ap.add_argument('--source-dir',type=Path,default=SOURCE)
     ap.add_argument('--output-dir',type=Path,default=OUTPUT)
     ap.add_argument('--batch-size',type=int,choices=[8,16,32],default=32)
+    ap.add_argument('--gpu-memory-utilization',type=float,default=0.8)
+    ap.add_argument('--max-num-batched-tokens',type=int,default=4096)
     ap.add_argument('--preflight-only',action='store_true')
     ap.add_argument('--resolve-output-dir',action='store_true',help=argparse.SUPPRESS)
     ap.add_argument('--reduce-batch-after-oom',action='store_true',help=argparse.SUPPRESS)
     args=ap.parse_args();root=args.output_dir
+    if not 0 < args.gpu_memory_utilization <= 0.95 or args.max_num_batched_tokens < 1:
+        raise ValueError('Invalid GPU memory/token budget')
     if args.resolve_output_dir:print(root);return
     root.mkdir(parents=True,exist_ok=True)
     import fcntl
@@ -172,6 +176,9 @@ def main():
             parser_sha256=file_sha(ROOT/'scripts/extract_rag2_top8_standalone_propositions.py'),
             parser_worker_sha256=file_sha(ROOT/'scripts/compare_rag2_proposition_models.py'),
             environment={n:importlib.metadata.version(n) for n in ['vllm','transformers','torch']})
+        if args.gpu_memory_utilization!=0.8 or args.max_num_batched_tokens!=4096:
+            contract.update(gpu_memory_utilization=args.gpu_memory_utilization,
+                max_num_batched_tokens=args.max_num_batched_tokens)
         contract_hash=sha(json.dumps(contract,sort_keys=True));mf=root/'manifest.json'
         if mf.exists() and json.loads(mf.read_text())['contract_sha256']!=contract_hash:
             raise RuntimeError('Repair output contract mismatch; use another output-dir')
@@ -217,8 +224,8 @@ def main():
             save(root/'generation_cursor.json',dict(contract_sha256=contract_hash,phase='load',batch_size=batch))
             with heartbeat(progress):
                 llm=LLM(model=str(model),dtype='bfloat16',tensor_parallel_size=1,
-                    gpu_memory_utilization=0.8,max_model_len=16384,max_num_seqs=batch,
-                    max_num_batched_tokens=4096,seed=20260921,enforce_eager=True,
+                    gpu_memory_utilization=args.gpu_memory_utilization,max_model_len=16384,max_num_seqs=batch,
+                    max_num_batched_tokens=args.max_num_batched_tokens,seed=20260921,enforce_eager=True,
                     enable_prefix_caching=True,language_model_only=True,disable_log_stats=True)
             sampling=SamplingParams(temperature=0.,max_tokens=6144,skip_special_tokens=False,
                 structured_outputs=StructuredOutputsParams(json=SCHEMA))

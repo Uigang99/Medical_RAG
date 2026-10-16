@@ -108,13 +108,21 @@ def run_job(args,job,offset,progress,env):
             progress.stage(offset+i,1,initial=1)
             progress.complete(f'cached {slug}')
         return
-    cmd=[str(python),'-u',str(WORKER),'--root',str(args.output_root),'--stage',stage]
+    cmd=[str(python),'-u',str(WORKER),'--root',str(args.output_root),'--stage',stage,'--profile',args.profile]
     if mode: cmd+=['--mode',mode]
     log=args.output_root/'logs'/f'{slug}.log'; log.parent.mkdir(parents=True,exist_ok=True)
     started=time.time(); attempt=0
     progress.stage(offset,1)
     while True:
         attempt+=1; last_phase=None; oom=False; previous=[]
+        if args.profile=='h200-throughput' and (stage in ('propositions','repair','step2','step3','step4') or (stage=='step5' and mode=='verify')):
+            gpu=subprocess.run(['nvidia-smi','-i','1','--query-gpu=memory.total,memory.used',
+                '--format=csv,noheader,nounits'],capture_output=True,text=True)
+            if gpu.returncode:
+                raise RuntimeError('Cannot inspect GPU 1; no model launched. '+gpu.stderr.strip())
+            total,used=map(float,gpu.stdout.strip().split(','))
+            if total-used < total*0.90+1024:
+                raise RuntimeError(f'GPU 1 has only {total-used:.0f}/{total:.0f} MiB free; throughput profile requires 90% plus 1 GiB headroom. Stop the other GPU job before resuming.')
         with log.open('a') as f:
             f.write(f'\nATTEMPT {attempt} time={time.time()} cmd={cmd}\n'); f.flush()
             proc=subprocess.Popen(cmd,cwd=ROOT,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
@@ -158,13 +166,18 @@ def run_job(args,job,offset,progress,env):
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--output-root',type=Path,default=DEFAULT_ROOT)
+    ap.add_argument('--output-root',type=Path)
+    ap.add_argument('--profile',choices=('reference','h200-throughput'),default='reference')
     ap.add_argument('--preflight-only',action='store_true')
     ap.add_argument('--stop-after',choices=['cohort','retrieval','restore','propositions','repair','usable','step2','step3','step4','step5','kg','export'],default='export')
     args=ap.parse_args()
+    if args.output_root is None:
+        args.output_root=DEFAULT_ROOT if args.profile=='reference' else DEFAULT_ROOT.with_name('rag2_official_train10000_top8_h200_throughput_v2')
     contract=preflight(args.output_root)
+    contract['execution_profile']=args.profile
+    contract['execution_note']='No measured speedup yet; batch-dependent floating-point differences can change outputs. Prompts/parsers/output limits are unchanged.'
     if args.preflight_only:
-        print(json.dumps({'status':'preflight_ok','questions':10000,'models':contract['models'],
+        print(json.dumps({'status':'preflight_ok','questions':10000,'profile':args.profile,'output_root':str(args.output_root),'models':contract['models'],
             'GPU_loaded':False,'large_cache_scanned':False,'outputs_written':False},ensure_ascii=False,indent=2))
         return
     args.output_root.mkdir(parents=True,exist_ok=True)

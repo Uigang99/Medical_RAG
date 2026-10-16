@@ -47,7 +47,7 @@ def runtime_batch(root, contract_hash, requested):
     if state['contract_sha256']!=contract_hash:
         raise RuntimeError('OOM resume state belongs to a different contract')
     batch=state['batch_size']
-    if batch not in (8,16,32) or batch>requested:
+    if batch not in (8,16,32,64) or batch>requested:
         raise RuntimeError('Invalid saved OOM batch limit')
     return batch
 
@@ -161,7 +161,9 @@ def main():
     ap.add_argument('--input',type=Path,default=INPUT_ROOT/'restored_chunks.jsonl')
     ap.add_argument('--output-dir',type=Path)
     ap.add_argument('--top-k',choices=['union','8'],default='union')
-    ap.add_argument('--batch-size',type=int,choices=[8,16,32],default=8)
+    ap.add_argument('--batch-size',type=int,choices=[8,16,32,64],default=8)
+    ap.add_argument('--gpu-memory-utilization',type=float,default=0.8)
+    ap.add_argument('--max-num-batched-tokens',type=int,default=4096)
     ap.add_argument('--resolve-output-dir',action='store_true',help=argparse.SUPPRESS)
     ap.add_argument('--reduce-batch-after-oom',action='store_true',help=argparse.SUPPRESS)
     ap.add_argument('--max-model-len',type=int,default=16384,
@@ -169,6 +171,8 @@ def main():
     ap.add_argument('--preflight-only',action='store_true')
     ap.add_argument('--source-scope',type=Path,help='Explicit non-Test cohort contract; generation method is unchanged')
     a=ap.parse_args()
+    if not 0 < a.gpu_memory_utilization <= 0.95 or a.max_num_batched_tokens < 1:
+        raise ValueError('Invalid GPU memory/token budget')
     default=OUTPUT if a.top_k=='union' and a.batch_size==8 else ROOT/'datasets/kg'/f'rag2_test6545_restored_{"top8" if a.top_k=="8" else "union"}_gemma_faithful_v3_ctx16k_batch{a.batch_size}_v1'
     root=a.output_dir or default
     if a.resolve_output_dir:print(root);return
@@ -186,19 +190,20 @@ def main():
         scope=json.loads(a.source_scope.read_text())
         expected_count=int(scope['documents'])
         if expected_count<=0:raise ValueError('Empty source scope')
-    seconds_per_doc={8:3.1,16:68.1655/64,32:47.0144/64}[a.batch_size]
+    seconds_per_doc=None if a.batch_size>32 or a.max_num_batched_tokens!=4096 or a.gpu_memory_utilization!=0.8 else {8:3.1,16:68.1655/64,32:47.0144/64}[a.batch_size]
     p=TwoLineProgress(['validate source/cache','tokenize input budgets','load Gemma31B','generate propositions','write outputs'])
     p.plan([f'{expected_count:,} fixed restored documents; scope={a.top_k}; source-review cases retained',
             'cached or validate all prompt token budgets; no truncation',
             'Gemma31B on GPU 1, context capacity=16384 (pilot8192); output remains4096; load ~25s',
             f'initial batch={a.batch_size}; 8-document shards; on OOM split failed group 32->16->8, then restore initial batch',
             'stream source-linked outputs and warnings'])
-    p.estimates=[10.,None,25.,expected_count*seconds_per_doc,90.]
+    p.estimates=[10.,None,25.,expected_count*seconds_per_doc if seconds_per_doc else None,90.]
     try:
         p.start(1,1,unit='contract',estimate=10.)
         with heartbeat(p):
             config=json.loads(CONFIG.read_text());g=dict(config['generation'])
             g['max_model_len']=a.max_model_len
+            g['gpu_memory_utilization']=a.gpu_memory_utilization
             prompt_path=CONFIG.parent/config['system_prompt_file']
             if file_sha(prompt_path)!=config['system_prompt_file_sha256']:raise RuntimeError('Frozen prompt hash mismatch')
             prompt=prompt_path.read_text().strip();model=ROOT.parent/'models'/config['validated_model']
@@ -242,6 +247,9 @@ def main():
                     retrieval='official Train; cached balanced 4*8 -> rerank 8',
                     source_review_policy='retain all selected source warnings; apply frozen usable policy after repair')
             if a.batch_size!=8:contract.update(effective_batch_size=a.batch_size,oom_policy='restart engine; split failed group down to 8; restore initial concurrency after group; immutable 8-document shards')
+            if a.gpu_memory_utilization!=0.8 or a.max_num_batched_tokens!=4096:
+                contract.update(effective_gpu_memory_utilization=a.gpu_memory_utilization,
+                    max_num_batched_tokens=a.max_num_batched_tokens)
             ch=sha(json.dumps(contract,sort_keys=True))
             mf=root/'manifest.json'
             if mf.exists() and json.loads(mf.read_text())['contract_sha256']!=ch:
@@ -253,8 +261,8 @@ def main():
             batch=runtime_batch(root,ch,a.batch_size)
             recovery=json.loads((root/'oom_batch_limit.json').read_text()) if (root/'oom_batch_limit.json').exists() else {}
             retry_stop=recovery.get('retry_stop') if batch<a.batch_size else None
-            seconds_per_doc={8:3.1,16:68.1655/64,32:47.0144/64}[batch]
-            p.estimates[3]=len(docs)*seconds_per_doc
+            seconds_per_doc=None if batch>32 or a.max_num_batched_tokens!=4096 or a.gpu_memory_utilization!=0.8 else {8:3.1,16:68.1655/64,32:47.0144/64}[batch]
+            p.estimates[3]=len(docs)*seconds_per_doc if seconds_per_doc else None
             spans=[];completed=0;missing=[]
             for start in range(0,len(docs),SHARD_SIZE):
                 stop=min(start+SHARD_SIZE,len(docs));path=root/'generation_shards'/f'batch_{start:07d}_{stop:07d}.jsonl'
@@ -301,11 +309,11 @@ def main():
             with heartbeat(p):
                 llm=LLM(model=str(model),dtype=g['dtype'],tensor_parallel_size=1,
                     gpu_memory_utilization=g['gpu_memory_utilization'],max_model_len=g['max_model_len'],
-                    max_num_seqs=batch,max_num_batched_tokens=4096,seed=g['seed'],
+                    max_num_seqs=batch,max_num_batched_tokens=a.max_num_batched_tokens,seed=g['seed'],
                     enforce_eager=True,enable_prefix_caching=True,language_model_only=True,disable_log_stats=True)
             sampling=SamplingParams(temperature=0.,max_tokens=g['max_output_tokens'],skip_special_tokens=False)
         p.complete('Gemma31B loaded' if missing else 'All shards cached; GPU loading skipped')
-        p.start(4,len(docs),initial=completed,unit='document',estimate=len(docs)*seconds_per_doc)
+        p.start(4,len(docs),initial=completed,unit='document',estimate=len(docs)*seconds_per_doc if seconds_per_doc else None)
         (root/'generation_shards').mkdir(exist_ok=True)
         with heartbeat(p):
             for group in pending_groups(missing,batch,retry_stop):

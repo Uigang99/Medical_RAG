@@ -51,6 +51,33 @@ def cli(*args):
     sys.argv=[sys.argv[0],*map(str,args)]
 
 
+def throughput_profile(module,stage):
+    """Execution-only overrides; output limits, prompts and parsers unchanged."""
+    if stage in ('step2','step3','step4'):
+        module.BATCH_CHOICES=(8,16,32,64,128)
+        if hasattr(module,'common'):
+            module.common.BATCH_CHOICES=(8,16,32,64,128)
+    batch={'propositions':64,'repair':32,'step2':128,'step3':128,'step4':64,'step5':128}.get(stage)
+    if batch is None: return
+    if stage in ('step2','step3','step4','step5'):
+        name='contract' if stage=='step2' else 'experiment_contract'
+        original=getattr(module,name)
+        def profiled_contract(*args,**kwargs):
+            value=original(*args,**kwargs)
+            value['execution_profile']='h200-throughput'
+            value['generation']['oom_policy']=f'halve current batch from {batch} down to 8 on confirmed OOM; restore {batch} after recovery shard'
+            return value
+        setattr(module,name,profiled_contract)
+    if stage=='step5':
+        sys.argv+=['--requested-batch-size',str(batch),'--gpu-memory-utilization','0.90']
+        module.is_oom=lambda e: any(t in (type(e).__name__+': '+str(e)).lower()
+            for t in ('outofmemoryerror','cuda out of memory','cuda error: out of memory','cudamalloc'))
+    else:
+        sys.argv+=['--batch-size',str(batch),'--gpu-memory-utilization','0.90']
+        if stage in ('propositions','repair','step2','step3'):
+            sys.argv+=['--max-num-batched-tokens',str(32768 if stage=='step3' else 16384)]
+
+
 def contract_scope(module, function, scope):
     original=getattr(module,function)
     def wrapped(*args,**kwargs):
@@ -184,6 +211,7 @@ def main():
     ap.add_argument('--mode',default='verify',choices=('inventory','candidates','prepare','verify','aggregate'))
     ap.add_argument('--preflight-only',action='store_true')
     ap.add_argument('--reduce-batch-after-oom',action='store_true')
+    ap.add_argument('--profile',choices=('reference','h200-throughput'),default='reference')
     a=ap.parse_args(); root=a.root
     def report(done,total,unit): event(phase=1,name=a.stage,done=done,total=total,unit=unit,initial=0)
     if a.stage in ('cohort','retrieval','restore','usable','export'):
@@ -206,6 +234,7 @@ def main():
             '--contract-version',VERSION+'_repair')
     else:
         m={'step2':step2,'step3':step3,'step4':step4,'step5':lambda r:step5(r,a.mode),'kg':step67}[a.stage](root)
+    if a.profile=='h200-throughput': throughput_profile(m,a.stage)
     if a.preflight_only:
         sys.argv.append('--prepare-only' if a.stage=='step2' else '--preflight-only')
     if a.reduce_batch_after_oom:
