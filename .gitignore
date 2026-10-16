@@ -263,3 +263,4 @@ venv/
 !/scripts/run_rag2_kg_attention_pilot.py
 !/scripts/run_rag2_kg_attention_pilot.sh
 !/tests/test_kg_structure_attention.py
+!/scripts/run_rag2_kg_attention_reporting_fix.py

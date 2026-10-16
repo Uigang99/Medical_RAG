@@ -7,4 +7,4 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
 export HF_HUB_DISABLE_PROGRESS_BARS=1
 export TRANSFORMERS_VERBOSITY=error
-exec /home/user/Uiheon/.venv_vllm/bin/python "$ROOT/scripts/run_rag2_kg_attention_pilot.py" "$@"
+exec /home/user/Uiheon/.venv_vllm/bin/python "$ROOT/scripts/run_rag2_kg_attention_reporting_fix.py" "$@"

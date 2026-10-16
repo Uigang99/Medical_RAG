@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import json
 from pathlib import Path
 
 import unittest
@@ -143,7 +144,7 @@ def test_no_links_exact_baseline_and_causal_future_safety():
 
 
 def test_summary_uses_same_512_definitions_on_small_fixture():
-    path = Path(__file__).resolve().parents[1] / "scripts/run_rag2_kg_attention_pilot.py"
+    path = Path(__file__).resolve().parents[1] / "scripts/run_rag2_kg_attention_reporting_fix.py"
     spec = importlib.util.spec_from_file_location("kg_attention_cli", path)
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     rows = [{"sample_id": str(i), "dataset": d, "answer": "A"}
@@ -155,6 +156,13 @@ def test_summary_uses_same_512_definitions_on_small_fixture():
     assert out["paired_comparisons"]["no_rag"]["delta_micro_pp"] == 100
     assert out["primary"]["transitions"]["C_C"] == 3
     assert not out["exploratory_gate"]["passed"]
+    assert type(out["exploratory_gate"]["passed"]) is bool
+    json.dumps(out, allow_nan=False)
+    # The old fixture exercised a short-circuit false result only. A positive
+    # delta evaluates the NumPy CI comparison and used to fail JSON encoding.
+    improved = module.summarize(rows, {"no_rag": bad, "text": bad, "graph_attention": good})
+    assert improved["exploratory_gate"]["passed"] is True
+    json.dumps(improved, allow_nan=False)
 
 
 def load_tests(loader, tests, pattern):
