@@ -269,3 +269,9 @@ venv/
 !/scripts/train_rag2_dynamic_kg_attention.py
 !/scripts/run_rag2_dynamic_kg_attention_training.sh
 !/tests/test_dynamic_kg_attention.py
+
+# Official Train10k frozen proposition/KG pipeline.
+!/scripts/build_rag2_train10000_kg.py
+!/scripts/run_rag2_train_kg_stage.py
+!/scripts/run_rag2_train10000_kg.sh
+!/tests/test_train_kg_data.py

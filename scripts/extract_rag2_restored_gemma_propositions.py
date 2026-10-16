@@ -167,6 +167,7 @@ def main():
     ap.add_argument('--max-model-len',type=int,default=16384,
                     help='Context capacity only; prompt and output budget remain frozen. Use a separate output directory if changed.')
     ap.add_argument('--preflight-only',action='store_true')
+    ap.add_argument('--source-scope',type=Path,help='Explicit non-Test cohort contract; generation method is unchanged')
     a=ap.parse_args()
     default=OUTPUT if a.top_k=='union' and a.batch_size==8 else ROOT/'datasets/kg'/f'rag2_test6545_restored_{"top8" if a.top_k=="8" else "union"}_gemma_faithful_v3_ctx16k_batch{a.batch_size}_v1'
     root=a.output_dir or default
@@ -179,6 +180,12 @@ def main():
         if not reduce_batch_after_oom(root):raise SystemExit(1)
         return
     expected_count=44911 if a.top_k=='8' else 88294
+    scope=None
+    if a.source_scope:
+        if a.top_k!='union':raise ValueError('Explicit source scope requires --top-k union')
+        scope=json.loads(a.source_scope.read_text())
+        expected_count=int(scope['documents'])
+        if expected_count<=0:raise ValueError('Empty source scope')
     seconds_per_doc={8:3.1,16:68.1655/64,32:47.0144/64}[a.batch_size]
     p=TwoLineProgress(['validate source/cache','tokenize input budgets','load Gemma31B','generate propositions','write outputs'])
     p.plan([f'{expected_count:,} fixed restored documents; scope={a.top_k}; source-review cases retained',
@@ -202,7 +209,15 @@ def main():
             download=json.loads((model/'download_manifest.json').read_text())
             if download['revision']!=config['checkpoint_revision']:raise RuntimeError('Wrong checkpoint revision')
             if shutil.disk_usage(root).free<10*1024**3:raise RuntimeError('Require at least 10 GiB free for outputs')
-            docs=load_source(a.input)
+            if scope is None:
+                docs=load_source(a.input)
+            else:
+                docs=list(rows(a.input))
+                if (len(docs)!=expected_count or len({d['stable_id'] for d in docs})!=expected_count
+                    or dict(Counter(d['source'] for d in docs))!=scope['by_source']
+                    or file_sha(a.input)!=scope['input_sha256']
+                    or any(not d.get('restored_text','').strip() for d in docs)):
+                    raise RuntimeError('Explicit source cohort identity/count/hash mismatch')
             membership=INPUT_ROOT/'question_chunk_membership.jsonl'
             if a.top_k=='8':docs=select_top8(docs,membership)
             contract=dict(version='restored_union88294_gemma_faithful_v3',input_path=str(a.input.resolve()),
@@ -221,6 +236,11 @@ def main():
                 contract.update(version='restored_top8_gemma_faithful_v3',membership_sha256=file_sha(membership),
                     retrieval='unchanged balanced 4corpus*8 -> rerank 8; exact existing Top-8 membership',
                     source_review_policy='retain all selected sources including warnings; no silent exclusion')
+            if scope is not None:
+                contract.update(version='official_train_top8_gemma_faithful_v3',
+                    source_scope=scope,source_scope_sha256=file_sha(a.source_scope),
+                    retrieval='official Train; cached balanced 4*8 -> rerank 8',
+                    source_review_policy='retain all selected source warnings; apply frozen usable policy after repair')
             if a.batch_size!=8:contract.update(effective_batch_size=a.batch_size,oom_policy='restart engine; split failed group down to 8; restore initial concurrency after group; immutable 8-document shards')
             ch=sha(json.dumps(contract,sort_keys=True))
             mf=root/'manifest.json'
