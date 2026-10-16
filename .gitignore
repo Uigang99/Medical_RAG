@@ -264,3 +264,8 @@ venv/
 !/scripts/run_rag2_kg_attention_pilot.sh
 !/tests/test_kg_structure_attention.py
 !/scripts/run_rag2_kg_attention_reporting_fix.py
+
+# Question-conditioned dynamic KG attention training (frozen Llama).
+!/scripts/train_rag2_dynamic_kg_attention.py
+!/scripts/run_rag2_dynamic_kg_attention_training.sh
+!/tests/test_dynamic_kg_attention.py
