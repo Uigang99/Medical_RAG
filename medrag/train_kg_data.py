@@ -175,8 +175,10 @@ def prepare_documents(root, event=lambda *a, **k: None):
             sid = r['sample_id']
             if sid not in questions:
                 continue
-            if sid in seen or r['question'] != questions[sid]['question'] or r['options'] != questions[sid]['options']:
-                raise RuntimeError(f'Cached retrieval question mismatch: {sid}')
+            if sid in seen:
+                raise RuntimeError(f'Duplicate cached retrieval sample_id: {sid}')
+            if not retrieval_question_matches(r, questions[sid]):
+                raise RuntimeError(f'Cached retrieval question/content mismatch: {sid}')
             seen.add(sid)
             docs = r['candidate_documents']
             if len(docs)!=8 or len({d['stable_id'] for d in docs})!=8 or r['initial_source_counts']!=dict.fromkeys(SOURCES,8):
@@ -205,6 +207,22 @@ def prepare_documents(root, event=lambda *a, **k: None):
     write_rows(root/'retrieval/documents.jsonl',sorted(documents.values(),key=lambda x:x['stable_id']))
     write_rows(root/'retrieval/question_document_membership.jsonl',sorted(mapping,key=lambda x:(x['sample_id'],x['rank'])))
     write_json(root/'retrieval/COMPLETE.json', {'contract_sha256':ch,'documents':len(documents),'questions':len(questions)})
+
+
+def retrieval_question_matches(cached, selected):
+    """Cache preprocessing collapses whitespace; retain all lexical content/order.
+
+    Do not use normalize_question here: it removes punctuation and case, which
+    would hide changes to clinical values and question/option meaning.
+    """
+    def text(value):
+        if not isinstance(value, str):
+            raise TypeError('Question and option values must be strings')
+        return ' '.join(value.split())
+    a,b=cached['options'],selected['options']
+    return (text(cached['question'])==text(selected['question']) and
+            isinstance(a,dict) and isinstance(b,dict) and a.keys()==b.keys() and
+            all(text(a[k])==text(b[k]) for k in a))
 
 
 def restore_documents(root, event=lambda *a, **k: None):

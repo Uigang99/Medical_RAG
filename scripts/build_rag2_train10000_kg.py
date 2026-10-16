@@ -182,6 +182,7 @@ def main():
         return
     args.output_root.mkdir(parents=True,exist_ok=True)
     lock=(args.output_root/'.workflow.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    resume_whitespace_fix(args.output_root,contract)
     args.contract_hash=data.freeze(args.output_root,contract)
     env=dict(os.environ,CUDA_VISIBLE_DEVICES='1',HF_HUB_OFFLINE='1',TOKENIZERS_PARALLELISM='false',
              VLLM_LOGGING_LEVEL='ERROR',VLLM_USE_FLASHINFER_SAMPLER='0',PYTHONUNBUFFERED='1')
@@ -201,6 +202,43 @@ def main():
         p.log(f'[FAILED] stage={p.index+1}/{len(names)} item={p.done}/{p.total}; {e}')
         raise
     finally: p.close()
+
+
+def resume_whitespace_fix(root,contract):
+    """One known pre-GPU failure only; never relax a generated-data contract."""
+    path=root/'manifest.json'
+    if not path.exists(): return
+    old=data.load(path)
+    if old['contract']==contract: return
+    known='5f4a8b6a385057859fde5bc2633a2ab672959f3253f83f8ff57bb32fbf9fcdb6'
+    if old.get('contract_sha256')!=known: return
+    if data.digest(old['contract'])!=known:
+        raise RuntimeError('Original workflow contract hash is invalid')
+    if any((root/s).exists() for s in ('retrieval','restored','propositions','repair','usable','step2','step3','step4','step5','kg')):
+        raise RuntimeError('Whitespace migration permitted only before retrieval artifacts/GPU work')
+    if {p.name for p in (root/'workflow').glob('*.json')}!={'cohort.json'}:
+        raise RuntimeError('Whitespace migration requires only the completed cohort stage')
+    before=json.loads(json.dumps(old['contract']))
+    after=json.loads(json.dumps(contract))
+    for value in (before,after):
+        value.pop('git_commit',None)
+        for f in ('medrag/train_kg_data.py','scripts/build_rag2_train10000_kg.py'):
+            value['code'].pop(f)
+    if before!=after:
+        raise RuntimeError('Inputs/settings changed beyond whitespace fix; cannot migrate')
+    archive=root/'manifest.before_whitespace_fix.json'
+    if archive.exists() and data.load(archive)!=old:
+        raise RuntimeError('Whitespace migration archive differs')
+    data.write_json(archive,old)
+    marker_path=root/'workflow/cohort.json';marker=data.load(marker_path)
+    new_hash=data.digest(contract)
+    if marker['workflow_contract_sha256'] not in (known,new_hash):
+        raise RuntimeError('Unexpected cohort completion contract')
+    marker['workflow_contract_sha256']=new_hash
+    marker['previous_workflow_contract_sha256']=known
+    data.write_json(marker_path,marker)
+    data.write_json(path,{'contract':contract,'contract_sha256':new_hash})
+    print('[resume fix] Whitespace-only comparison; original manifest archived; existing cohort preserved; no GPU artifacts changed.',flush=True)
 
 
 if __name__=='__main__':main()

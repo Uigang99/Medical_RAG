@@ -14,6 +14,14 @@ import run_rag2_train_kg_stage as adapter
 
 
 class TrainDataTests(unittest.TestCase):
+    def test_retrieval_whitespace_only_equivalence(self):
+        a={'question':'Dose is 1.5 mg.  Which drug?', 'options':{'A':'Drug  A','B':'Drug B'}}
+        b={'question':' Dose is 1.5 mg.\nWhich drug? ', 'options':{'A':'Drug A','B':'Drug B'}}
+        self.assertTrue(d.retrieval_question_matches(a,b))
+        for question in ('Dose is 15 mg. Which drug?','Dose is not 1.5 mg. Which drug?', 'Dose is 1.5 mg? Which drug?'):
+            self.assertFalse(d.retrieval_question_matches(a,dict(b,question=question)))
+        self.assertFalse(d.retrieval_question_matches(a,dict(b,options={'A':'Drug B','B':'Drug A'})))
+
     def test_throughput_profile_and_oom_recovery(self):
         m=importlib.import_module('extract_rag2_stage2_relation_discovery_full')
         old=m.BATCH_CHOICES
