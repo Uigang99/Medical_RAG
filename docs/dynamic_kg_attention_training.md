@@ -97,3 +97,31 @@ GPU 1 only. The default is two sequential arms, not parallel GPU jobs. There is
 no defensible new wall-clock forecast before calibration; static-training time
 is not reused as if throughput were identical. Frozen model activations, not
 controller parameter storage, dominate training memory and computation.
+
+## Evaluation after training
+
+```bash
+bash /home/user/Uiheon/Medical_RAG/scripts/run_rag2_dynamic_kg_attention_evaluation.sh
+```
+
+This does not train or select checkpoints. It requires completed full training
+and loads each arm's `full/best.pt`, selected using the 256 validation questions.
+The same 512 development questions, evidence, medical LoRA, answer-only greedy
+decoding (16 output tokens), parser and Macro-3/Micro definitions are reused.
+
+No-RAG, TEXT and static attention predictions are reused; only dynamic `local`
+and `graph` predictions are generated. Zero-bias token parity against cached TEXT
+must pass before each new condition. GPU 1, batch 16, OOM batch halving with
+restoration on the next shard. No accuracy threshold is tuned on these questions.
+
+Output: `results/rag2_dynamic_kg_attention_evaluation_v1/summary.json`,
+`summary_table.json`, and `paired_predictions.jsonl`. Reports include five
+conditions, paired C->W/W->C transitions and bootstrap confidence intervals;
+`graph_vs_local` is the neighbor-propagation comparison. This remains a reused
+development cohort, not an untouched benchmark test.
+
+`--prepare-only` checks inputs on CPU even before training completes.
+`--preflight-only` additionally requires valid selected checkpoints. Neither
+loads model weights on the GPU or generates answers. Rerunning the ordinary
+command resumes durable prediction shards and shared evaluation feature caches.
+New evaluation throughput is calibrated, not extrapolated from training time.

@@ -275,3 +275,8 @@ venv/
 !/scripts/run_rag2_train_kg_stage.py
 !/scripts/run_rag2_train10000_kg.sh
 !/tests/test_train_kg_data.py
+
+# Fixed 512-question evaluation of selected dynamic attention controllers.
+!/scripts/evaluate_rag2_dynamic_kg_attention.py
+!/scripts/run_rag2_dynamic_kg_attention_evaluation.sh
+!/tests/test_dynamic_kg_evaluation.py
