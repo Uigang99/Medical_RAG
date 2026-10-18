@@ -585,7 +585,9 @@ def runtime_checks(a, llm, rows, pad_id):
         if any(p.grad is not None for p in llm.parameters()): raise RuntimeError("Frozen target accumulated gradients")
         del ce, reg, out
     # Test leakage with nonzero output parameters; zero initialization alone is vacuous.
-    with torch.no_grad():
+    # This check is outside the MATH-only parity/gradient scope above. Keep the
+    # same non-cuDNN backend policy as training and validation here as well.
+    with torch.no_grad(), training_attention_backend():
         torch.manual_seed(a.seed+991)
         wrapper.controller.output.weight.normal_(0, .01)
         wrapper.controller.output.bias.fill_(.01)

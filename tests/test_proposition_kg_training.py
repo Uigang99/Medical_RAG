@@ -44,6 +44,30 @@ class TrainingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls): torch.set_num_threads(1)
 
+    def test_all_safety_forwards_exclude_cudnn_and_restore_backend(self):
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        wrapper = fixture(True)
+        args = SimpleNamespace(seed=42, bias_penalty=.001)
+        original = torch.nn.functional.scaled_dot_product_attention
+        calls = []
+
+        def checked_attention(*args, **kwargs):
+            self.assertFalse(torch.backends.cuda.cudnn_sdp_enabled(),
+                             "Safety forward escaped the non-cuDNN backend context")
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        # Backend flags are inspectable on CPU: reproduce the escaped context
+        # even without a CUDA device or a cuDNN execution plan.
+        with sdpa_kernel([SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]):
+            with patch.object(runner, "make_wrapper", return_value=wrapper), \
+                 patch.object(torch.nn.functional, "scaled_dot_product_attention", side_effect=checked_attention):
+                report = runner.runtime_checks(args, wrapper.llm, rows(), 0)
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+        self.assertGreater(len(calls), 0)
+        self.assertGreater(report["controller_gradient_l1"], 0.)
+        self.assertTrue(report["answer_suffix_and_gold_do_not_change_bias"])
+
     def test_choice_loss_gold_is_not_prompt_and_backpropagates(self):
         wrapper = fixture(True)
         data = rows()[:2]
