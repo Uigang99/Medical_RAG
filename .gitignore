@@ -280,3 +280,10 @@ venv/
 !/scripts/evaluate_rag2_dynamic_kg_attention.py
 !/scripts/run_rag2_dynamic_kg_attention_evaluation.sh
 !/tests/test_dynamic_kg_evaluation.py
+
+# Official Train9k proposition-pair attention, pristine frozen Llama.
+!/scripts/train_rag2_proposition_kg_attention.py
+!/scripts/run_rag2_proposition_kg_attention_training.sh
+!/tests/test_proposition_kg_attention.py
+!/tests/test_proposition_kg_attention_data.py
+!/tests/test_proposition_kg_training.py
