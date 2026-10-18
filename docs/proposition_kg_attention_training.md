@@ -60,6 +60,13 @@ The initial TEXT validation uses exactly zero correction with the same block
 attention backend. Its accuracy is the uncorrected baseline, but its runtime
 includes controller/block overhead and is not ordinary TEXT-RAG latency.
 
+Safety checks compare the manual decoder against the native Llama decoder loop
+with independently constructed zero masks and the same chunk schedule. Native
+unchunked BF16 hidden/probability differences are recorded separately; native
+answer parity must still pass. This separates implementation parity from
+shape-dependent kernel rounding without loosening the existing tolerances or
+bypassing controller gradients. GPU parity must be checked on the running GPU.
+
 The default runs all three trainable arms sequentially on GPU1. Each arm is
 27,000 training example passes and 3,000 validation passes at max3epochs;
 the initial 1,000-question TEXT validation is shared. No claim of improvement
@@ -118,6 +125,12 @@ bash /home/user/Uiheon/Medical_RAG/scripts/run_rag2_proposition_kg_attention_tra
 ```
 
 `--prepare-only` builds the complete CPU input cache without model loading.
+After a trainer/attention-core numerical fix, a new output root may read an old
+root's prepared cache with `--reuse-prepared-from <old-output-root>`. The donor
+manifest and rows hashes are checked; data-building code, inputs and all
+non-code settings must match. Only trainer/core code hashes may differ. No old
+training checkpoint is reused, and donor files are never rewritten. Keep this
+flag on subsequent resumes of that new root.
 Default output: `results/rag2_official_train_proposition_attention_v1/`.
 `manifest.json`, `prepared/COMPLETE.json`, `SAFETY.json`, `TEXT_validation.jsonl`,
 `{arm}/last.pt`, `{arm}/best.pt`, `{arm}/history.json`, per-epoch validation

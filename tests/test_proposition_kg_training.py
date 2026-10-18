@@ -97,6 +97,83 @@ class TrainingTests(unittest.TestCase):
         inputs["source_disk_free_bytes"] = 50
         self.assertEqual(first, runner.contract_for(a, inputs))
 
+    def test_prepared_reuse_is_read_only_and_keeps_exact_split_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a = runner.arguments(["--output-root", str(root / "new"),
+                                  "--reuse-prepared-from", str(root / "old")])
+            old = runner.contract_for(a, {"source": "fixed"})
+            current = copy.deepcopy(old)
+            current["code"]["scripts/train_rag2_proposition_kg_attention.py"] = "updated-trainer"
+            current["code"]["medrag/generation/proposition_kg_attention.py"] = "updated-runtime"
+            data = [{"split": "train"}] * 9000 + [{"split": "validation"}] * 1000
+            donor = a.reuse_prepared_from
+            runner.atomic_json(donor / "manifest.json", {"contract": old, "contract_sha256": runner.digest(old)})
+            rows_path = donor / "prepared/rows.jsonl"
+            runner.atomic_jsonl(rows_path, data)
+            runner.atomic_json(donor / "prepared/COMPLETE.json", {
+                "contract_sha256": runner.digest(old), "rows_sha256": runner.sha_file(rows_path)})
+            before = {path: path.read_bytes() for path in donor.rglob("*") if path.is_file()}
+            selected = runner.prepared_cache_source(a, current)
+            self.assertEqual(selected, rows_path)
+            tokenizer = object()
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer), \
+                    patch.object(runner, "build_rows", side_effect=AssertionError("must reuse cache")):
+                result, loaded = runner.prepare(a, Progress(), runner.digest(current), selected)
+                self.assertEqual(result, data)
+                self.assertIs(loaded, tokenizer)
+                with patch.object(runner, "jsonl", return_value=iter(data[:-1])):
+                    with self.assertRaisesRegex(RuntimeError, "exact official train9000/val1000"):
+                        runner.prepare(a, Progress(), runner.digest(current), selected)
+            self.assertFalse(a.output_root.exists())
+            self.assertEqual(before, {path: path.read_bytes() for path in donor.rglob("*") if path.is_file()})
+
+    def test_prepared_reuse_rejects_contract_and_integrity_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a = runner.arguments(["--output-root", str(root / "new"),
+                                  "--reuse-prepared-from", str(root / "old")])
+            contract = runner.contract_for(a, {"source": "fixed"})
+            donor = a.reuse_prepared_from
+            manifest = {"contract": contract, "contract_sha256": runner.digest(contract)}
+            runner.atomic_json(donor / "manifest.json", manifest)
+            rows_path = donor / "prepared/rows.jsonl"
+            runner.atomic_jsonl(rows_path, rows())
+            meta = {"contract_sha256": runner.digest(contract), "rows_sha256": runner.sha_file(rows_path)}
+            complete = donor / "prepared/COMPLETE.json"
+            runner.atomic_json(complete, meta)
+            for field in ("inputs", "model", "environment", "training"):
+                current = copy.deepcopy(contract)
+                current[field] = {"changed": True}
+                with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "donor contract mismatch"):
+                    runner.prepared_cache_source(a, current)
+            for name in set(runner.CODE) - {"scripts/train_rag2_proposition_kg_attention.py",
+                                             "medrag/generation/proposition_kg_attention.py"}:
+                current = copy.deepcopy(contract)
+                current["code"][name] = "changed"
+                with self.subTest(code=name), self.assertRaisesRegex(RuntimeError, "donor contract mismatch"):
+                    runner.prepared_cache_source(a, current)
+            runner.atomic_json(donor / "manifest.json", dict(manifest, contract_sha256="bad"))
+            with self.assertRaisesRegex(RuntimeError, "manifest digest mismatch"):
+                runner.prepared_cache_source(a, contract)
+            runner.atomic_json(donor / "manifest.json", manifest)
+            for field in ("contract_sha256", "rows_sha256"):
+                runner.atomic_json(complete, dict(meta, **{field: "bad"}))
+                with self.subTest(integrity=field), self.assertRaisesRegex(RuntimeError, "cache mismatch"):
+                    runner.prepared_cache_source(a, contract)
+
+    def test_prepared_destination_cache_takes_priority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a = runner.arguments(["--output-root", str(root / "new"),
+                                  "--reuse-prepared-from", str(root / "missing-donor")])
+            contract = runner.contract_for(a, {"source": "fixed"})
+            rows_path = a.output_root / "prepared/rows.jsonl"
+            runner.atomic_jsonl(rows_path, rows())
+            runner.atomic_json(a.output_root / "prepared/COMPLETE.json", {
+                "contract_sha256": runner.digest(contract), "rows_sha256": runner.sha_file(rows_path)})
+            self.assertEqual(runner.prepared_cache_source(a, contract), rows_path)
+
     def test_full_epoch_resume_after_train_before_validation(self):
         target = fixture().llm
         data = rows()

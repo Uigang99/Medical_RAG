@@ -137,7 +137,7 @@ def block_bias(context: _AttentionContext, start: int, stop: int, dtype: torch.d
 
 
 def proposition_attention(module, query, key, value, attention_mask, scaling,
-                          dropout=0., proposition_context=None, **kwargs):
+                          dropout=0., proposition_context=None, zero_reference_contexts=None, **kwargs):
     """Standard SDPA outside controlled layers; exact block-bias attention inside.
 
     PyTorch's fused SDPA backends do not currently provide additive-mask
@@ -146,7 +146,8 @@ def proposition_attention(module, query, key, value, attention_mask, scaling,
     """
     if dropout:
         raise RuntimeError("Frozen target attention dropout must be zero")
-    context = proposition_context
+    context = (zero_reference_contexts[module.layer_idx]
+               if zero_reference_contexts is not None else proposition_context)
     gqa = query.shape[1] != key.shape[1]
     if context is None:
         # Also supports raw zero-bias baseline calls on the attached Llama.
@@ -240,6 +241,34 @@ class PropositionAttentionModel(nn.Module):
         a, b = map(int, span)
         part = states[a:b].float()
         return torch.cat((part.mean(0), part[-1]), -1)
+
+    @torch.no_grad()
+    def zero_bias_reference(self, row: dict[str, Any]) -> torch.Tensor:
+        """Native Llama decoder loop with independently built zero-bias masks.
+
+        Match the production chunk/mask schedule, not the controller output.
+        BF16 full-query and chunk-query kernels need not be bitwise identical.
+        The caller separately checks native unchunked answer parity. This path
+        never invokes the controller or the wrapper's manual decoder loop.
+        """
+        validate_layout(row)
+        device = self.llm.model.embed_tokens.weight.device
+        ids = torch.tensor([row["input_ids"]], device=device)
+        n = len(row["input_ids"])
+        spans = row["proposition_spans"]
+        token_ids = torch.full((n,), len(spans), device=device, dtype=torch.long)
+        for i, (start, stop) in enumerate(spans):
+            token_ids[start:stop] = i
+        lengths = torch.tensor([n], device=device)
+        plain = _AttentionContext(lengths, (token_ids,), None, self.query_chunk)
+        readers = (tuple(tuple(spans[i]) for i in sorted({p[0] for p in row["pairs"]})),)
+        zero = _AttentionContext(lengths, (token_ids,),
+                                 (torch.zeros((len(spans)+1, len(spans)+1), device=device),),
+                                 self.query_chunk, readers)
+        contexts = {i: zero if i in self.attention_layers else plain
+                    for i in range(len(self.llm.model.layers))}
+        return self.llm.model(input_ids=ids, use_cache=False,
+                              zero_reference_contexts=contexts).last_hidden_state[:, -1]
 
     def forward(self, rows: list[dict[str, Any]], pad_id: int) -> PropositionAttentionOutput:
         if not rows:

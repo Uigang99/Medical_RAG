@@ -1,6 +1,7 @@
 """Bounded CPU regression tests; no local checkpoint or GPU required."""
 import copy
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.nn import functional as F
@@ -75,6 +76,20 @@ class PropositionAttentionTests(unittest.TestCase):
         score(wrapper, [row_fixture()]).backward()
         self.assertGreater(wrapper.controller.proposition_projection[0].weight.grad.abs().sum().item(), 0.)
         self.assertGreater(wrapper.controller.messages[0][0].weight.grad.abs().sum().item(), 0.)
+
+    def test_bf16_reference_uses_native_loop_without_controller(self):
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        wrapper = fixture()
+        wrapper.llm.to(torch.bfloat16)
+        row = row_fixture()
+        with sdpa_kernel(SDPBackend.MATH), torch.no_grad():
+            expected = wrapper([row], 0).last_hidden
+            with patch.object(wrapper.controller, "forward", side_effect=AssertionError("reference called controller")):
+                reference = wrapper.zero_bias_reference(row)
+            torch.testing.assert_close(reference, expected, atol=0, rtol=0)
+            # A nonzero controller must NOT leak into the independent reference.
+            wrapper.controller.output.bias.fill_(.7)
+            torch.testing.assert_close(wrapper.zero_bias_reference(row), reference, atol=0, rtol=0)
 
     def test_checkpoint_gradient_and_immutable_context(self):
         plain, checked = fixture(False), fixture(True)

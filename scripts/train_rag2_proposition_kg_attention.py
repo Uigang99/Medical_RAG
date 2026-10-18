@@ -50,6 +50,8 @@ def arguments(argv=None):
     p.add_argument("--data-root", type=Path, default=ROOT / "datasets/kg/rag2_official_train10000_top8_h200_throughput_v2")
     p.add_argument("--model", type=Path, default=ROOT.parent / "models/Llama-3-8B-Instruct")
     p.add_argument("--output-root", type=Path, default=ROOT / "results/rag2_official_train_proposition_attention_v1")
+    p.add_argument("--reuse-prepared-from", type=Path,
+                   help="Read a compatible prior output root's prepared cache without modifying it")
     p.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--learning-rate", type=float, default=3e-4)
@@ -135,6 +137,39 @@ def ensure_manifest(path, contract, *, create=False):
                                "requested_cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
         atomic_json(path, value)
     return value["contract_sha256"]
+
+
+def prepared_cache_source(a, contract):
+    """Validate cached rows before tokenizer/model loading; never rewrite donors."""
+    root, expected_hash = a.output_root, digest(contract)
+    complete = root / "prepared/COMPLETE.json"
+    if not complete.exists():
+        if a.reuse_prepared_from is None:
+            return None
+        root = a.reuse_prepared_from
+        prior = json.loads((root / "manifest.json").read_text())
+        old = prior.get("contract")
+        if not isinstance(old, dict) or prior.get("contract_sha256") != digest(old):
+            raise RuntimeError("Prepared donor manifest digest mismatch; preserve old outputs")
+        changed = sorted(k for k in old.keys() | contract.keys()
+                         if k != "code" and (k not in old or k not in contract or old[k] != contract[k]))
+        allowed = {"scripts/train_rag2_proposition_kg_attention.py",
+                   "medrag/generation/proposition_kg_attention.py"}
+        old_code, new_code = old.get("code", {}), contract["code"]
+        if not isinstance(old_code, dict) or old_code.keys() != new_code.keys():
+            changed.append("code.files")
+        else:
+            changed.extend("code." + name for name in old_code
+                           if old_code[name] != new_code[name] and name not in allowed)
+        if changed:
+            raise RuntimeError(f"Prepared donor contract mismatch at {changed}; no cache reused")
+        expected_hash = prior["contract_sha256"]
+        complete = root / "prepared/COMPLETE.json"
+    meta = json.loads(complete.read_text())
+    rows_path = root / "prepared/rows.jsonl"
+    if meta.get("contract_sha256") != expected_hash or sha_file(rows_path) != meta.get("rows_sha256"):
+        raise RuntimeError("Prepared data cache mismatch; preserve old outputs")
+    return rows_path
 
 
 def save_torch(path, payload):
@@ -519,16 +554,30 @@ def runtime_checks(a, llm, rows, pad_id):
     with sdpa_kernel(SDPBackend.MATH):
         with torch.no_grad():
             max_difference = 0.
+            native_max_difference = 0.
+            native_max_probability_difference = 0.
             for row in sample:
                 ids = torch.tensor([row["input_ids"]], device=llm.device)
-                raw = llm.model(input_ids=ids, use_cache=False).last_hidden_state[:, -1]
+                native = llm.model(input_ids=ids, use_cache=False).last_hidden_state[:, -1]
+                raw = wrapper.zero_bias_reference(row)
                 result = wrapper([row], pad_id=pad_id).last_hidden
                 diff = float((raw.float()-result.float()).abs().max())
                 max_difference = max(max_difference, diff)
+                native_max_difference = max(native_max_difference,
+                                             float((native.float()-result.float()).abs().max()))
                 torch.testing.assert_close(result, raw, atol=.03, rtol=.02)
                 w = llm.lm_head.weight[torch.tensor(row["choice_token_ids"], device=llm.device)]
-                if F.linear(raw, w).argmax().item() != F.linear(result, w).argmax().item():
+                reference_logits = F.linear(raw, w).float()
+                native_logits = F.linear(native, w).float()
+                logits = F.linear(result, w).float()
+                native_max_probability_difference = max(native_max_probability_difference,
+                    float((native_logits.softmax(-1)-logits.softmax(-1)).abs().max()))
+                if reference_logits.argmax().item() != logits.argmax().item():
                     raise RuntimeError("Zero-bias answer parity failed")
+                if native_logits.argmax().item() != logits.argmax().item():
+                    raise RuntimeError("Native-vs-chunked BF16 answer parity failed; "
+                                       f"sample={row['sample_id']}, native_logits={native_logits.tolist()}, "
+                                       f"chunked_logits={logits.tolist()}; no training started")
         ce, reg, _, out = choice_losses(wrapper, [sample[0]], pad_id)
         (ce + a.bias_penalty*reg).mean().backward()
         norm = sum(float(p.grad.abs().sum()) for p in wrapper.controller.parameters() if p.grad is not None)
@@ -550,23 +599,24 @@ def runtime_checks(a, llm, rows, pad_id):
         second = wrapper([changed], pad_id=pad_id).biases[0]
         torch.testing.assert_close(first, second, atol=1e-6, rtol=1e-5)
     report.update(zero_bias_max_hidden_difference=max_difference,
+                  parity_reference="native Llama decoder loop; independently built zero masks; matched chunk/backend schedule",
+                  native_bf16_max_hidden_difference=native_max_difference,
+                  native_bf16_max_choice_probability_difference=native_max_probability_difference,
+                  native_answer_parity=True,
                   controller_gradient_l1=norm, answer_suffix_and_gold_do_not_change_bias=True)
     del wrapper
     release_memory()
     return report
 
 
-def prepare(a, progress, run_hash):
+def prepare(a, progress, run_hash, cached_rows_path=None):
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(a.model, local_files_only=True, use_fast=True)
     rows_path = a.output_root / "prepared/rows.jsonl"
     complete = a.output_root / "prepared/COMPLETE.json"
-    if complete.exists():
-        meta = json.loads(complete.read_text())
-        if meta["contract_sha256"] != run_hash or sha_file(rows_path) != meta["rows_sha256"]:
-            raise RuntimeError("Prepared data cache mismatch; preserve old outputs")
+    if cached_rows_path is not None:
         progress.stage(1, 10000, initial=10000, unit="q")
-        rows = list(jsonl(rows_path)); progress.complete(f"cached {rows_path}")
+        rows = list(jsonl(cached_rows_path)); progress.complete(f"cached {cached_rows_path}")
     else:
         progress.stage(1, 10000, unit="q", kind="tokenization")
         phase = [None]
@@ -592,6 +642,7 @@ def main(argv=None):
     inputs = inspect_inputs(a.data_root, a.model)
     contract = contract_for(a, inputs)
     run_hash = ensure_manifest(a.output_root / "manifest.json", contract)
+    cached_rows_path = prepared_cache_source(a, contract)
     if a.preflight_only:
         print(json.dumps({"status": "metadata_preflight_ok", "data": inputs,
                           "arms_requested": a.arms, "contract_sha256": run_hash,
@@ -624,9 +675,10 @@ def main(argv=None):
     progress.weights[0] = 1.; progress.weights[-1] = 1.
     try:
         progress.stage(0, 1); progress.update(); progress.complete(f"contract={run_hash}; no old LoRA/test split")
-        rows, tokenizer = prepare(a, progress, run_hash)
+        rows, tokenizer = prepare(a, progress, run_hash, cached_rows_path)
         if a.prepare_only:
-            progress.stage(len(names)-1, 1); progress.update(); progress.complete(f"CPU cache ready: {a.output_root/'prepared'}")
+            prepared_root = cached_rows_path.parent if cached_rows_path is not None else a.output_root / "prepared"
+            progress.stage(len(names)-1, 1); progress.update(); progress.complete(f"CPU cache ready: {prepared_root}")
             progress.log("[complete] preparation only; no GPU load/training/evaluation")
             return
         progress.stage(2, 1, unit="model")
