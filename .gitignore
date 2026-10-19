@@ -287,3 +287,8 @@ venv/
 !/tests/test_proposition_kg_attention.py
 !/tests/test_proposition_kg_attention_data.py
 !/tests/test_proposition_kg_training.py
+
+# Bounded local pair-intervention supervision pilot, official train only.
+!/scripts/pilot_rag2_proposition_pair_effects.py
+!/scripts/run_rag2_proposition_pair_effects_pilot.sh
+!/tests/test_proposition_pair_effects.py
