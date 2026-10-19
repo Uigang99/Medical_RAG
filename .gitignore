@@ -275,6 +275,11 @@ venv/
 !/scripts/run_rag2_attention_oracle_pilot.sh
 !/tests/test_attention_oracle.py
 
+# Fixed-seed range/time continuation; saved source results remain immutable.
+!/scripts/pilot_rag2_attention_oracle_range.py
+!/scripts/run_rag2_attention_oracle_range_pilot.sh
+!/tests/test_attention_oracle_range.py
+
 # Official Train10k frozen proposition/KG pipeline.
 !/scripts/build_rag2_train10000_kg.py
 !/scripts/run_rag2_train_kg_stage.py
