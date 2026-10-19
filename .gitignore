@@ -292,3 +292,8 @@ venv/
 !/scripts/pilot_rag2_proposition_pair_effects.py
 !/scripts/run_rag2_proposition_pair_effects_pilot.sh
 !/tests/test_proposition_pair_effects.py
+
+# Controlled attention intervention diagnosis: dose, layer, order, learning and joint application.
+!/scripts/pilot_rag2_attention_identifiability.py
+!/scripts/run_rag2_attention_identifiability_pilot.sh
+!/tests/test_attention_intervention_diagnostic.py
