@@ -1,12 +1,15 @@
 import unittest
 from pathlib import Path
 import tempfile
+import copy
 
 import torch
 
 from medrag.generation.pair_memory_attention import (
     PairMemoryBridge, FrozenLlamaMemory, apply_messages, answer_loss)
-from scripts.pilot_rag2_pair_memory_oracle import stats, better, Store, oracle
+from scripts.pilot_rag2_pair_memory_oracle import (stats, better, Store, oracle,
+    baseline_audit, ensure_resume_contract, RUNNER, INITIAL_RUNNER_SHA256)
+from medrag.training.graph_input_data import ensure_contract
 
 
 class PairMemoryTests(unittest.TestCase):
@@ -80,6 +83,36 @@ class PairMemoryTests(unittest.TestCase):
             store.save(store.path("oracle_kg", row, "json"), {"best": {"correct": True}})
             result = oracle(None, store, None, None, row, None, "kg", Progress())
             self.assertTrue(result["best"]["correct"])
+
+    def test_baseline_audit_records_near_tie_without_changing_current_baseline(self):
+        original = {"sample_id": "x", "base": {"gold": 1, "prediction": 1,
+                    "correct": True, "margin": .02, "logits": [0., .02, -.1, -.2]}}
+        current = {"sample_id": "x", "dataset": "medqa", "base": {"gold": 1,
+                   "prediction": 0, "correct": False, "margin": -.01,
+                   "logits": [0., -.01, -.1, -.2]}}
+        audit = baseline_audit([current], {"x": original})
+        self.assertEqual(audit["changed_predictions"], 1)
+        self.assertEqual((audit["old_correct"], audit["native_correct"]), (1, 0))
+        self.assertEqual(audit["differences"][0]["sample_id"], "x")
+
+    def test_only_original_runner_hash_migrates_cached_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            old = {"code": {RUNNER: INITIAL_RUNNER_SHA256, "other": "fixed"}, "dataset": "fixed"}
+            h = ensure_contract(path, old)
+            patched = copy.deepcopy(old)
+            patched["code"][RUNNER] = "reviewed-patch"
+            self.assertEqual(ensure_resume_contract(path, patched), h)
+            self.assertTrue(path.with_name("BASELINE_AUDIT_PATCH.json").exists())
+            self.assertEqual(ensure_resume_contract(path, patched), h)
+            future = copy.deepcopy(patched)
+            future["code"][RUNNER] = "unreviewed-future-patch"
+            with self.assertRaises(RuntimeError):
+                ensure_resume_contract(path, future)
+            changed_data = copy.deepcopy(patched)
+            changed_data["dataset"] = "different"
+            with self.assertRaises(RuntimeError):
+                ensure_resume_contract(path, changed_data)
 
 
 if __name__ == "__main__":

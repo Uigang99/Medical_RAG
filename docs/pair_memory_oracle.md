@@ -41,6 +41,10 @@ not be a valid test of selecting evidence contributions.
 - Fixed diagnostic: previously studied official TRAIN128, 90 MedMCQA + 38 MedQA,
   originally 96 correct / 32 wrong, four graphless. It is exploratory, not fresh
   held-out evidence, and is not the final 6545-question test.
+- The older TRAIN128 predictions used a chunked attention intervention wrapper.
+  This pilot uses native Llama attention for every current arm. `BASELINE_AUDIT.json`
+  records any per-question differences; the current native no-op is the paired
+  reference for fixed bridge and Oracle results.
 - Bridge training: 256 other official-training questions (179/77).
 - Bridge selection: 64 official-validation questions (45/19).
 - Exact normalized question duplicates are excluded across cohorts. This does

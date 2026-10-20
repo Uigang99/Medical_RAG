@@ -28,6 +28,34 @@ CODE = ["scripts/pilot_rag2_pair_memory_oracle.py", "scripts/run_rag2_pair_memor
         "medrag/generation/pair_memory_attention.py", "medrag/training/pair_memory_oracle_data.py",
         "medrag/training/graph_input_progress.py", "medrag/training/graph_input_modules.py",
         "medrag/training/proposition_kg_attention_data.py", "medrag/training/graph_input_data.py"]
+RUNNER = "scripts/pilot_rag2_pair_memory_oracle.py"
+INITIAL_RUNNER_SHA256 = "7058af1f47840241af30efd021135add55384f5a5e14f79ecddf30728d0a38df"
+
+
+def ensure_resume_contract(path, contract):
+    """Pin a reporting-only patch while retaining existing numerical caches."""
+    if not path.exists():
+        return ensure_contract(path, contract)
+    previous = json.loads(path.read_text())
+    if digest(previous.get("contract")) != previous.get("contract_sha256"):
+        raise RuntimeError("Existing run manifest is corrupt")
+    if previous["contract"] == contract:
+        return previous["contract_sha256"]
+    previous_code = previous["contract"].get("code", {})
+    expected = dict(contract, code=dict(contract["code"], **{RUNNER: INITIAL_RUNNER_SHA256}))
+    if previous_code.get(RUNNER) != INITIAL_RUNNER_SHA256 or previous["contract"] != expected:
+        raise RuntimeError("Scientific/cache contract changed; use a new output directory")
+    amendment_path = path.with_name("BASELINE_AUDIT_PATCH.json")
+    amendment = {"cache_contract_sha256": previous["contract_sha256"],
+                 "original_runner_sha256": INITIAL_RUNNER_SHA256,
+                 "patched_runner_sha256": contract["code"][RUNNER],
+                 "scope": "Compare the previous diagnostic baseline with the native no-op; record discrepancies and resume the unchanged bridge, prompts, KG and oracle search"}
+    if amendment_path.exists():
+        if json.loads(amendment_path.read_text()) != amendment:
+            raise RuntimeError("Resume patch changed; use a new output directory")
+    else:
+        atomic_json(amendment_path, amendment)
+    return previous["contract_sha256"]
 
 
 def arguments(argv=None):
@@ -105,6 +133,37 @@ def stats(records, baseline=None):
                    wrong_to_correct=sum(not b["correct"] and r["correct"] for b, r in zip(baseline, records)),
                    correct_to_wrong=sum(b["correct"] and not r["correct"] for b, r in zip(baseline, records)))
     return out
+
+
+def baseline_audit(diagnosis, prior):
+    """Record the previous intervention-backend baseline versus native Llama."""
+    if len(diagnosis) != len(prior) or len({r["sample_id"] for r in diagnosis}) != len(diagnosis):
+        raise RuntimeError("Baseline cohort identity/count changed")
+    differences = []
+    max_logit_delta = 0.
+    for row in diagnosis:
+        old = prior[row["sample_id"]]["base"]
+        new = row["base"]
+        if old["gold"] != new["gold"]:
+            raise RuntimeError(f"Gold label changed: {row['sample_id']}")
+        if any(r["correct"] != (r["prediction"] == r["gold"]) for r in (old, new)):
+            raise RuntimeError(f"Invalid baseline score: {row['sample_id']}")
+        delta = max(abs(x-y) for x, y in zip(old["logits"], new["logits"]))
+        max_logit_delta = max(max_logit_delta, delta)
+        if old["prediction"] != new["prediction"]:
+            differences.append({"sample_id": row["sample_id"], "dataset": row["dataset"],
+                "old_prediction": old["prediction"], "native_prediction": new["prediction"],
+                "old_correct": old["correct"], "native_correct": new["correct"],
+                "old_margin": old["margin"], "native_margin": new["margin"],
+                "max_logit_delta": delta})
+    old_correct = sum(prior[r["sample_id"]]["base"]["correct"] for r in diagnosis)
+    native_correct = sum(r["base"]["correct"] for r in diagnosis)
+    return {"n": len(diagnosis), "old_correct": old_correct, "native_correct": native_correct,
+            "changed_predictions": len(differences), "differences": differences,
+            "max_abs_logit_delta": max_logit_delta,
+            "old_backend": "prior intervention wrapper, zero bias and chunked attention",
+            "current_backend": "native Llama SDPA, identical prompt/weights; all experimental arms use this backend",
+            "baseline_policy": "Use current native no-op for every current experimental comparison; retain old scores as an audit only"}
 
 
 def encode_memory(a, store, specs, rows, progress):
@@ -386,7 +445,7 @@ def oracle(a, store, wrapper, bridge, row, baseline, mode, progress):
     return value
 
 
-def report(rows, diagnosis, oracles, selected_epoch, selection, runtime, seed=314159):
+def report(rows, diagnosis, oracles, selected_epoch, selection, runtime, baseline_comparison, seed=314159):
     base = [r["base"] for r in diagnosis]
     conditions = {"text_only": stats(base)}
     conditions["random_kg_gates"] = stats([r["random_kg"] for r in diagnosis], base)
@@ -409,12 +468,14 @@ def report(rows, diagnosis, oracles, selected_epoch, selection, runtime, seed=31
                                **variants(row, seed)["rewired"]["shuffle_statistics"]) for row in rows],
               "kg_delta_pp_bootstrap_95": [float(x) for x in torch.quantile(samples, torch.tensor([.025, .975]))],
               "selected_epoch": selected_epoch, "bridge_selection": selection, "runtime": runtime,
+              "baseline_comparison": baseline_comparison,
               "interpretation": [
                   "Gold no-op eliminates harms by construction; deployable accuracy is NOT measured.",
                   "This is finite-search achievable headroom conditional on a separately trained/frozen bridge, NOT a global upper bound.",
                   "Failure cannot distinguish insufficient bridge alignment from absence of architectural headroom.",
                   "Previously studied TRAIN128 is exploratory; no benchmark TEST and no new generalization claim.",
                   "Pair residual multipliers are [0,2], jointly optimized; native self-attention remains untouched.",
+                  "The earlier wrapper baseline may differ at near-ties; this run compares every arm with its own native no-op.",
                   "Rewired control has same text and ordered degrees; unchanged rewires weaken structural attribution.",
                   "Forced MCQ next-label scoring, not rationale generation or open-ended QA."]}
     result["by_dataset"] = {}
@@ -469,7 +530,7 @@ def main():
                          "rewired_exposure": "alternate by question/epoch; both modes across default two epochs"},
             "success": {"recoveries_over_same_text": 8, "recoveries_advantage_over_rewired": 4},
             "hypothesis": "Additional question/pair-conditioned token memory offers larger controllable headroom than native attention-logit bias"}
-        h = ensure_contract(a.output_root / "manifest.json", contract)
+        h = ensure_resume_contract(a.output_root / "manifest.json", contract)
         store = Store(a.output_root, h)
         if not (a.output_root / "PROVENANCE.json").exists():
             atomic_json(a.output_root / "PROVENANCE.json", {
@@ -581,9 +642,10 @@ def main():
         else:
             diagnosis = validation(store, wrapper, bridge, groups["diagnosis"], p, random_control=True)
             store.save(dp, diagnosis)
-        if any(r["base"]["prediction"] != prior[r["sample_id"]]["base"]["prediction"] for r in diagnosis):
-            raise RuntimeError("Recomputed text-only baseline predictions differ from fixed original TRAIN128")
-        p.complete(f"Text baseline={stats([r['base'] for r in diagnosis])}; fixed bridge effects recorded BEFORE oracle")
+        audit = baseline_audit(diagnosis, prior)
+        atomic_json(a.output_root / "BASELINE_AUDIT.json", {"contract_sha256": h, **audit})
+        p.complete(f"Native text baseline={audit['native_correct']}/128; prior wrapper={audit['old_correct']}/128; "
+                   f"changed predictions={audit['changed_predictions']}; BASELINE_AUDIT.json")
         oracles = {}
         for j, mode in enumerate(("kg", "rewired")):
             cached = sum(store.path("oracle_" + mode, row, "json").exists() for row in groups["diagnosis"])
@@ -592,7 +654,7 @@ def main():
                              for row, record in zip(groups["diagnosis"], diagnosis)]
             p.complete(f"{mode}: bounded JOINT directed gates complete; gold fallback retains original correct cases")
         p.stage(end+3, 1)
-        result = report(groups["diagnosis"], diagnosis, oracles, best_epoch, selection, runtime, a.seed)
+        result = report(groups["diagnosis"], diagnosis, oracles, best_epoch, selection, runtime, audit, a.seed)
         result["contract_sha256"] = h
         atomic_jsonl(a.output_root / "per_question.jsonl", result.pop("per_question"))
         atomic_json(a.output_root / "SUMMARY.json", result)
