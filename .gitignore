@@ -45,6 +45,8 @@ venv/
 # reproducible pipeline.
 /configs/
 /scripts/*
+!/scripts/pilot_rag2_pair_memory_oracle.py
+!/scripts/run_rag2_pair_memory_oracle.sh
 !/scripts/analyze_rag2_hidden_score_gold_margin.py
 !/scripts/analyze_rag2_hidden_vs_terra_semantic.py
 !/scripts/analyze_rag2_label_threshold_policies.py
@@ -174,6 +176,7 @@ venv/
 !/medrag/kg/biomedical_mvp.py
 
 /tests/*
+!/tests/test_pair_memory_oracle.py
 !/tests/test_rag2_hidden_score_gold_margin.py
 !/tests/test_rag2_codex_labeling_resilience.py
 !/tests/test_rag2_incremental_semantic_labels.py
