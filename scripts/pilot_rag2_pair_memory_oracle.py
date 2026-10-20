@@ -313,7 +313,6 @@ def oracle(a, store, wrapper, bridge, row, baseline, mode, progress):
     path = store.path("oracle_" + mode, row, "json")
     if path.exists():
         value = store.load(path)
-        progress.update()
         return value
     # Accuracy-ceiling diagnosis: true correct examples keep the gold no-op.
     # This artificially guarantees no harm and is NOT an inference policy.
@@ -433,7 +432,9 @@ def main():
     names = ["CPU exact cohorts/pairs", "encode MedCPT memories", "load frozen Llama",
              "zero/gradient safety", "tiny8 alignment fit", "tiny8 fit check"]
     for epoch in range(1, a.epochs + 1):
-        names += [f"bridge epoch{epoch} train", f"bridge epoch{epoch} validation"]
+        # Progress propagates compatible rates by the prefix before " epoch".
+        # Train and validation must therefore have different prefixes.
+        names += [f"bridge train epoch{epoch}", f"bridge val epoch{epoch}"]
     names += ["fixed bridge TRAIN128", "KG oracle TRAIN128", "rewired oracle TRAIN128", "paired report"]
     p = Progress(names)
     a.output_root.mkdir(parents=True, exist_ok=True)
@@ -479,6 +480,13 @@ def main():
         p.complete(f"train={len(groups['train'])}, dev={len(groups['dev'])}, diagnosis=128; no source mutation")
         if a.preflight_only:
             p.log("[preflight passed] Exact source/512-token checks passed; no GPU or model loaded.")
+            return
+        completed_summary = a.output_root / "SUMMARY.json"
+        if completed_summary.exists():
+            previous_result = json.loads(completed_summary.read_text())
+            if previous_result.get("contract_sha256") != h:
+                raise ValueError("Completed summary has incompatible contract")
+            p.log(f"[already completed] {previous_result['status']}; {completed_summary}; no GPU loaded.")
             return
         if os.environ.get("CUDA_VISIBLE_DEVICES") != "1" or not torch.cuda.is_available():
             raise RuntimeError("Run wrapper on GPU1; GPU not available, no training launched")
@@ -578,7 +586,8 @@ def main():
         p.complete(f"Text baseline={stats([r['base'] for r in diagnosis])}; fixed bridge effects recorded BEFORE oracle")
         oracles = {}
         for j, mode in enumerate(("kg", "rewired")):
-            p.stage(end+1+j, 128, unit="question", kind="validation")
+            cached = sum(store.path("oracle_" + mode, row, "json").exists() for row in groups["diagnosis"])
+            p.stage(end+1+j, 128, initial=cached, unit="question", kind="validation")
             oracles[mode] = [oracle(a, store, wrapper, bridge, row, record["base"], mode, p)
                              for row, record in zip(groups["diagnosis"], diagnosis)]
             p.complete(f"{mode}: bounded JOINT directed gates complete; gold fallback retains original correct cases")

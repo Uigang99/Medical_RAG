@@ -1,10 +1,12 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 import torch
 
 from medrag.generation.pair_memory_attention import (
     PairMemoryBridge, FrozenLlamaMemory, apply_messages, answer_loss)
-from scripts.pilot_rag2_pair_memory_oracle import stats, better
+from scripts.pilot_rag2_pair_memory_oracle import stats, better, Store, oracle
 
 
 class PairMemoryTests(unittest.TestCase):
@@ -67,6 +69,17 @@ class PairMemoryTests(unittest.TestCase):
         self.assertEqual(summary["delta_accuracy_pp"], 50.)
         self.assertEqual(summary["wrong_to_correct"], 1)
         self.assertTrue(better(x[0], b[0]))
+
+    def test_cached_oracle_does_not_count_as_fresh_work(self):
+        class Progress:
+            def update(self):
+                raise AssertionError("Cached record inflated active throughput")
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory), "unit-test")
+            row = {"sample_id": "cached"}
+            store.save(store.path("oracle_kg", row, "json"), {"best": {"correct": True}})
+            result = oracle(None, store, None, None, row, None, "kg", Progress())
+            self.assertTrue(result["best"]["correct"])
 
 
 if __name__ == "__main__":
