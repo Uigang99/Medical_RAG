@@ -280,6 +280,11 @@ venv/
 !/scripts/run_rag2_attention_oracle_range_pilot.sh
 !/tests/test_attention_oracle_range.py
 
+# Frozen-Llama causal versus KG-restricted bidirectional attention diagnostic.
+!/scripts/pilot_rag2_bidirectional_attention.py
+!/scripts/run_rag2_bidirectional_attention_pilot.sh
+!/tests/test_bidirectional_proposition_attention.py
+
 # Official Train10k frozen proposition/KG pipeline.
 !/scripts/build_rag2_train10000_kg.py
 !/scripts/run_rag2_train_kg_stage.py
