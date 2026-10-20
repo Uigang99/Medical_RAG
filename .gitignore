@@ -315,3 +315,7 @@ venv/
 !/scripts/pilot_rag2_attention_identifiability.py
 !/scripts/run_rag2_attention_identifiability_pilot.sh
 !/tests/test_attention_intervention_diagnostic.py
+
+# Reusable, budgeted JEV document metadata; generated labels remain local.
+!/scripts/classify_rag2_documents_jev.py
+!/tests/test_medical_topic_classification.py
