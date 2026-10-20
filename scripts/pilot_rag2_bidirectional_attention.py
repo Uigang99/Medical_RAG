@@ -26,11 +26,13 @@ from medrag.training.bidirectional_attention_diagnostic import summarize
 from medrag.training.graph_input_data import atomic_json, atomic_jsonl, digest, sha_file, identity, jsonl
 from medrag.training.graph_input_progress import Progress
 from medrag.training.graph_input_modules import training_attention_backend
+from medrag.training.bidirectional_attention_runtime import calibrate, step_with_retry
 
 STAGES=['validate TRAIN128','load frozen Llama','mask / gradient safety',
         'causal and bi zero','causal oracle','bidirectional oracle','paired diagnosis']
 CODE=legacy.CODE+['scripts/pilot_rag2_attention_oracle_range.py','medrag/training/attention_oracle_range.py',
     'medrag/generation/bidirectional_proposition_attention.py','medrag/training/bidirectional_attention_diagnostic.py',
+    'medrag/training/bidirectional_attention_runtime.py',
     'scripts/pilot_rag2_bidirectional_attention.py','scripts/run_rag2_bidirectional_attention_pilot.sh']
 
 
@@ -38,12 +40,14 @@ def arguments(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source-root',type=Path,default=ROOT/'results/rag2_attention_identifiability_v1')
     p.add_argument('--prepared-root',type=Path,default=ROOT/'results/rag2_official_train_proposition_attention_v1')
-    p.add_argument('--output-root',type=Path,default=ROOT/'results/rag2_bidirectional_attention_pilot_v1')
+    p.add_argument('--output-root',type=Path,default=ROOT/'results/rag2_bidirectional_attention_pilot_v2_fast')
     p.add_argument('--steps',type=int,default=80)
     p.add_argument('--query-chunk',type=int,default=128)
+    p.add_argument('--memory-fraction',type=float,default=.88)
     p.add_argument('--preflight-only',action='store_true')
     a=p.parse_args(argv)
     if a.steps<2 or a.steps%2 or a.query_chunk<1:p.error('Positive even --steps >=2 and positive chunk required')
+    if not .5<=a.memory_fraction<=.92:p.error('--memory-fraction must be in [0.5,0.92]')
     return a
 
 
@@ -82,10 +86,13 @@ def preflight(a):
         rows.append(row)
     if counts!={'train':9000,'validation':1000} or len(rows)!=128:raise RuntimeError('Incomplete official data')
     rows.sort(key=lambda r:legacy.stable_key(314159,r['sample_id']))
-    contract=dict(version='bidirectional_attention_pilot_v1',source_hash=src['contract_sha256'],
+    contract=dict(version='bidirectional_attention_pilot_v2_fast',source_hash=src['contract_sha256'],
         source_predictions_sha256=sha_file(a.source_root/'capability_interventions.jsonl'),prepared_sha256=rh,
         model=src['contract']['model'],model_files=donor['contract']['inputs']['model_files'],
-        settings=dict(steps=a.steps,learning_rate=.1,bound=8.,query_chunk=a.query_chunk,seed=314159,batch=1),
+        settings=dict(steps=a.steps,learning_rate=.1,bound=8.,query_chunk=a.query_chunk,seed=314159,batch=1,
+            cache_frozen_prefix=True,cache_static_bidirectional_mask=True,memory_fraction=a.memory_fraction,
+            checkpointing='Choose faster equivalent path on longest prompt separately per mask; OOM rolls back current step.',
+            numerical_backend='Same MATH kernel and query chunk as v1; no fused-mask backend substitution'),
         cohort=[dict(sample_id=r['sample_id'],dataset=r['dataset'],row_sha256=digest(r),tokens=len(r['input_ids']),
             pairs=len(r['pairs']),source_correct=prior[r['sample_id']]['base']['correct']) for r in rows],
         code={p:sha_file(ROOT/p) for p in CODE},
@@ -197,7 +204,7 @@ def optimize(a,w,row,zero,pad,h,mode,progress):
     else:
         if not state['complete']:
             for step in range(state['step'],a.steps):
-                result,before,diag=optimize_step(w,row,pad,opt,8.)
+                result,before,diag=step_with_retry(w,row,pad,opt,8.,getattr(progress,'log',None))
                 observe(state,result,before,step)
                 g=w.controller.values.grad
                 diag.update(forward_gradient_norm=float(g[:n].norm()),
@@ -254,17 +261,25 @@ def run(a,rows,prior,c,h,p):
     torch.manual_seed(c['settings']['seed'])
     llm=AutoModelForCausalLM.from_pretrained(c['model'],local_files_only=True,dtype=torch.bfloat16,
         device_map={'':'cuda:0'},attn_implementation='sdpa').eval()
-    w=BidirectionalPropositionModel(llm,rows[0],query_chunk=a.query_chunk)
+    w=BidirectionalPropositionModel(llm,rows[0],query_chunk=a.query_chunk,cache_prefix=True)
     p.complete('Frozen pristine Llama; original text; MATH on controlled layers')
     p.stage(2,1)
     check=safety(w,max((r for r in rows if r['pairs']),key=lambda r:len(r['input_ids'])),pad)
     check['contract_sha256']=h;atomic_json(a.output_root/'SAFETY.json',check)
+    runtime=calibrate(w,max((r for r in rows if r['pairs']),key=lambda r:len(r['input_ids'])),
+                      pad,a.memory_fraction,p.log)
+    runtime['contract_sha256']=h
+    # On resume retain earlier calibration records as well as the latest one.
+    runtime_path=a.output_root/'RUNTIME.json'
+    earlier=legacy.read_json(runtime_path,h)['sessions'] if runtime_path.exists() else []
+    atomic_json(runtime_path,dict(contract_sha256=h,sessions=earlier+[runtime]))
     n=sum(bool(r['pairs']) for r in rows)
-    p.weights[3]=len(rows)*sum(check[x]['forward_seconds'] for x in ('causal','bidirectional'))
+    p.weights[3]=len(rows)*sum(runtime['modes'][x]['selected']['forward_seconds'] for x in ('causal','bidirectional'))
     for j,mode in enumerate(('causal','bidirectional'),4):
-        p.weights[j]=n*(a.steps*check[mode]['update_seconds']+3*check[mode]['forward_seconds'])
+        selected=runtime['modes'][mode]['selected']
+        p.weights[j]=n*(a.steps*selected['update_seconds']+3*selected['forward_seconds'])
     p.weights[6]=2.
-    p.complete('Legacy causal parity, nonzero grad/eval parity and directional gradients checked; fresh ETA calibrated')
+    p.complete('Legacy parity + cached/non-checkpointed loss/gradient/Adam parity; fastest memory-safe execution selected; RUNTIME.json')
     zero=measure_zero(a,w,rows,prior,pad,h,p);records={r['sample_id']:{} for r in rows}
     for j,mode in enumerate(('causal','bidirectional'),4):
         p.stage(j,n*a.steps,initial=cached_updates(a,rows,mode,h),unit='update',kind='train')
@@ -273,6 +288,7 @@ def run(a,rows,prior,c,h,p):
             records[row['sample_id']][mode]=optimize(a,w,row,zero[row['sample_id']],pad,h,mode,p)
         p.complete(f'{mode}: zero initialization, {a.steps} updates/question, graphless retained unchanged; {a.output_root}/questions')
     p.stage(6,1);report=summarize(rows,records,a.steps,h)
+    report['execution_runtime']=runtime
     atomic_jsonl(a.output_root/'per_question.jsonl',report['per_question']);atomic_json(final,report)
     p.complete(f'Four conditions, paired gains/harms and raw endpoints; {final}')
     return report
@@ -294,7 +310,8 @@ def main(argv=None):
                 gpu_job_started=False,output=str(a.output_root)),indent=2));return
         p.log(f'[plan] frozen TRAIN128 -> load -> safety -> causal/bi zero -> causal oracle -> bi oracle -> gains/harms; {counts}')
         p.log('[scope] Gold-conditioned diagnosis, not learned routing or final TEST. Same zero initialization and steps, bound8, independent directional biases. No cross-mask no-op fallback.')
-        p.log('[ETA] Prior 7,680 causal updates took about 67min with setup. New ~20,000 updates plus larger mask: rough 3-5h on GPU1; no measured bi throughput yet. Safety calibrates each arm separately. Resume every 5 updates.')
+        p.log('[runtime] Cache unchanged layers 0..11 and static masks; use spare VRAM to avoid recomputation. Exact v1 query chunk/MATH/optimizer preserved; fastest parity-passing path selected per mask. OOM rollback is question-local.')
+        p.log('[ETA] Old unoptimized estimate 3-5h; provisional 2-4h if retained activations fit H200. No fast H200 measurement yet; startup records matched old/new timings and VRAM in RUNTIME.json, then recalibrates ETA. Resume every 5 updates.')
         a.output_root.mkdir(parents=True,exist_ok=True)
         with (a.output_root/'.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

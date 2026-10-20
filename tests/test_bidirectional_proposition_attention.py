@@ -16,6 +16,7 @@ from medrag.generation.bidirectional_proposition_attention import (
 )
 from medrag.training.attention_oracle import score,optimize_step
 from medrag.training.bidirectional_attention_diagnostic import summarize
+from medrag.training.bidirectional_attention_runtime import step_with_retry, assert_equivalent, cpu_copy, calibrate
 from scripts import pilot_rag2_bidirectional_attention as runner
 
 
@@ -89,6 +90,8 @@ class Tests(unittest.TestCase):
 
     def test_full_four_conditions_and_graphless_resume(self):
         w,row=setup();empty=copy.deepcopy(row);empty.update(sample_id='medqa:empty',pairs=[],pair_roles=[])
+        w.cache_prefix=True
+        w.runtime_profiles={m:{'gradient_checkpointing':False} for m in ('causal','bidirectional')}
         rows=[row,empty];prior={r['sample_id']:dict(base=dict(correct=False)) for r in rows}
         with tempfile.TemporaryDirectory() as tmp:
             a=SimpleNamespace(output_root=Path(tmp),steps=4)
@@ -113,6 +116,8 @@ class Tests(unittest.TestCase):
 
     def test_partial_optimizer_resume_matches_fresh(self):
         w,row=setup();w.configure(row,True)
+        w.cache_prefix=True
+        w.runtime_profiles={'bidirectional':{'gradient_checkpointing':False}}
         zero=dict(bidirectional=score(w,row,0),source_initially_correct=False)
         class Interrupted(Progress):
             def update(self,n=1):
@@ -130,6 +135,74 @@ class Tests(unittest.TestCase):
             _,final=runner.paths(a,row,'bidirectional');final.unlink()
             p=Progress();self.assertEqual(runner.optimize(a,w,row,zero,0,'h','bidirectional',p),resumed)
             self.assertEqual(p.updates,0)
+
+    def test_prefix_cache_and_retained_activations_preserve_adam_trajectory(self):
+        w,row=setup()
+        for bi in (False,True):
+            runs=[]
+            for fast in (False,True):
+                w.configure(row,bi);w.cache_prefix=fast;w.gradient_checkpointing=not fast
+                w.controller.assign(torch.full_like(w.controller.values,.25))
+                opt=torch.optim.Adam([w.controller.values],lr=.1)
+                start=w.prefix_computations
+                first=None
+                for i in range(3):
+                    value,_,_=step_with_retry(w,row,0,opt,8.)
+                    if i==0:first=dict(score=value,gradient=cpu_copy(w.controller.values.grad))
+                runs.append(dict(first=first,values=cpu_copy(w.controller.values),endpoint=score(w,row,0)))
+                self.assertEqual(w.prefix_computations-start,1 if fast and not bi else 0 if fast else 4)
+            assert_equivalent(runs[1],runs[0])
+        original=w.prefix_computations
+        changed=copy.deepcopy(row);changed['input_ids'][13]+=1
+        score(w,changed,0)
+        self.assertEqual(w.prefix_computations,original+1)
+
+    def test_fast_step_oom_rolls_back_adam_and_restores_fast_next_question(self):
+        w,row=setup();w.cache_prefix=True
+        w.runtime_profiles={'bidirectional':{'gradient_checkpointing':False}}
+        outputs=[]
+        for inject in (False,True):
+            w.configure(row,True);self.assertFalse(w.gradient_checkpointing)
+            opt=torch.optim.Adam([w.controller.values],lr=.1)
+            step_with_retry(w,row,0,opt,8.)  # Make optimizer state nonempty before failure.
+            def fail_after_mutation(*args):
+                optimize_step(*args)
+                raise torch.cuda.OutOfMemoryError('simulated AFTER Adam update')
+            logs=[]
+            if inject:
+                with patch('medrag.training.bidirectional_attention_runtime.optimize_step',
+                           side_effect=[None]) as mocked:
+                    # First attempt mutates both values and Adam; retry must restore both.
+                    def attempt(*args):
+                        if mocked.call_count==1:return fail_after_mutation(*args)
+                        return optimize_step(*args)
+                    mocked.side_effect=attempt
+                    result=step_with_retry(w,row,0,opt,8.,logs.append)
+                    self.assertEqual(mocked.call_count,2)
+                self.assertTrue(w.gradient_checkpointing);self.assertEqual(len(logs),1)
+                self.assertTrue(result[2]['oom_retried_with_checkpointing'])
+            else:step_with_retry(w,row,0,opt,8.)
+            outputs.append((cpu_copy(w.controller.values),cpu_copy(opt.state_dict())))
+        torch.testing.assert_close(outputs[0][0],outputs[1][0],rtol=1e-5,atol=1e-7)
+        for k,v in outputs[0][1]['state'][0].items():
+            torch.testing.assert_close(v,outputs[1][1]['state'][0][k],rtol=1e-5,atol=1e-7)
+        w.configure(row,True);self.assertFalse(w.gradient_checkpointing)
+
+    def test_runtime_calibration_exercises_real_forwards_and_gradients(self):
+        w,row=setup()
+        # Only device telemetry is mocked; all six 3-update probes use real Llama.
+        with patch('torch.cuda.synchronize'),patch('torch.cuda.reset_peak_memory_stats'),\
+             patch('torch.cuda.empty_cache'),patch('torch.cuda.mem_get_info',return_value=(14*1024**3,16*1024**3)),\
+             patch('torch.cuda.memory_allocated',return_value=1024**3),\
+             patch('torch.cuda.max_memory_allocated',return_value=2*1024**3):
+            report=calibrate(w,row,0,.88,lambda _:None)
+        self.assertTrue(w.cache_prefix)
+        for mode in ('causal','bidirectional'):
+            data=report['modes'][mode]
+            self.assertEqual(len(data['attempts']),2)
+            self.assertTrue(all(x['parity'] for x in data['attempts']))
+            self.assertEqual(data['selected']['status'],'safe')
+            self.assertEqual(data['selected'],w.runtime_profiles[mode])
 
 
 if __name__=='__main__':unittest.main()
