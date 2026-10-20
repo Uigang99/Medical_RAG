@@ -16,7 +16,7 @@ from medrag.generation.bidirectional_proposition_attention import (
 )
 from medrag.training.attention_oracle import score,optimize_step
 from medrag.training.bidirectional_attention_diagnostic import summarize
-from medrag.training.bidirectional_attention_runtime import step_with_retry, assert_equivalent, cpu_copy, calibrate
+from medrag.training.bidirectional_attention_runtime import step_with_retry, assert_equivalent, cpu_copy, calibrate, deterministic_execution
 from scripts import pilot_rag2_bidirectional_attention as runner
 
 
@@ -190,7 +190,7 @@ class Tests(unittest.TestCase):
 
     def test_runtime_calibration_exercises_real_forwards_and_gradients(self):
         w,row=setup()
-        # Only device telemetry is mocked; all six 3-update probes use real Llama.
+        # Only device telemetry is mocked; all eight 3-update probes use real Llama.
         with patch('torch.cuda.synchronize'),patch('torch.cuda.reset_peak_memory_stats'),\
              patch('torch.cuda.empty_cache'),patch('torch.cuda.mem_get_info',return_value=(14*1024**3,16*1024**3)),\
              patch('torch.cuda.memory_allocated',return_value=1024**3),\
@@ -203,6 +203,28 @@ class Tests(unittest.TestCase):
             self.assertTrue(all(x['parity'] for x in data['attempts']))
             self.assertEqual(data['selected']['status'],'safe')
             self.assertEqual(data['selected'],w.runtime_profiles[mode])
+            self.assertTrue(data['baseline_repeat_parity'])
+
+    def test_baseline_mismatch_is_saved_and_not_misreported_as_memory(self):
+        w,row=setup()
+        ref=dict(first=dict(score=dict(logits=[0.,1.]),gradient=torch.zeros(2)),
+                 endpoint=dict(logits=[0.,1.]),values=torch.zeros(2),update_seconds=1.,peak_vram_bytes=1)
+        different=copy.deepcopy(ref);different['first']['gradient'][0]=.1
+        reports=[]
+        with patch('medrag.training.bidirectional_attention_runtime.probe',side_effect=[ref,different]):
+            with self.assertRaisesRegex(RuntimeError,'baseline fails its own repeatability'):
+                calibrate(w,row,0,.88,lambda _:None,lambda report:reports.append(copy.deepcopy(report)))
+        self.assertEqual(reports[-1]['failure'],'baseline_not_repeatable')
+        self.assertEqual(reports[-1]['status'],'failed')
+
+    def test_determinism_is_required_not_warn_only(self):
+        before=torch.are_deterministic_algorithms_enabled()
+        warn=torch.is_deterministic_algorithms_warn_only_enabled()
+        try:
+            deterministic_execution()
+            self.assertTrue(torch.are_deterministic_algorithms_enabled())
+            self.assertFalse(torch.is_deterministic_algorithms_warn_only_enabled())
+        finally:torch.use_deterministic_algorithms(before,warn_only=warn)
 
 
 if __name__=='__main__':unittest.main()

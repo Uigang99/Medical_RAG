@@ -26,7 +26,7 @@ from medrag.training.bidirectional_attention_diagnostic import summarize
 from medrag.training.graph_input_data import atomic_json, atomic_jsonl, digest, sha_file, identity, jsonl
 from medrag.training.graph_input_progress import Progress
 from medrag.training.graph_input_modules import training_attention_backend
-from medrag.training.bidirectional_attention_runtime import calibrate, step_with_retry
+from medrag.training.bidirectional_attention_runtime import calibrate, step_with_retry, deterministic_execution
 
 STAGES=['validate TRAIN128','load frozen Llama','mask / gradient safety',
         'causal and bi zero','causal oracle','bidirectional oracle','paired diagnosis']
@@ -40,11 +40,12 @@ def arguments(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source-root',type=Path,default=ROOT/'results/rag2_attention_identifiability_v1')
     p.add_argument('--prepared-root',type=Path,default=ROOT/'results/rag2_official_train_proposition_attention_v1')
-    p.add_argument('--output-root',type=Path,default=ROOT/'results/rag2_bidirectional_attention_pilot_v2_fast')
+    p.add_argument('--output-root',type=Path,default=ROOT/'results/rag2_bidirectional_attention_pilot_v2_fast_fix1')
     p.add_argument('--steps',type=int,default=80)
     p.add_argument('--query-chunk',type=int,default=128)
     p.add_argument('--memory-fraction',type=float,default=.88)
     p.add_argument('--preflight-only',action='store_true')
+    p.add_argument('--calibration-only',action='store_true',help='Stop after GPU safety/runtime checks; no cohort optimization')
     a=p.parse_args(argv)
     if a.steps<2 or a.steps%2 or a.query_chunk<1:p.error('Positive even --steps >=2 and positive chunk required')
     if not .5<=a.memory_fraction<=.92:p.error('--memory-fraction must be in [0.5,0.92]')
@@ -86,11 +87,12 @@ def preflight(a):
         rows.append(row)
     if counts!={'train':9000,'validation':1000} or len(rows)!=128:raise RuntimeError('Incomplete official data')
     rows.sort(key=lambda r:legacy.stable_key(314159,r['sample_id']))
-    contract=dict(version='bidirectional_attention_pilot_v2_fast',source_hash=src['contract_sha256'],
+    contract=dict(version='bidirectional_attention_pilot_v2_fast_fix1',source_hash=src['contract_sha256'],
         source_predictions_sha256=sha_file(a.source_root/'capability_interventions.jsonl'),prepared_sha256=rh,
         model=src['contract']['model'],model_files=donor['contract']['inputs']['model_files'],
         settings=dict(steps=a.steps,learning_rate=.1,bound=8.,query_chunk=a.query_chunk,seed=314159,batch=1,
             cache_frozen_prefix=True,cache_static_bidirectional_mask=True,memory_fraction=a.memory_fraction,
+            deterministic_algorithms=True,cublas_workspace_config=os.environ.get('CUBLAS_WORKSPACE_CONFIG',':4096:8'),
             checkpointing='Choose faster equivalent path on longest prompt separately per mask; OOM rolls back current step.',
             numerical_backend='Same MATH kernel and query chunk as v1; no fused-mask backend substitution'),
         cohort=[dict(sample_id=r['sample_id'],dataset=r['dataset'],row_sha256=digest(r),tokens=len(r['input_ids']),
@@ -267,7 +269,8 @@ def run(a,rows,prior,c,h,p):
     check=safety(w,max((r for r in rows if r['pairs']),key=lambda r:len(r['input_ids'])),pad)
     check['contract_sha256']=h;atomic_json(a.output_root/'SAFETY.json',check)
     runtime=calibrate(w,max((r for r in rows if r['pairs']),key=lambda r:len(r['input_ids'])),
-                      pad,a.memory_fraction,p.log)
+                      pad,a.memory_fraction,p.log,
+                      lambda data:atomic_json(a.output_root/'RUNTIME_CALIBRATION.json',dict(contract_sha256=h,**data)))
     runtime['contract_sha256']=h
     # On resume retain earlier calibration records as well as the latest one.
     runtime_path=a.output_root/'RUNTIME.json'
@@ -280,6 +283,8 @@ def run(a,rows,prior,c,h,p):
         p.weights[j]=n*(a.steps*selected['update_seconds']+3*selected['forward_seconds'])
     p.weights[6]=2.
     p.complete('Legacy parity + cached/non-checkpointed loss/gradient/Adam parity; fastest memory-safe execution selected; RUNTIME.json')
+    if a.calibration_only:
+        return dict(status='calibration_complete',execution_runtime=runtime)
     zero=measure_zero(a,w,rows,prior,pad,h,p);records={r['sample_id']:{} for r in rows}
     for j,mode in enumerate(('causal','bidirectional'),4):
         p.stage(j,n*a.steps,initial=cached_updates(a,rows,mode,h),unit='update',kind='train')
@@ -295,7 +300,7 @@ def run(a,rows,prior,c,h,p):
 
 
 def main(argv=None):
-    a=arguments(argv);torch.set_num_threads(8);p=None
+    a=arguments(argv);deterministic_execution();torch.set_num_threads(8);p=None
     try:
         if not a.preflight_only:p=Progress(list(STAGES));p.stage(0,1)
         rows,prior,c,h=preflight(a)
@@ -311,11 +316,14 @@ def main(argv=None):
         p.log(f'[plan] frozen TRAIN128 -> load -> safety -> causal/bi zero -> causal oracle -> bi oracle -> gains/harms; {counts}')
         p.log('[scope] Gold-conditioned diagnosis, not learned routing or final TEST. Same zero initialization and steps, bound8, independent directional biases. No cross-mask no-op fallback.')
         p.log('[runtime] Cache unchanged layers 0..11 and static masks; use spare VRAM to avoid recomputation. Exact v1 query chunk/MATH/optimizer preserved; fastest parity-passing path selected per mask. OOM rollback is question-local.')
-        p.log('[ETA] Old unoptimized estimate 3-5h; provisional 2-4h if retained activations fit H200. No fast H200 measurement yet; startup records matched old/new timings and VRAM in RUNTIME.json, then recalibrates ETA. Resume every 5 updates.')
+        p.log('[ETA] Full-cohort time is not measured. Startup records matched deterministic old/new timings and VRAM in RUNTIME.json; ETA calibrates separately per mask, then updates from fresh cohort steps. Resume every 5 updates.')
         a.output_root.mkdir(parents=True,exist_ok=True)
         with (a.output_root/'.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             report=run(a,rows,prior,c,h,p)
+        if report['status']=='calibration_complete':
+            p.log(f'[result] calibration complete; full cohort optimization NOT started; {a.output_root}/RUNTIME.json')
+            return
         if p.index<6:
             for j in range(p.index+1,7):p.stage(j,1,initial=1);p.complete('cached complete diagnostic')
         p.log(f'[result] {report["status"]}; exploratory screen={report["screen_passed"]}; {a.output_root}/SUMMARY.json; NOT generalization accuracy')

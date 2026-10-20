@@ -7,11 +7,18 @@ Only question-local Oracle scalars/Adam state are rolled back after a real OOM.
 from __future__ import annotations
 
 import gc
+import os
 import statistics
 import time
 import torch
 
 from medrag.training.attention_oracle import optimize_step, score
+
+
+def deterministic_execution():
+    """Require reproducible GPU reductions before comparing Adam trajectories."""
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG',':4096:8')
+    torch.use_deterministic_algorithms(True, warn_only=False)
 
 
 def cpu_copy(value):
@@ -78,7 +85,7 @@ def assert_equivalent(actual,reference):
     torch.testing.assert_close(actual['values'],reference['values'],atol=1e-5,rtol=1e-4)
 
 
-def calibrate(w,row,pad,memory_fraction,log):
+def calibrate(w,row,pad,memory_fraction,log,save_report=None):
     """Longest prompt, both masks: pick the faster numerically equivalent mode.
 
     The cache is required to match the reference; memory-vs-recompute selection
@@ -86,7 +93,8 @@ def calibrate(w,row,pad,memory_fraction,log):
     """
     if not 0.5<=memory_fraction<=0.92:raise ValueError('memory_fraction must be in [0.5,0.92]')
     w.runtime_profiles={}
-    report=dict(sample_id=row['sample_id'],tokens=len(row['input_ids']),modes={},
+    report=dict(status='calibrating',sample_id=row['sample_id'],tokens=len(row['input_ids']),modes={},
+        deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
         memory_fraction=memory_fraction,query_chunk=w.query_chunk,
         selection='Same MATH/query shape. Compare loss/logits, bias gradients and 3-step Adam values; select by time, not accuracy.',
         note='Longest-row warm-step estimate, not measured full-cohort wall time. OOM recovery is question-local.')
@@ -94,6 +102,18 @@ def calibrate(w,row,pad,memory_fraction,log):
         w.configure(row,mode=='bidirectional')
         reference=probe(w,row,pad,False,True)
         attempts=[];valid=[]
+        report['modes'][mode]=dict(attempts=attempts,old_update_seconds=reference['update_seconds'],
+            old_peak_vram_bytes=reference['peak_vram_bytes'])
+        # A nondeterministic baseline cannot judge whether the optimization is equivalent.
+        repeat=probe(w,row,pad,False,True)
+        try:
+            assert_equivalent(repeat,reference)
+        except AssertionError as exc:
+            report.update(status='failed',failure='baseline_not_repeatable',reason=str(exc))
+            if save_report:save_report(report)
+            raise RuntimeError(f'{mode} baseline fails its own repeatability test; this is not a VRAM shortage: {exc}') from exc
+        report['modes'][mode]['baseline_repeat_parity']=True
+        del repeat
         for ckpt in (False,True):
             opt_result=None;oom=False
             w.controller.values.grad=None;gc.collect();torch.cuda.empty_cache()
@@ -107,24 +127,30 @@ def calibrate(w,row,pad,memory_fraction,log):
             if oom:
                 w.controller.values.grad=None;gc.collect();torch.cuda.empty_cache()
                 attempts.append(dict(gradient_checkpointing=ckpt,status='oom'))
+                if save_report:save_report(report)
                 log(f'[calibration] {mode}: retain activations OOM; testing checkpointed path')
                 continue
             try:
                 assert_equivalent(opt_result,reference)
             except AssertionError as exc:
                 attempts.append(dict(gradient_checkpointing=ckpt,status='parity_failed',reason=str(exc)))
-                log(f'[calibration] {mode}: checkpointing={ckpt} failed strict parity; this execution path will NOT be used')
+                if save_report:save_report(report)
+                log(f'[calibration] {mode}: checkpointing={ckpt} failed strict parity; path rejected: {exc}')
                 continue
             item={k:v for k,v in opt_result.items() if k not in ('first','values','endpoint')}
             item.update(status='safe' if item['peak_vram_bytes']<=limit else 'insufficient_headroom',
                 vram_limit_bytes=int(limit),parity=True)
             attempts.append(item)
+            if save_report:save_report(report)
             if item['status']=='safe':valid.append(item)
-        if not valid:raise RuntimeError(f'No {mode} runtime within measured memory budget; free GPU memory and retry')
+        if not valid:
+            reasons=[x['status'] for x in attempts]
+            report.update(status='failed',failure='no_valid_runtime',reasons=reasons)
+            if save_report:save_report(report)
+            raise RuntimeError(f'No valid {mode} runtime: {reasons}. '
+                'parity_failed means numerical mismatch, NOT insufficient GPU memory; inspect RUNTIME_CALIBRATION.json')
         selected=min(valid,key=lambda x:x['update_seconds'])
-        report['modes'][mode]=dict(selected=selected,attempts=attempts,
-            old_update_seconds=reference['update_seconds'],
-            old_peak_vram_bytes=reference['peak_vram_bytes'],
+        report['modes'][mode].update(selected=selected,
             measured_warm_step_speedup=reference['update_seconds']/selected['update_seconds'])
         log(f'[calibration] {mode}: checkpointing={selected["gradient_checkpointing"]}, '
             f'{selected["update_seconds"]:.3f} s/update, peak={selected["peak_vram_bytes"]/1024**3:.1f} GiB; '
@@ -133,4 +159,6 @@ def calibrate(w,row,pad,memory_fraction,log):
     w.cache_prefix=True
     w.runtime_profiles={mode:data['selected'] for mode,data in report['modes'].items()}
     w.controller.values.grad=None;gc.collect();torch.cuda.empty_cache()
+    report['status']='complete'
+    if save_report:save_report(report)
     return report
