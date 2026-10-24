@@ -1,0 +1,21 @@
+# KEV A/B/C relation-label pilot
+
+The KEV prompt pilot classified 48 unique candidate proposition pairs from the fixed TEST Top-8 corpus: 24 development pairs for prompt revision and 24 document-disjoint confirmation pairs used only once after selecting v7. A, B and C were judged independently from the two unchanged proposition texts. The reference was a single assistant's pre-KEV adjudication, not clinical ground truth. Per-version probabilities, pair-level outputs and disagreement lists are stored under `results/rag2_kev_abc_quality_pilot_v1/`, `results/rag2_kev_abc_quality_prompt_updates/` and `results/rag2_kev_abc_quality_prompt_updates_confirmation/`.
+
+All scores in the table use raw KEV argmax decisions; the original v1/v2 0.70-confidence abstention scores are excluded because they had very low coverage. “Score” is the equal-family mean of A macro-F1, B positive-edge F1 and C positive-edge F1, not QA accuracy. The development references contain only one positive B decision and nine positive C decisions, so all positive-edge estimates are unstable.
+
+| Version | Revision | Dev score | A macro-F1 | B TP/FP/FN | C TP/FP/FN | Observation |
+|---|---|---:|---:|---:|---:|---|
+| v1 concise | Initial short relation definitions | .360 | .624 | 1/5/0 | 5/45/4 | Similar claims triggered many false C edges. |
+| v2 explicit | Added scope and missing-premise boundaries | .327 | .624 | 1/7/0 | 4/46/5 | Raw quality worsened; apparent thresholded score gain came with C coverage .126. |
+| v3 binary | Replaced B/C three-way choice with explicit pair-level YES/NO | .441 | .503 | 1/2/0 | 4/12/5 | False C edges fell, but true limits/contrasts were missed. |
+| v4 relation boundaries | Added individual edge-type distinctions | .510 | .503 | 1/2/0 | 5/5/4 | Best C development result; still confused sequential rescue and alternatives. |
+| v5 scope/direction | Added more patient/study and directional restrictions | .468 | .503 | 1/2/0 | 4/7/5 | Longer instructions worsened C. |
+| v6 minimal pair test | Shortened all decisions to direct pair tests | .361 | .591 | 1/4/0 | 3/26/6 | Better A, much worse C. |
+| v7 family composite | Exact v6 A + v4 B/C bodies; cached judgments reused | .539 | .591 | 1/2/0 | Highest tested whole-system development score; selected before holdout. |
+
+The v7 confirmation results were A macro-F1 .550; B positive TP/FP/FN 1/2/0, precision .333 and one internally inconsistent B case; C positive TP/FP/FN 2/6/6, precision .250 and recall .250. C F1 fell from .526 on development to .250 on confirmation. For each C .250 estimate, the Wilson 95% interval is approximately [.071, .591]. The frozen pilot gate was A macro-F1 ≥.75; B/C positive precision ≥.85 and recall ≥.60; and zero inconsistent B cases. **The gate failed; no full-corpus KEV classification was launched.**
+
+Qualitative confirmation review found a false B contradiction for two compatible internal-carotid/cavernous-sinus facts (P14), an unsupported RESULT_OF relation between nerve-damage findings and an examination (P46), and missed mechanism-to-phenomenon EXPLAINS relations (P44 and P48). The reference itself has ambiguous cases: the de Quervain/subacute-thyroiditis synonym (P30) and near-paraphrase entailment (P13) depend on the allowed background-knowledge policy. Frozen labels were not edited after seeing predictions. A separate one-predicate-versus-18-predicate GPU check on two error cases gave nearly identical probabilities, so bundling is unlikely to explain the main failures.
+
+Before any full 705,635-pair labeling, require a larger independently adjudicated challenge set with positive and hard-negative cases for every retained B/C edge label, checks of direction and source-document strata, and two annotators for ambiguous cases. The present 48-pair sample has no positives for most C edge types, so even a successful score on it could not certify all proposed relations. At 22 decisions per pair, full labeling would require about 15.52 million KEV decisions and likely several GPU-days at the measured H200 pilot throughput.
