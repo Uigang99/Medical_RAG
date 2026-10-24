@@ -323,4 +323,7 @@ venv/
 # Fixed-evidence decision-only KEV graph pilot; generated artifacts stay local.
 !/scripts/pilot_rag2_kev_evidence_graphs.py
 !/scripts/run_rag2_kev_evidence_graphs_pilot.sh
+!/scripts/prepare_rag2_common_pair_candidates.py
+!/scripts/run_rag2_common_pair_candidates.sh
+!/tests/test_common_proposition_pair_candidates.py
 !/tests/test_evidence_relation_graph.py
