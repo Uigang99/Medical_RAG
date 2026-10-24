@@ -319,3 +319,8 @@ venv/
 # Reusable, budgeted JEV document metadata; generated labels remain local.
 !/scripts/classify_rag2_documents_jev.py
 !/tests/test_medical_topic_classification.py
+
+# Fixed-evidence decision-only KEV graph pilot; generated artifacts stay local.
+!/scripts/pilot_rag2_kev_evidence_graphs.py
+!/scripts/run_rag2_kev_evidence_graphs_pilot.sh
+!/tests/test_evidence_relation_graph.py
