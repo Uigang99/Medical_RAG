@@ -81,6 +81,13 @@ decision rows; eight questions in one request count as eight rows. Repeated
 proposition/entity and proposition/pair requests are cached. Batch/single
 probability parity is checked at startup; failures use single-request forwards.
 OOM divides uncommitted batches. A single-request OOM stops with durable caches.
+KEV forwards exclude cuDNN SDPA, which failed to build an execution plan for
+the first padded batch on the H200 environment. Flash/efficient SDPA remain
+enabled with a math fallback. This scoped backend policy also covers the parity
+forward and is recorded in the manifest; it does not alter masks or prompts.
+After this fix, use a new output root (for example,
+`results/rag2_kev_evidence_graphs_test64_v2_cudnnfix`), since the failed v1
+manifest records different runtime/code. Do not overwrite or mix those caches.
 The KEV subprocess exits before vLLM starts: Llama can use 85% of GPU1, with up to
 16 concurrent generation requests. No new paid API calls or model downloads.
 

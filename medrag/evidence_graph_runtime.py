@@ -11,6 +11,10 @@ from medrag.training.graph_input_data import atomic_json, digest
 
 KEV_MAX_STATE = 7552
 KEV_MAX_ROW = 8192
+# cuDNN SDPA cannot build a plan for some padded Qwen3.5 decision batches
+# on the current H200 stack. Keep fused alternatives and a math fallback;
+# do not change the model's mask, precision, or decision inputs.
+KEV_SDPA_BACKENDS = ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "MATH")
 
 
 class DecisionCache:
@@ -83,10 +87,14 @@ independent fixed-choice questions.
 
     def _forward(self, batch):
         import torch
+        from torch.nn.attention import SDPBackend, sdpa_kernel
         if self.batch_disabled and len(batch) > 1:
             return [output for item in batch for output in self._forward([item])]
         try:
-            with torch.inference_mode():
+            # Scope this to KEV, including single-request parity forwards.
+            # Restore the caller's backend settings even if a forward fails.
+            with torch.inference_mode(), sdpa_kernel(
+                    [getattr(SDPBackend, name) for name in KEV_SDPA_BACKENDS]):
                 output = self.model.forward_batch([x[1] for x in batch], shared_prefix=False)
                 if self.parity is None and len(batch) > 1:
                     single = self.model.forward(batch[0][1])

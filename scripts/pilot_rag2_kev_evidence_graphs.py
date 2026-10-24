@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from medrag import evidence_relation_graph as g
 from medrag.benchmark import load_benchmark_samples, resolve_benchmark_path
-from medrag.evidence_graph_runtime import DecisionCache, KEV_MAX_ROW, KEV_MAX_STATE
+from medrag.evidence_graph_runtime import DecisionCache, KEV_MAX_ROW, KEV_MAX_STATE, KEV_SDPA_BACKENDS
 from medrag.training.graph_input_data import atomic_json, atomic_jsonl, digest, ensure_contract, identity, jsonl
 from medrag.training.graph_input_progress import Progress
 
@@ -249,7 +249,8 @@ def preflight(a):
                     "input_order": "question-options-evidence-optional_annotations", "evidence_pruning": False},
                 "runtime": {"kev_batch_rows": a.kev_batch_rows, "generation_batch": a.generation_batch,
                             "gpu_memory_utilization": a.gpu_memory_utilization, "physical_gpu": 1,
-                            "kev_max_state": KEV_MAX_STATE, "kev_max_row": KEV_MAX_ROW},
+                            "kev_max_state": KEV_MAX_STATE, "kev_max_row": KEV_MAX_ROW,
+                            "kev_sdpa_backends": list(KEV_SDPA_BACKENDS)},
                 "evaluation": {"primary": "paired MCQ accuracy difference (percentage points)",
                     "missing_parse": "count as incorrect; report separately", "minimum_worthwhile_gain_pp": 3.125,
                     "stop": "No full TEST expansion on this exploratory result alone; inspect labels and confirm on independent validation.",
@@ -289,7 +290,7 @@ def kev_worker(a):
     emit("stage", index=1, total=1)
     judge = LocalDecisions(a.kev_source, a.kev_adapter, a.kev_base, cache, a.kev_batch_rows)
     emit("update", amount=1)
-    emit("complete", message="frozen KEV9B, full-row forward; no external API")
+    emit("complete", message="frozen KEV9B, full-row forward; cuDNN SDPA disabled; no external API")
     result = judge.score(ac, 2, emit)
     result.update(judge.score(pairs, 3, emit))
     ontology = json.loads((a.output_root / "ontology.json").read_text())
@@ -315,7 +316,8 @@ def kev_worker(a):
         atomic_json(item_path(a.output_root, "experts", sid), {"contract_hash": c, "sample_id": sid,
                     "question_requests": per_question[sid], "group_requests": per_group[sid], "notes": notes})
     atomic_json(a.output_root / "KEV_RUNTIME.json", {"batch_parity": judge.parity,
-                "batch_disabled": judge.batch_disabled, "oom_splits": judge.oom_splits})
+                "batch_disabled": judge.batch_disabled, "oom_splits": judge.oom_splits,
+                "allowed_sdpa_backends": list(KEV_SDPA_BACKENDS)})
     atomic_json(a.output_root / "KEV_DONE.json", {"contract_hash": c, "questions": len(rows)})
 
 

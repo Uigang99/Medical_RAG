@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from medrag import evidence_relation_graph as g
-from medrag.evidence_graph_runtime import DecisionCache
+from medrag.evidence_graph_runtime import DecisionCache, LocalDecisions
 from scripts import pilot_rag2_kev_evidence_graphs as runner
 
 
@@ -40,6 +40,52 @@ def fixture():
 
 
 class GraphTests(unittest.TestCase):
+    def test_kev_forward_excludes_cudnn_and_restores_backend_flags(self):
+        """Exercise the production dispatch context on CPU, without loading KEV."""
+        import torch
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        owner = self
+
+        class Model:
+            calls = 0
+            fail = False
+
+            def forward_batch(self, encs, shared_prefix=False):
+                owner.assertFalse(shared_prefix)
+                owner.assertFalse(torch.backends.cuda.cudnn_sdp_enabled())
+                owner.assertTrue(torch.backends.cuda.flash_sdp_enabled())
+                owner.assertTrue(torch.backends.cuda.mem_efficient_sdp_enabled())
+                owner.assertTrue(torch.backends.cuda.math_sdp_enabled())
+                owner.assertTrue(torch.is_inference_mode_enabled())
+                self.calls += 1
+                if self.fail:
+                    raise RuntimeError("unrelated model failure")
+                # A real SDPA call, with padded-key masking, uses CPU math here.
+                q = torch.ones(1, 1, 2, 4)
+                mask = torch.tensor([[True, False], [True, False]])
+                h = torch.nn.functional.scaled_dot_product_attention(q, q, q, attn_mask=mask)
+                return [[h[0, 0, 0, :3]] for _ in encs]
+
+            def forward(self, enc):
+                return self.forward_batch([enc])[0]
+
+        judge = LocalDecisions.__new__(LocalDecisions)
+        judge.model = Model()
+        judge.parity, judge.batch_disabled, judge.oom_splits = None, False, 0
+        batch = [({}, {"ids": [1]}, []), ({}, {"ids": [2]}, [])]
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            result = judge._forward(batch)
+            self.assertEqual(len(result), 2)
+            self.assertEqual(judge.model.calls, 2)  # Batch plus single parity check.
+            self.assertTrue(judge.parity["passed"])
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+            self.assertFalse(torch.backends.cuda.math_sdp_enabled())
+            judge.model.fail = True
+            with self.assertRaisesRegex(RuntimeError, "unrelated model failure"):
+                judge._forward(batch)
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+            self.assertFalse(torch.backends.cuda.math_sdp_enabled())
+
     def test_sampling_proportions_no_label_dependency(self):
         rows = [{"sample_id": str(i), "dataset": "a" if i < 80 else "b", "gold": "A"} for i in range(100)]
         chosen = g.select_sample(rows, 10, 42)
