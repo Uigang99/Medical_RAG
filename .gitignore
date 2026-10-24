@@ -326,4 +326,7 @@ venv/
 !/scripts/prepare_rag2_common_pair_candidates.py
 !/scripts/run_rag2_common_pair_candidates.sh
 !/tests/test_common_proposition_pair_candidates.py
+!/scripts/pilot_rag2_kev_abc_quality.py
+!/scripts/run_rag2_kev_abc_quality_pilot.sh
+!/tests/test_kev_abc_quality.py
 !/tests/test_evidence_relation_graph.py
