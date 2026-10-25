@@ -1,0 +1,29 @@
+{
+  "version": "p3",
+  "change": "Primary-only refinement: actual speech act over reason/topic; preserve explicit causal claims under hedging; secondary unchanged.",
+  "primary_instruction": "Identify the central communication of the WHOLE proposition. Do not classify merely by the topic or by the fact that a sentence reports something. Decide what the reader principally learns. When it instructs, recommends, permits, prohibits or calls for an action, choose NORM; a justification does not turn that instruction into a mechanism. When the main new content is concrete means or execution details, choose METHOD. When it tells how a sign/test/criterion establishes or distinguishes a judgment, choose ASSESS. When its principal assertion is that one thing produces, changes, depends on, progresses to or prevents another, choose EXPLAIN, including uncertain/partial/observed/predicted effects. When it principally names, defines or classifies, choose DEFINE. Otherwise a characteristic, location, association, individual finding or historical occurrence is DESCRIBE. A passive report can still contain a causal claim or diagnostic inference; use the asserted relation, not tense. Conversely a list of features or a static anatomical branch is not a cause. No external medical inference. Choose ONE central function; ancillary functions will be checked separately. OTHER is not for unfamiliar medical terms.",
+  "primary_criteria": {
+    "DEFINE": "The main claim gives a definition, name, class membership, category example, or division into types. Not merely a characteristic or location.",
+    "DESCRIBE": "The main claim reports characteristics, location, frequency, association, an individual finding or history. Not a generic label for any factual sentence; explicit cause/effect, judgment criteria, means and guidance have their own roles.",
+    "EXPLAIN": "Central cause/effect, mechanism, dependency, progression or functional process, including modest, possible, adverse and experimentally observed effects. 'May', 'some' or reporting language does not erase an explicit causal assertion. Mere association/static location is not enough.",
+    "ASSESS": "The main claim links a sign/test/criterion to identification, measurement, diagnosis, discrimination, candidate assessment or evaluation, or states limitations/performance of doing so. A single observed measurement without that link is DESCRIBE.",
+    "METHOD": "The main claim supplies a means of achieving a treatment/prevention/practical goal, or how to perform something. A drug used to treat a disease can count without an imperative or detailed steps. Mere past use, outcome or drug mention does not.",
+    "NORM": "Central advice, requirement, permission, prohibition or ethical principle about an actor's action. Warnings that call for action and exceptions to an action rule count. A definition/diagnostic criterion containing 'must' is not an actor's duty.",
+    "OTHER": "The central information function genuinely lies outside all six categories.",
+    "UNCERTAIN": "Unresolved wording or missing referents prevents identifying the central information function."
+  },
+  "secondary_instruction": "The primary role has already been selected. Does the proposition explicitly provide this ADDITIONAL information role, beyond its central purpose? YES requires an additional meaningful function actually expressed in the text. Mere topic words, possible downstream uses, or a generic restatement of the main role are insufficient. It is normal to have no secondary role. Do not assess truth or invent missing facts.",
+  "secondary_criteria": {
+    "YES": "A distinct additional function is explicitly expressed.",
+    "NO": "No distinct additional function is expressed.",
+    "UNCERTAIN": "Ambiguity prevents deciding."
+  },
+  "secondary_roles": {
+    "DEFINE": "Role to assess: Definition or classification: what a term means, what something is, or which class it belongs to.",
+    "DESCRIBE": "Role to assess: Description or observation: characteristics, anatomy, occurrence, history, association, frequencies or reported findings.",
+    "EXPLAIN": "Role to assess: Cause or mechanism: why/how a phenomenon occurs, a dependency, a process, or an action producing an effect.",
+    "ASSESS": "Role to assess: Identification or evaluation: how to recognize, distinguish, measure, diagnose or assess; criteria, test use, or test limitations.",
+    "METHOD": "Role to assess: Means or procedure: an intervention to achieve a goal, or concrete instructions/steps for doing something.",
+    "NORM": "Role to assess: Recommendation or norm: what an actor should/should not/may/must do, including clinical and ethical guidance."
+  }
+}

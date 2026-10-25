@@ -334,3 +334,5 @@ venv/
 # Bounded six-role KEV classification pilot; labels/caches remain local.
 !/scripts/pilot_rag2_kev_information_roles.py
 !/tests/test_kev_information_roles.py
+!/scripts/pilot_rag2_kev_primary_roles.py
+!/tests/test_kev_primary_roles.py
