@@ -330,3 +330,7 @@ venv/
 !/scripts/run_rag2_kev_abc_quality_pilot.sh
 !/tests/test_kev_abc_quality.py
 !/tests/test_evidence_relation_graph.py
+
+# Bounded six-role KEV classification pilot; labels/caches remain local.
+!/scripts/pilot_rag2_kev_information_roles.py
+!/tests/test_kev_information_roles.py
