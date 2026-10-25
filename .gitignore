@@ -336,3 +336,8 @@ venv/
 !/tests/test_kev_information_roles.py
 !/scripts/pilot_rag2_kev_primary_roles.py
 !/tests/test_kev_primary_roles.py
+
+# Frozen P3 corpus metadata labeling; generated labels remain local.
+!/scripts/label_rag2_kev_roles_full.py
+!/scripts/run_rag2_kev_roles_full.sh
+!/tests/test_kev_role_labeling.py
