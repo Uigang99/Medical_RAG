@@ -36,10 +36,27 @@ def arguments(argv=None):
     p.add_argument('--chunk-size', type=int, default=1024)
     p.add_argument('--max-batch-rows', type=int, choices=(48,96,192), default=192)
     p.add_argument('--memory-fraction', type=float, default=.88)
+    p.add_argument('--gpu', type=int, choices=(0,1), default=1)
+    p.add_argument('--shard-count', type=int, choices=(1,2), default=1)
+    p.add_argument('--shard-index', type=int, default=0)
     a = p.parse_args(argv)
     if not 192 <= a.chunk_size <= 4096 or not .5 <= a.memory_fraction <= .92:
         p.error('chunk-size must be 192..4096; memory-fraction .5...92')
+    if not 0 <= a.shard_index < a.shard_count:
+        p.error('shard-index must be smaller than shard-count')
     return a
+
+
+def shard(a):
+    count, index = getattr(a,'shard_count',1), getattr(a,'shard_index',0)
+    if count not in (1,2) or not 0 <= index < count:
+        raise ValueError('Invalid shard')
+    return count, index, len(range(index,N,count))
+
+
+def source_rows(db,a):
+    count,index,_ = shard(a)
+    return db.execute('SELECT idx,pid,did,claim FROM proposition WHERE idx % ? = ? ORDER BY idx', (count,index))
 
 
 def read_source(a):
@@ -100,7 +117,9 @@ def contract(a, source):
          'outputs':'one main role, remaining YES/NO/UNCERTAIN roles, complete probabilities, verbatim source text',
          'expected_questions':6545, 'expected_propositions':N, 'seed':0,
          'generation':'none; argmax fixed-choice probabilities; no new confidence thresholds',
-         'dtype':'bfloat16', 'gpu':1, 'shared_prefix':False,
+         'dtype':'bfloat16', 'gpu':getattr(a,'gpu',1), 'shared_prefix':False,
+         'shard':{'count':shard(a)[0],'index':shard(a)[1],'propositions':shard(a)[2],
+                  'rule':'source index modulo shard count; no content or label based selection'},
          'batch_policy':{'reference_rows':48,'max_rows':a.max_batch_rows,
                          'memory_fraction':a.memory_fraction,'chunk':a.chunk_size,
                          'selection':'fastest parity-passing calibration, primary/secondary separately'},
@@ -136,13 +155,19 @@ def preflight_budget(db, spec, runtime, models):
 
 
 def run(a):
-    if os.environ.get('CUDA_VISIBLE_DEVICES') != '1':
-        raise RuntimeError('Use the shell launcher: physical GPU1 only')
+    gpu = getattr(a,'gpu',1)
+    _,_,total = shard(a)
+    if os.environ.get('CUDA_VISIBLE_DEVICES') != str(gpu):
+        raise RuntimeError(f'CUDA_VISIBLE_DEVICES must expose only physical GPU{gpu}')
     progress = Progress(('CPU contract', 'load KEV', 'TEST role labels', 'export / coverage'))
     db = store = None
     started = time.monotonic()
     active = None
     done = 0
+    def status(stage,**extra):
+        if not a.preflight:
+            atomic_json(a.output_root/'STATUS.json',{'stage':stage,'gpu':gpu,'completed':done,
+                'total':total,'updated_at':time.time(),**extra})
     try:
         progress.log('[plan] TEST6545 Top-8 union -> frozen P3 main+secondary -> atomic labels; no QA evaluation or new training')
         progress.stage(0,1)
@@ -150,7 +175,7 @@ def run(a):
         c,spec,runtime,models = contract(a,source)
         budget = preflight_budget(db,spec,runtime,models)
         progress.update()
-        progress.complete(f'{N} propositions; original empty document slots={stats["empty_document_slots"]}; longest-input CPU check={budget} tokens')
+        progress.complete(f'{N} union / {total} assigned to GPU{gpu}; original empty document slots={stats["empty_document_slots"]}; longest-input CPU check={budget} tokens')
         if a.preflight:
             progress.log('[preflight passed] No GPU/model loaded; all source counts and P3 schema checked; output untouched')
             return
@@ -164,14 +189,15 @@ def run(a):
                 'started_at':time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'contract':h})
             store = RoleStore(a.output_root,h)
             done = store.count()
-            if not 0 <= done <= N:
+            if not 0 <= done <= total:
                 raise ValueError('Invalid completed label count')
-            progress.log(f'[resume] completed={done}/{N}; remaining={N-done}; unique-text decisions cached; original IDs retained')
-            progress.log('[ETA] Compatible batch48 pilot implies 17-22h from empty cache; larger-batch gains unmeasured; calibrate first completed chunk')
-            progress.weights = [time.monotonic()-started, 8., N/4.6, 30.]
-            progress.stage(1,1,initial=int(done==N))
+            progress.log(f'[resume] GPU{gpu} completed={done}/{total}; remaining={total-done}; unique-text decisions cached; original IDs retained')
+            progress.log(f'[ETA] Assigned fraction={total/N:.3f} of full 17-22h batch48 estimate; calibrate first completed chunk')
+            progress.weights = [time.monotonic()-started, 8., total/4.6, 30.]
+            progress.stage(1,1,initial=int(done==total))
+            status('loading')
             judge = None
-            if done < N:
+            if done < total:
                 import torch
                 from transformers.utils import logging
                 logging.set_verbosity_error()
@@ -180,7 +206,8 @@ def run(a):
                 judge = LocalDecisions(runtime,models/'kev-9b',models/'Qwen3.5-9B-Base',store,batch_rows=48)
                 progress.update()
             progress.complete('One resident KEV; bf16; full-row backend; no unsafe hybrid prefix cache')
-            progress.stage(2,N,initial=done,unit='prop',kind='kev')
+            progress.stage(2,total,initial=done,unit='prop',kind='kev')
+            status('labeling')
             tuning = {}
             infer_started = time.monotonic()
             inferred = 0
@@ -191,7 +218,7 @@ def run(a):
                 judge.batch_rows = tuning.get(phase,{}).get('selected_rows',48)
                 # Parent owns one continuous progress footer; child progress is suppressed.
                 return judge.score(jobs,0,lambda *args,**kw:None)
-            cursor = db.execute('SELECT idx,pid,did,claim FROM proposition ORDER BY idx')
+            cursor = source_rows(db,a)
             while True:
                 chunk = cursor.fetchmany(a.chunk_size)
                 if not chunk:
@@ -220,18 +247,20 @@ def run(a):
                 inferred += len(outputs)
                 progress.update(len(outputs))
                 elapsed = time.monotonic()-infer_started
-                atomic_json(a.output_root/'RUNTIME.json',{'completed':done,'total':N,'remaining':N-done,
+                atomic_json(a.output_root/'RUNTIME.json',{'completed':done,'total':total,'remaining':total-done,
                     'fresh_propositions':inferred,'fresh_wall_seconds':elapsed,
-                    'seconds_per_proposition':elapsed/inferred, 'eta_seconds':(N-done)*elapsed/inferred,
+                    'seconds_per_proposition':elapsed/inferred, 'eta_seconds':(total-done)*elapsed/inferred,
                     'calibration':tuning,'oom_splits':judge.oom_splits,'batch_disabled':judge.batch_disabled,
                     'last_committed_index_range':active})
+                status('labeling',eta_seconds=(total-done)*elapsed/inferred)
             progress.complete(f'All {done} labeled; durable={a.output_root/"labels.sqlite3"}')
-            progress.stage(3,N,unit='prop')
-            if store.count() != N:
+            progress.stage(3,total,unit='prop')
+            status('exporting',eta_seconds=0)
+            if store.count() != total:
                 raise RuntimeError('Incomplete labels; cannot publish a complete export')
             counts, secondary_counts = Counter(), Counter()
             def export():
-                expected = db.execute('SELECT idx,pid,did,claim FROM proposition ORDER BY idx')
+                expected = source_rows(db,a)
                 for label, original in zip(store.rows(),expected,strict=True):
                     if (label['index'],label['proposition_id'],label['document_id'],label['text']) != tuple(original):
                         raise ValueError('Export identity/text mismatch')
@@ -240,16 +269,20 @@ def run(a):
                     progress.update()
                     yield label
             atomic_jsonl(a.output_root/'labels.jsonl',export())
-            summary = {'status':'complete','propositions':N,'questions':6545,'missing_labels':0,
+            summary = {'status':'complete','propositions':total,'union_propositions':N,'questions':6545,'missing_labels':0,
                 'source_inventory':stats,'primary_distribution':dict(counts),
                 'secondary_positive_distribution':dict(secondary_counts),'contract':h,
                 'wall_seconds_this_invocation':time.monotonic()-started,
                 'quality':'No new human gold or TEST QA evaluation; frozen P3 metadata, not verified semantic relations'}
             atomic_json(a.output_root/'summary.json',summary)
             progress.complete(str(a.output_root/'labels.jsonl'))
-            progress.log(f'[complete] {N}/{N}, missing=0; {a.output_root/"summary.json"}')
+            status('complete',eta_seconds=0)
+            progress.log(f'[complete] {total}/{total}, missing=0; {a.output_root/"summary.json"}')
     except BaseException as exc:
-        progress.log(f'[FAILED] stage={progress.index+1}/4 index_range={active}; completed={done}/{N}; remaining={N-done}; durable={a.output_root}; {type(exc).__name__}: {exc}; identical command resumes committed decisions/labels')
+        # A contender that failed to acquire the lock must not write STATUS.
+        if store is not None:
+            status('failed',error=f'{type(exc).__name__}: {exc}')
+        progress.log(f'[FAILED] stage={progress.index+1}/4 index_range={active}; completed={done}/{total}; remaining={total-done}; durable={a.output_root}; {type(exc).__name__}: {exc}; identical command resumes committed decisions/labels')
         raise
     finally:
         if store is not None:
