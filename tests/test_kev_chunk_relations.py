@@ -1,8 +1,21 @@
 import unittest
+from types import SimpleNamespace
 from medrag import kev_chunk_relations as s
 
 
 class ChunkRelationsTest(unittest.TestCase):
+    def test_local_checkpoint_paths_preserve_full_weights(self):
+        from medrag.evidence_graph_runtime import localize_checkpoint
+        full=SimpleNamespace(full=True,path='/tmp/kev27',meta=SimpleNamespace(base='Qwen/Qwen3.8-27B',base_revision='rev'))
+        localize_checkpoint(full,'/tmp/unrelated-base')
+        self.assertEqual(full.meta.base,'/tmp/kev27')
+        self.assertIsNone(full.meta.base_revision)
+        adapter=SimpleNamespace(full=False,meta=SimpleNamespace(base='Qwen/Qwen3.5-9B-Base',base_revision='rev'))
+        localize_checkpoint(adapter,'/tmp/base9')
+        self.assertEqual(adapter.meta.base,'/tmp/base9')
+        invalid=SimpleNamespace(full=True,meta=SimpleNamespace(base='unknown'))
+        with self.assertRaises(RuntimeError):localize_checkpoint(invalid,'/tmp/base')
+
     def test_independent_directions_and_no_question(self):
         pair = {"pair_id": "pair", "A": {"text": "literal A"}, "B": {"text": "literal B"}}
         jobs = [s.make_job(pair, task) for task in s.TASKS]

@@ -17,6 +17,21 @@ KEV_MAX_ROW = 8192
 KEV_SDPA_BACKENDS = ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "MATH")
 
 
+def localize_checkpoint(checkpoint, base):
+    """Validate the released family, then use its local tokenizer/weight paths."""
+    if checkpoint.full:
+        if checkpoint.meta.base != "Qwen/Qwen3.8-27B":
+            raise RuntimeError(f"Unvalidated full-weight KEV base: {checkpoint.meta.base}")
+        # Full weights are loaded from checkpoint.path, never from the 9B base.
+        # Checkpoint.load resolves the tokenizer through meta.base as well.
+        checkpoint.meta.base = str(Path(checkpoint.path).resolve())
+    else:
+        if checkpoint.meta.base != "Qwen/Qwen3.5-9B-Base":
+            raise RuntimeError(f"Unvalidated KEV base: {checkpoint.meta.base}")
+        checkpoint.meta.base = str(Path(base).resolve())
+    checkpoint.meta.base_revision = None
+
+
 class DecisionCache:
     def __init__(self, root, contract_hash):
         self.root, self.contract_hash = Path(root), contract_hash
@@ -64,10 +79,7 @@ independent fixed-choice questions.
         from kev.api import SystemOneRequest, to_record
         from kev.checkpoint import Checkpoint, LoadOptions
         checkpoint = Checkpoint(adapter)
-        if checkpoint.meta.base != "Qwen/Qwen3.5-9B-Base":
-            raise RuntimeError(f"Unvalidated KEV base: {checkpoint.meta.base}")
-        checkpoint.meta.base = str(Path(base).resolve())
-        checkpoint.meta.base_revision = None
+        localize_checkpoint(checkpoint, base)
         self.tokenizer, self.model = checkpoint.load(
             "cuda:0", LoadOptions(dtype=torch.bfloat16, merge=True, fused=False, cuda_graphs=False))
         self.model.eval()
