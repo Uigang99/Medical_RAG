@@ -4,6 +4,21 @@ from medrag import kev_chunk_relations as s
 
 
 class ChunkRelationsTest(unittest.TestCase):
+    def test_kev27_updates_keep_scope_options_and_raw_chunks(self):
+        from medrag.kev27_chunk_prompts import make_job
+        pair={'pair_id':'p','A':{'text':'literal A'},'B':{'text':'literal B'}}
+        for task in s.TASKS:
+            old=make_job(pair,task,'v2');new=make_job(pair,task,'v3')
+            self.assertEqual(old['body']['state'],new['body']['state'])
+            self.assertEqual(list(new['body']['questions']['RELATION']['criteria']),['YES','NO','UNCERTAIN'])
+            self.assertEqual(old['direction'],new['direction'])
+        self.assertEqual(make_job(pair,'OVERLAP','v2')['body'],make_job(pair,'OVERLAP','v3')['body'])
+        reverse=make_job(pair,'EXPLAINS_BA','v4')
+        self.assertEqual(reverse['body']['state']['SOURCE'],'literal B')
+        self.assertEqual(reverse['body']['state']['TARGET'],'literal A')
+        self.assertEqual(make_job(pair,'OVERLAP','v2')['body'],make_job(pair,'OVERLAP','v4')['body'])
+        self.assertEqual(make_job(pair,'OVERLAP','v2')['id'],make_job(pair,'OVERLAP','v4')['id'])
+
     def test_local_checkpoint_paths_preserve_full_weights(self):
         from medrag.evidence_graph_runtime import localize_checkpoint
         full=SimpleNamespace(full=True,path='/tmp/kev27',meta=SimpleNamespace(base='Qwen/Qwen3.8-27B',base_revision='rev'))
