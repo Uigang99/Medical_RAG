@@ -344,3 +344,8 @@ venv/
 !/scripts/label_rag2_kev_roles_dual.py
 !/scripts/run_rag2_kev_roles_dual.sh
 !/tests/test_kev_role_labeling_dual.py
+
+# Original-chunk relation quality pilot; graph artifacts remain local.
+!/scripts/pilot_rag2_kev_chunk_relations.py
+!/scripts/review_rag2_kev_chunk_relations.py
+!/tests/test_kev_chunk_relations.py
