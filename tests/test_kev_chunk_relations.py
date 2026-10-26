@@ -18,6 +18,21 @@ class ChunkRelationsTest(unittest.TestCase):
         self.assertEqual(reverse['body']['state']['TARGET'],'literal A')
         self.assertEqual(make_job(pair,'OVERLAP','v2')['body'],make_job(pair,'OVERLAP','v4')['body'])
         self.assertEqual(make_job(pair,'OVERLAP','v2')['id'],make_job(pair,'OVERLAP','v4')['id'])
+        newest=make_job(pair,'EXPLAINS_BA','v5')
+        self.assertEqual(newest['body']['state']['SOURCE'],'literal B')
+        self.assertEqual(newest['body']['state']['TARGET'],'literal A')
+        self.assertEqual(make_job(pair,'OVERLAP','v2')['id'],make_job(pair,'OVERLAP','v5')['id'])
+        self.assertNotEqual(make_job(pair,'EXPLAINS_BA','v4')['id'],newest['id'])
+        latest=make_job(pair,'PRECEDES_BA','v6')
+        self.assertEqual(latest['body']['state']['SOURCE'],'literal B')
+        self.assertEqual(latest['body']['state']['TARGET'],'literal A')
+        self.assertEqual(latest['body'],make_job(pair,'PRECEDES_BA','v4')['body'])
+        self.assertEqual(latest['id'],make_job(pair,'PRECEDES_BA','v4')['id'])
+        for task in s.TASKS:
+            base='v4' if s.TASKS[task][1] in ('EXPLAINS','PROCESS_PRECEDES') else 'v2'
+            selected=make_job(pair,task,'v7')
+            self.assertEqual(selected['id'],make_job(pair,task,base)['id'])
+            self.assertEqual(selected['body'],make_job(pair,task,base)['body'])
 
     def test_local_checkpoint_paths_preserve_full_weights(self):
         from medrag.evidence_graph_runtime import localize_checkpoint

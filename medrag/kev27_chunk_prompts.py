@@ -72,8 +72,70 @@ DEFINITIONS['v4'] = {
         'of the same alternatives without differing comparison information are also NO.'),
 }
 
+# Keep the previously strong overlap definition.  The three other relations
+# are revised independently so the effect of each can be inspected.
+DEFINITIONS['v5'] = {
+    'EXPLAINS': (
+        'Decide whether SOURCE supplies a reason, mechanism, or definition for '
+        'a particular statement or term actually present in TARGET. Identify '
+        'that TARGET statement first. YES only when the SOURCE information '
+        'answers WHY/HOW that statement holds or WHAT its term means, using '
+        'facts stated in these chunks. The explanatory information must add '
+        'something beyond repeating the TARGET fact: listing the same types, '
+        'markers, outcomes, or recommendations is NO unless SOURCE also states '
+        'the causal, functional, or definitional link. A more detailed account '
+        'of a briefly stated mechanism can qualify. A temporal predecessor '
+        'alone is not automatically an explanation. Never reverse SOURCE and '
+        'TARGET or supply a missing medical premise.'),
+    'PROCESS_PRECEDES': DEFINITIONS['v4']['PROCESS_PRECEDES'] + (
+        ' Do not label YES merely because two documents mention the same '
+        'clinical workflow or historical era: the particular earlier stage in '
+        'SOURCE and later stage in TARGET must be distinguishable in the '
+        'supplied text. If both directions seem true, each direction needs '
+        'its own different-stage witness.'),
+    'CONTEXTUAL_CONTRAST': (
+        'Do A and B give substantively different alternatives, conditions, '
+        'states, or positions for one identifiable comparison issue? YES if '
+        'one can ask the SAME concrete question of both portions and obtain '
+        'different answers grounded in the two chunks, even though both '
+        'answers may be true. Different uses of the same intervention, '
+        'different causes of the same stated outcome, and different management '
+        'contexts can qualify. A broad topic alone is not the comparison '
+        'issue. A general rule plus its matching example, repeated lists of '
+        'the same alternatives, or extra detail about one mechanism are NO. '
+        'Do not invent a common patient, event, task, or difference.'),
+}
+
+DEFINITIONS['v6'] = {
+    'EXPLAINS': (
+        'Does SOURCE explain something actually stated in TARGET? A definition '
+        'of a target term, or a stated reason or mechanism for a target finding '
+        'or action, is YES. One specific portion suffices; SOURCE may repeat '
+        'the target fact as well, provided it also supplies the explanatory '
+        'link. A list of the same examples, categories, findings, or outcomes '
+        'without such a link is NO. Check the requested direction: the '
+        'explaining content must be in SOURCE, not TARGET. Use only the two '
+        'texts and ordinary paraphrase; do not supply a missing premise.'),
+    'PROCESS_PRECEDES': DEFINITIONS['v4']['PROCESS_PRECEDES'],
+    'CONTEXTUAL_CONTRAST': (
+        'Do A and B describe meaningfully different alternatives or contexts '
+        'for an identifiable common problem, phenomenon, decision, or outcome? '
+        'YES when the chunks state different causes of the same phenomenon, '
+        'different interventions for the same task, or different states or '
+        'applications relevant to the same decision. They need not explicitly '
+        'compare each other or disagree, and one chunk may contain a broader '
+        'list while the other details one genuinely distinct alternative. '
+        'NO when the only difference is added detail about the same alternative, '
+        'repetition of the same list, a shared broad topic, or separate cases '
+        'with no matched issue. Never invent the common problem or difference.'),
+}
+
 
 def make_job(pair, task, version):
+    if version == 'v7':
+        # Frozen task-wise selection, not an additional prompt rewrite.
+        chosen = 'v4' if TASKS[task][1] in ('EXPLAINS', 'PROCESS_PRECEDES') else 'v2'
+        return dict(make_job(pair, task, chosen), prompt_version=version)
     if version == 'v2':
         return dict(original_job(pair, task, 'v2'), prompt_version=version)
     if version not in DEFINITIONS:
@@ -83,11 +145,11 @@ def make_job(pair, task, version):
     _, relation, direction = TASKS[task]
     if relation in DEFINITIONS[version]:
         instruction = DEFINITIONS[version][relation]
-        if direction and version != 'v4':
+        if direction and version not in ('v4', 'v5', 'v6'):
             source, target = ('A', 'B') if direction == 'A_TO_B' else ('B', 'A')
             instruction += f' For this decision SOURCE is chunk {source}; TARGET is chunk {target}.'
         job['body']['questions']['RELATION']['instructions'] = instruction
-    if version == 'v4' and direction:
+    if version in ('v4', 'v5', 'v6') and direction:
         source, target = ('A','B') if direction == 'A_TO_B' else ('B','A')
         job['body']['state'] = {'rules':job['body']['state']['rules'],
                                'SOURCE':pair[source]['text'], 'TARGET':pair[target]['text']}

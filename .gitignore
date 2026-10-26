@@ -353,3 +353,5 @@ venv/
 !/scripts/review_rag2_kev_chunk_refinement.py
 !/scripts/pilot_rag2_kev27_chunk_relations.py
 !/scripts/refine_rag2_kev27_chunk_prompts.py
+!/scripts/continue_rag2_kev27_prompt_quality.py
+!/scripts/report_rag2_kev27_prompt_quality.py
