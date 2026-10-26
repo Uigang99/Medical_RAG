@@ -28,5 +28,16 @@ class ChunkRelationsTest(unittest.TestCase):
         self.assertEqual((edge['source'],edge['target']),('b','a'))
         self.assertIsNone(edge['supporting_spans'])
 
+    def test_refined_prompt_keeps_inputs_tasks_and_separate_cache(self):
+        pair={'pair_id':'p','A':{'text':'alpha'},'B':{'text':'beta'}}
+        for task in s.TASKS:
+            old=s.make_job(pair,task);new=s.make_job(pair,task,'v2')
+            self.assertNotEqual(old['id'],new['id'])
+            self.assertEqual(old['direction'],new['direction'])
+            self.assertEqual(new['body']['state']['chunk_A'],'alpha')
+            self.assertEqual(new['body']['state']['chunk_B'],'beta')
+            self.assertEqual(set(new['body']['questions']['RELATION']['criteria']),set(s.CRITERIA))
+        with self.assertRaises(ValueError):s.make_job(pair,'OVERLAP','unknown')
+
 
 if __name__ == '__main__': unittest.main()

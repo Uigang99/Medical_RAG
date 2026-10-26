@@ -349,3 +349,5 @@ venv/
 !/scripts/pilot_rag2_kev_chunk_relations.py
 !/scripts/review_rag2_kev_chunk_relations.py
 !/tests/test_kev_chunk_relations.py
+!/scripts/pilot_rag2_kev_chunk_refinement.py
+!/scripts/review_rag2_kev_chunk_refinement.py
