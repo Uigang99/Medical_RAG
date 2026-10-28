@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cache four fixed question-only retrieval views for TEST-6545.
+"""Cache four fixed question-only retrieval views for a benchmark split.
 
 One exact inner-product scan of each of four corpora supplies both the balanced and
 unrestricted dense pools.  MedCPT CE scores the *union* once per question, so
@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -31,19 +32,29 @@ from medrag.reranking.medcpt_cross_encoder import MedCPTCrossEncoderReranker
 from medrag.training.graph_input_progress import Progress
 
 
-DATASETS = (
+TEST_DATASETS = (
     "medmcqa", "medqa", "mmlu_anatomy", "mmlu_clinical_knowledge",
     "mmlu_college_biology", "mmlu_college_medicine", "mmlu_medical_genetics",
     "mmlu_professional_medicine",
 )
+TRAIN_DATASETS = ("medmcqa", "medqa")
+EXPECTED_ROWS = {
+    "test": {"medmcqa": 4183, "medqa": 1273, "mmlu_anatomy": 135,
+             "mmlu_clinical_knowledge": 265, "mmlu_college_biology": 144,
+             "mmlu_college_medicine": 173, "mmlu_medical_genetics": 100,
+             "mmlu_professional_medicine": 272},
+    "train": {"medmcqa": 182822, "medqa": 10178},
+}
 SOURCES = ("pubmed", "pmc", "cpg", "textbooks")
 ARMS = ("balanced_dense", "global_dense", "balanced_ce", "global_ce")
 
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-root", type=Path, default=PROJECT / "databases" / "run_cache" /
-                        "question_only_ip_fourway_test6545_v1")
+    parser.add_argument("--split", choices=("test", "train"), default="test")
+    parser.add_argument("--datasets", nargs="+", default=None,
+                        help="Dataset names; defaults to all eight TEST datasets or MedMCQA+MedQA TRAIN")
+    parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--benchmark-root", type=Path, default=PROJECT / "datasets" / "benchmark" /
                         "mcq" / "unified")
     parser.add_argument("--query-cache-root", type=Path, default=PROJECT / "databases" /
@@ -58,7 +69,17 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--ce-max-length", type=int, default=512)
     parser.add_argument("--device", default="cuda:0", help="Visible device; wrapper exposes physical GPU 1 as cuda:0")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and print plan; no GPU or output writes")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.datasets is None:
+        args.datasets = TEST_DATASETS if args.split == "test" else TRAIN_DATASETS
+    if len(set(args.datasets)) != len(args.datasets) or any(
+            dataset not in EXPECTED_ROWS[args.split] for dataset in args.datasets):
+        parser.error(f"Invalid or repeated datasets for {args.split}: {args.datasets}")
+    if args.output_root is None:
+        count = sum(EXPECTED_ROWS[args.split][dataset] for dataset in args.datasets)
+        args.output_root = (PROJECT / "databases" / "run_cache" /
+                            f"question_only_ip_fourway_{args.split}{count}_v1")
+    return args
 
 
 def sha256_file(path: Path) -> str:
@@ -96,27 +117,28 @@ def atomic_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def preflight(args: argparse.Namespace) -> tuple[list, np.ndarray, dict, str]:
-    """Verify the exact TEST cohort, query text, embedding cache, and DB contract."""
+    """Verify the requested cohort, query text, embedding cache, and DB contract."""
     samples = []
     vector_batches = []
     inputs = []
     query_digest = hashlib.sha256()
-    for dataset in DATASETS:
-        benchmark = args.benchmark_root / dataset / "test.jsonl"
-        cache_dir = args.query_cache_root / dataset / "test"
+    for dataset in args.datasets:
+        benchmark = args.benchmark_root / dataset / f"{args.split}.jsonl"
+        cache_dir = args.query_cache_root / dataset / args.split
         manifest_path = cache_dir / "manifest.json"
         metadata_path = cache_dir / "metadata.jsonl"
         if not benchmark.is_file() or not manifest_path.is_file() or not metadata_path.is_file():
             raise FileNotFoundError(f"Missing question-only input for {dataset}: {benchmark}, {cache_dir}")
         cohort = load_benchmark_samples(benchmark, task="mcq", collection="unified",
-                                        dataset=dataset, split="test")
+                                        dataset=dataset, split=args.split)
         store = QueryEmbeddingStore(cache_dir)
         manifest = store.manifest
         if manifest.get("mcq_query_mode") != "question_only" or manifest.get("normalize") is not False:
             raise RuntimeError(f"Not the expected unnormalized question-only MedCPT cache: {manifest_path}")
         if manifest.get("model", {}).get("name") != "MedCPT-Query-Encoder":
             raise RuntimeError(f"Wrong query model: {manifest_path}")
-        if len(cohort) != int(manifest["rows"]) or store.dimension != 768:
+        if (len(cohort) != EXPECTED_ROWS[args.split][dataset] or
+                len(cohort) != int(manifest["rows"]) or store.dimension != 768):
             raise RuntimeError(f"Question count/dimension mismatch: {dataset}")
         with metadata_path.open(encoding="utf-8") as handle:
             for sample, line in zip(cohort, handle, strict=True):
@@ -134,8 +156,9 @@ def preflight(args: argparse.Namespace) -> tuple[list, np.ndarray, dict, str]:
                        "query_manifest_sha256": sha256_file(manifest_path),
                        "query_embeddings": signature(cache_dir / "embeddings.npy"),
                        "query_metadata": signature(metadata_path)})
-    if len(samples) != 6545 or len({sample.id for sample in samples}) != 6545:
-        raise RuntimeError(f"Expected exactly 6545 unique TEST questions; got {len(samples)}")
+    expected = sum(EXPECTED_ROWS[args.split][dataset] for dataset in args.datasets)
+    if len(samples) != expected or len({sample.id for sample in samples}) != expected:
+        raise RuntimeError(f"Expected exactly {expected} unique {args.split} questions; got {len(samples)}")
 
     source_contract = []
     for source in SOURCES:
@@ -170,10 +193,11 @@ def preflight(args: argparse.Namespace) -> tuple[list, np.ndarray, dict, str]:
                                     args.ce_batch_size, args.ce_question_batch_size, args.ce_max_length)):
         raise ValueError("Chunk and batch sizes must be positive")
     vectors = np.ascontiguousarray(np.concatenate(vector_batches), dtype=np.float32)
-    if vectors.shape != (6545, 768) or not np.isfinite(vectors).all():
-        raise RuntimeError("Invalid TEST question embedding matrix")
+    if vectors.shape != (expected, 768) or not np.isfinite(vectors).all():
+        raise RuntimeError(f"Invalid {args.split} question embedding matrix")
     contract = {
-        "experiment": "question_only_ip_fourway_test6545_v1",
+        "experiment": f"question_only_ip_fourway_{args.split}{expected}_v1",
+        "split": args.split, "datasets": list(args.datasets),
         "question_input": "benchmark question only; no options, rationale, or gold",
         "retrieval_metric": "raw float32 inner product; stored unnormalized FAISS vectors are reconstructed",
         "sources": list(SOURCES), "source_contract": source_contract,
@@ -356,25 +380,41 @@ def merge_outputs(args: argparse.Namespace, samples: list, contract_hash: str,
             handle.close()
     for arm, path in output_paths.items():
         os.replace(temporary[arm], path)
-    summary = {"questions": len(samples), "documents_per_question_per_arm": 32,
+    summary = {"questions": len(samples), "split": args.split,
+               "datasets": {dataset: EXPECTED_ROWS[args.split][dataset] for dataset in args.datasets},
+               "documents_per_question_per_arm": 32,
                "metric": "inner_product", "arms": {arm: {"path": str(output_paths[arm]),
                "source_counts": dict(source_counts[arm])} for arm in ARMS}}
     atomic_json(args.output_root / "summary.json", summary)
-    progress.complete(f"four 6545-row ranked JSONL files and summary: {args.output_root}")
+    progress.complete(f"four {len(samples)}-row ranked JSONL files and summary: {args.output_root}")
 
 
 def run(args: argparse.Namespace) -> None:
     samples, vectors, contract, contract_hash = preflight(args)
+    # The completed TEST run used ~2.2 GB for 6,545 rows including durable parts.
+    # Reserve a conservative margin before starting a fresh large run.
+    if not args.dry_run and not args.output_root.exists():
+        required = int(len(samples) * 350_000 * 1.5)
+        available = shutil.disk_usage(args.output_root.parent).free
+        if available < required:
+            raise RuntimeError(f"Insufficient free disk: {available / 1e9:.1f} GB; "
+                               f"need ~{required / 1e9:.1f} GB for a fresh run")
     source_rows = {item["source"]: item["rows"] for item in contract["source_contract"]}
     total = sum(source_rows.values())
-    plan = ("[plan] TEST6545 question-only MedCPT -> four corpus inner-product scans "
+    plan = (f"[plan] {args.split.upper()}{len(samples)} question-only MedCPT -> four corpus inner-product scans "
             "-> balanced/global 32 -> deduplicated MedCPT CE -> four ranked JSONL; "
             f"vectors={total:,}, GPU 1 only, no labels, no generation")
     print(plan, flush=True)
+    # Approximate stage durations from the completed, same-GPU TEST-6545 run:
+    # search 278 s, CE 312 s, merge 13 s. Recalibrate from fresh work.
+    scale = len(samples) / 6545
+    search_seconds, ce_seconds, merge_seconds = 278 * scale, 312 * scale, 13 * scale
     print("[stages] contract; pubmed; pmc; cpg; textbooks; CE rerank; merge. "
-          "Search/CE ETA calibrates on this new inner-product workload.", flush=True)
+          f"Previous-run scaled ETA ~{(search_seconds + ce_seconds + merge_seconds) / 3600:.1f} h "
+          "(same H200 GPU 1 and batch sizes); recalibrates during execution.", flush=True)
     if args.dry_run:
-        print(f"[dry-run OK] N={len(samples)}; query mode=question_only; output={args.output_root}; "
+        print(f"[dry-run OK] N={len(samples)} datasets={','.join(args.datasets)}; "
+              f"query mode=question_only; output={args.output_root}; "
               "no GPU/model/index load and no output writes", flush=True)
         return
     checked_manifest(args.output_root, contract)
@@ -387,12 +427,15 @@ def run(args: argparse.Namespace) -> None:
     progress = Progress(["input contract", *[f"inner product {source}" for source in SOURCES],
                          "MedCPT CE union", "merge four outputs"])
     progress.weights[0] = 1.0
-    progress.weights[6] = max(10.0, len(samples) * .005)  # small I/O-only stage cost model
+    for stage, source in enumerate(SOURCES, start=1):
+        progress.weights[stage] = search_seconds * source_rows[source] / total
+    progress.weights[5] = ce_seconds
+    progress.weights[6] = merge_seconds
     current = "contract"
     indexes = {}
     try:
         progress.stage(0, 1, unit="check")
-        progress.complete(f"manifest={args.output_root / 'manifest.json'}; N=6545")
+        progress.complete(f"manifest={args.output_root / 'manifest.json'}; N={len(samples)}")
         per_source = {}
         for stage, source in enumerate(SOURCES, start=1):
             current = f"inner product {source}"
@@ -410,8 +453,9 @@ def run(args: argparse.Namespace) -> None:
                 if fresh > 0:
                     seconds_per_vector = (time.monotonic() - stage_start) / fresh
                     for future_stage, future_source in enumerate(SOURCES, start=1):
-                        if progress.weights[future_stage] is None:
-                            progress.weights[future_stage] = max(1., seconds_per_vector * source_rows[future_source])
+                        if future_stage > stage:
+                            progress.weights[future_stage] = max(
+                                1., seconds_per_vector * source_rows[future_source])
 
             scores, ids = source_topk_inner_product(
                 index, vectors, k=32, vector_chunk_size=args.vector_chunk_size,
@@ -427,7 +471,7 @@ def run(args: argparse.Namespace) -> None:
         rerank_parts(args, samples, per_source, indexes, contract_hash, progress)
         current = "merge"
         merge_outputs(args, samples, contract_hash, progress)
-        progress.log(f"[complete] N=6545; four Top-32 sets: {args.output_root}")
+        progress.log(f"[complete] N={len(samples)}; four Top-32 sets: {args.output_root}")
     except Exception as exc:
         progress.log(f"[FAILED] stage={progress.index + 1}/7 {current}; "
                      f"completed={progress.done}/{progress.total} remaining={progress.total-progress.done}; "
