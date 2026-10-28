@@ -1,0 +1,155 @@
+"""One-pass, per-source cosine search for balanced and global candidate pools.
+
+The stored RAG_Square FAISS vectors are *not* unit normalized.  Searching their
+IndexFlatIP directly would rank by dot product, not by cosine similarity.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+def _atomic_state(path: Path, *, contract: str, next_shard: int,
+                  scores: np.ndarray, ids: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez(handle, contract=np.asarray(contract), next_shard=np.asarray(next_shard),
+                 scores=scores, ids=ids)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def load_state(path: Path, *, contract: str, shape: tuple[int, int],
+               shard_count: int) -> tuple[int, np.ndarray, np.ndarray]:
+    if not path.exists():
+        return (0, np.full(shape, -np.inf, dtype=np.float32),
+                np.full(shape, -1, dtype=np.int64))
+    with np.load(path, allow_pickle=False) as state:
+        if str(state["contract"].item()) != contract:
+            raise RuntimeError(f"Cosine checkpoint contract mismatch: {path}")
+        next_shard = int(state["next_shard"].item())
+        scores = np.asarray(state["scores"], dtype=np.float32)
+        ids = np.asarray(state["ids"], dtype=np.int64)
+    if scores.shape != shape or ids.shape != shape or not 0 <= next_shard <= shard_count:
+        raise RuntimeError(f"Invalid cosine checkpoint shape or cursor: {path}")
+    return next_shard, scores, ids
+
+
+def merge_topk(best_scores: torch.Tensor, best_ids: torch.Tensor,
+               chunk_scores: torch.Tensor, chunk_ids: torch.Tensor,
+               k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep the best document IDs for each query after one vector chunk."""
+    combined_scores = torch.cat((best_scores, chunk_scores), dim=1)
+    combined_ids = torch.cat((best_ids, chunk_ids), dim=1)
+    scores, positions = torch.topk(combined_scores, k=k, dim=1)
+    return scores, combined_ids.gather(1, positions)
+
+
+def source_topk_cosine(
+    source_index,
+    query_vectors: np.ndarray,
+    *,
+    k: int,
+    vector_chunk_size: int,
+    query_batch_size: int,
+    device: torch.device,
+    checkpoint_path: Path,
+    contract: str,
+    on_vectors: Callable[[int], None] | None = None,
+    on_checkpoint: Callable[[int, int], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Search each physical FAISS shard once against all normalized queries.
+
+    Scores are computed in float32 after L2-normalizing both sides.  A checkpoint
+    is committed after every complete physical shard, so a restart never needs
+    to repeat an earlier shard.  Source-local IDs are preserved throughout.
+    """
+    if k <= 0 or vector_chunk_size <= 0 or query_batch_size <= 0:
+        raise ValueError("k, vector_chunk_size, and query_batch_size must be positive")
+    vectors = np.asarray(query_vectors, dtype=np.float32)
+    if vectors.ndim != 2 or len(vectors) == 0 or not np.isfinite(vectors).all():
+        raise ValueError("Query vectors must be a non-empty, finite 2-D array")
+    if np.any(np.linalg.norm(vectors, axis=1) == 0):
+        raise ValueError("A query embedding has zero norm; cosine is undefined")
+    if int(source_index.rows) < k:
+        raise ValueError(f"Source {source_index.source} has fewer than {k} vectors")
+
+    shards = source_index._shards if source_index._is_sharded else [None]
+    cursor, saved_scores, saved_ids = load_state(
+        checkpoint_path, contract=contract, shape=(len(vectors), k), shard_count=len(shards)
+    )
+    if cursor == len(shards):
+        return saved_scores, saved_ids
+
+    queries = F.normalize(torch.as_tensor(vectors, device=device), p=2, dim=1)
+    best_scores = torch.as_tensor(saved_scores, device=device)
+    best_ids = torch.as_tensor(saved_ids, device=device)
+    for shard_number in range(cursor, len(shards)):
+        shard = shards[shard_number]
+        index = source_index._shard_index(shard) if shard is not None else source_index.index
+        source_offset = int(shard["start"]) if shard is not None else 0
+        for offset in range(0, int(index.ntotal), vector_chunk_size):
+            size = min(vector_chunk_size, int(index.ntotal) - offset)
+            raw = np.ascontiguousarray(index.reconstruct_n(offset, size), dtype=np.float32)
+            if not np.isfinite(raw).all():
+                raise ValueError(f"Non-finite vector in {source_index.source}:{source_offset + offset}")
+            block = torch.as_tensor(raw, device=device)
+            norms = torch.linalg.vector_norm(block, dim=1)
+            valid = norms > 0
+            block = block / norms.clamp_min(torch.finfo(block.dtype).tiny).unsqueeze(1)
+            local_k = min(k, size)
+            for query_start in range(0, len(vectors), query_batch_size):
+                query_end = min(query_start + query_batch_size, len(vectors))
+                similarity = queries[query_start:query_end] @ block.T
+                if not bool(valid.all()):
+                    similarity[:, ~valid] = -torch.inf
+                scores, positions = torch.topk(similarity, k=local_k, dim=1)
+                ids = positions.to(torch.int64) + source_offset + offset
+                merged = merge_topk(best_scores[query_start:query_end],
+                                    best_ids[query_start:query_end], scores, ids, k)
+                best_scores[query_start:query_end] = merged[0]
+                best_ids[query_start:query_end] = merged[1]
+                del similarity, scores, positions, ids, merged
+            del raw, block, norms, valid
+            if on_vectors:
+                on_vectors(size)
+        saved_scores = best_scores.cpu().numpy().copy()
+        saved_ids = best_ids.cpu().numpy().copy()
+        _atomic_state(checkpoint_path, contract=contract, next_shard=shard_number + 1,
+                      scores=saved_scores, ids=saved_ids)
+        if on_checkpoint:
+            on_checkpoint(shard_number + 1, len(shards))
+        if shard is not None and not source_index.cache_index:
+            shard["index"] = None
+    return saved_scores, saved_ids
+
+
+def derive_candidate_ids(per_source: dict[str, tuple[np.ndarray, np.ndarray]],
+                         row: int, *, balanced_per_source: int = 8,
+                         global_k: int = 32) -> tuple[list[tuple[str, int, float, int]],
+                                                           list[tuple[str, int, float, int]]]:
+    """Derive both exact sets from per-source Top-32 cosine hits."""
+    balanced: list[tuple[str, int, float, int]] = []
+    pool: list[tuple[str, int, float, int]] = []
+    for source, (scores, ids) in per_source.items():
+        for source_rank, (score, local_id) in enumerate(zip(scores[row], ids[row]), start=1):
+            if int(local_id) < 0 or not np.isfinite(score):
+                continue
+            hit = (source, int(local_id), float(score), source_rank)
+            pool.append(hit)
+            if source_rank <= balanced_per_source:
+                balanced.append(hit)
+    if len(balanced) != balanced_per_source * len(per_source):
+        raise RuntimeError(f"Incomplete balanced cosine hits at row {row}")
+    if len(pool) < global_k:
+        raise RuntimeError(f"Fewer than {global_k} global cosine hits at row {row}")
+    balanced.sort(key=lambda hit: (-hit[2], hit[0], hit[1]))
+    pool.sort(key=lambda hit: (-hit[2], hit[0], hit[1]))
+    return balanced, pool[:global_k]

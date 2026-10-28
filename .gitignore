@@ -355,3 +355,8 @@ venv/
 !/scripts/refine_rag2_kev27_chunk_prompts.py
 !/scripts/continue_rag2_kev27_prompt_quality.py
 !/scripts/report_rag2_kev27_prompt_quality.py
+
+# Question-only cosine retrieval views; generated candidates stay in run_cache/.
+!/scripts/build_question_only_fourway_retrieval.py
+!/scripts/run_question_only_fourway_retrieval.sh
+!/tests/test_question_only_fourway_retrieval.py
