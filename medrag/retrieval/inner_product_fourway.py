@@ -1,7 +1,7 @@
-"""One-pass, per-source cosine search for balanced and global candidate pools.
+"""One-pass, per-source MedCPT inner-product search for four candidate views.
 
-The stored RAG_Square FAISS vectors are *not* unit normalized.  Searching their
-IndexFlatIP directly would rank by dot product, not by cosine similarity.
+The stored RAG_Square FAISS vectors and query embeddings are not normalized;
+scores therefore match the original IndexFlatIP retrieval metric.
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from typing import Callable
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 
 def _atomic_state(path: Path, *, contract: str, next_shard: int,
@@ -33,12 +32,12 @@ def load_state(path: Path, *, contract: str, shape: tuple[int, int],
                 np.full(shape, -1, dtype=np.int64))
     with np.load(path, allow_pickle=False) as state:
         if str(state["contract"].item()) != contract:
-            raise RuntimeError(f"Cosine checkpoint contract mismatch: {path}")
+            raise RuntimeError(f"Inner-product checkpoint contract mismatch: {path}")
         next_shard = int(state["next_shard"].item())
         scores = np.asarray(state["scores"], dtype=np.float32)
         ids = np.asarray(state["ids"], dtype=np.int64)
     if scores.shape != shape or ids.shape != shape or not 0 <= next_shard <= shard_count:
-        raise RuntimeError(f"Invalid cosine checkpoint shape or cursor: {path}")
+        raise RuntimeError(f"Invalid inner-product checkpoint shape or cursor: {path}")
     return next_shard, scores, ids
 
 
@@ -52,7 +51,7 @@ def merge_topk(best_scores: torch.Tensor, best_ids: torch.Tensor,
     return scores, combined_ids.gather(1, positions)
 
 
-def source_topk_cosine(
+def source_topk_inner_product(
     source_index,
     query_vectors: np.ndarray,
     *,
@@ -65,9 +64,9 @@ def source_topk_cosine(
     on_vectors: Callable[[int], None] | None = None,
     on_checkpoint: Callable[[int, int], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Search each physical FAISS shard once against all normalized queries.
+    """Search each physical FAISS shard once against unnormalized queries.
 
-    Scores are computed in float32 after L2-normalizing both sides.  A checkpoint
+    Scores are raw float32 inner products, matching IndexFlatIP. A checkpoint
     is committed after every complete physical shard, so a restart never needs
     to repeat an earlier shard.  Source-local IDs are preserved throughout.
     """
@@ -76,8 +75,6 @@ def source_topk_cosine(
     vectors = np.asarray(query_vectors, dtype=np.float32)
     if vectors.ndim != 2 or len(vectors) == 0 or not np.isfinite(vectors).all():
         raise ValueError("Query vectors must be a non-empty, finite 2-D array")
-    if np.any(np.linalg.norm(vectors, axis=1) == 0):
-        raise ValueError("A query embedding has zero norm; cosine is undefined")
     if int(source_index.rows) < k:
         raise ValueError(f"Source {source_index.source} has fewer than {k} vectors")
 
@@ -88,7 +85,7 @@ def source_topk_cosine(
     if cursor == len(shards):
         return saved_scores, saved_ids
 
-    queries = F.normalize(torch.as_tensor(vectors, device=device), p=2, dim=1)
+    queries = torch.as_tensor(vectors, device=device)
     best_scores = torch.as_tensor(saved_scores, device=device)
     best_ids = torch.as_tensor(saved_ids, device=device)
     for shard_number in range(cursor, len(shards)):
@@ -101,15 +98,10 @@ def source_topk_cosine(
             if not np.isfinite(raw).all():
                 raise ValueError(f"Non-finite vector in {source_index.source}:{source_offset + offset}")
             block = torch.as_tensor(raw, device=device)
-            norms = torch.linalg.vector_norm(block, dim=1)
-            valid = norms > 0
-            block = block / norms.clamp_min(torch.finfo(block.dtype).tiny).unsqueeze(1)
             local_k = min(k, size)
             for query_start in range(0, len(vectors), query_batch_size):
                 query_end = min(query_start + query_batch_size, len(vectors))
                 similarity = queries[query_start:query_end] @ block.T
-                if not bool(valid.all()):
-                    similarity[:, ~valid] = -torch.inf
                 scores, positions = torch.topk(similarity, k=local_k, dim=1)
                 ids = positions.to(torch.int64) + source_offset + offset
                 merged = merge_topk(best_scores[query_start:query_end],
@@ -117,7 +109,7 @@ def source_topk_cosine(
                 best_scores[query_start:query_end] = merged[0]
                 best_ids[query_start:query_end] = merged[1]
                 del similarity, scores, positions, ids, merged
-            del raw, block, norms, valid
+            del raw, block
             if on_vectors:
                 on_vectors(size)
         saved_scores = best_scores.cpu().numpy().copy()
@@ -135,7 +127,7 @@ def derive_candidate_ids(per_source: dict[str, tuple[np.ndarray, np.ndarray]],
                          row: int, *, balanced_per_source: int = 8,
                          global_k: int = 32) -> tuple[list[tuple[str, int, float, int]],
                                                            list[tuple[str, int, float, int]]]:
-    """Derive both exact sets from per-source Top-32 cosine hits."""
+    """Derive both exact sets from per-source Top-32 inner-product hits."""
     balanced: list[tuple[str, int, float, int]] = []
     pool: list[tuple[str, int, float, int]] = []
     for source, (scores, ids) in per_source.items():
@@ -147,9 +139,9 @@ def derive_candidate_ids(per_source: dict[str, tuple[np.ndarray, np.ndarray]],
             if source_rank <= balanced_per_source:
                 balanced.append(hit)
     if len(balanced) != balanced_per_source * len(per_source):
-        raise RuntimeError(f"Incomplete balanced cosine hits at row {row}")
+        raise RuntimeError(f"Incomplete balanced inner-product hits at row {row}")
     if len(pool) < global_k:
-        raise RuntimeError(f"Fewer than {global_k} global cosine hits at row {row}")
+        raise RuntimeError(f"Fewer than {global_k} global inner-product hits at row {row}")
     balanced.sort(key=lambda hit: (-hit[2], hit[0], hit[1]))
     pool.sort(key=lambda hit: (-hit[2], hit[0], hit[1]))
     return balanced, pool[:global_k]

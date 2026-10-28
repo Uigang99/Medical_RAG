@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from medrag.retrieval.cosine_fourway import derive_candidate_ids, source_topk_cosine
+from medrag.retrieval.inner_product_fourway import derive_candidate_ids, source_topk_inner_product
 from scripts.build_question_only_fourway_retrieval import _ce_rank
 
 
@@ -32,21 +32,21 @@ class FakeSource:
         self.cache_index = False
 
 
-class CosineFourwayTests(unittest.TestCase):
-    def test_cosine_normalizes_both_sides_and_resumes(self):
-        # The large-norm second vector wins by inner product but loses by cosine.
+class InnerProductFourwayTests(unittest.TestCase):
+    def test_inner_product_preserves_norms_and_resumes(self):
+        # The larger-norm second vector wins by inner product, unlike cosine.
         source = FakeSource(np.array([[1., 0.], [2., 10.], [0., 1.]], dtype=np.float32))
         queries = np.array([[1., 0.], [0., 1.]], dtype=np.float32)
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "source.npz"
-            scores, ids = source_topk_cosine(
+            scores, ids = source_topk_inner_product(
                 source, queries, k=2, vector_chunk_size=2, query_batch_size=1,
                 device=torch.device("cpu"), checkpoint_path=checkpoint, contract="test"
             )
-            self.assertEqual(ids.tolist(), [[0, 1], [2, 1]])
-            self.assertAlmostEqual(scores[0, 0], 1., places=5)
+            self.assertEqual(ids.tolist(), [[1, 0], [1, 2]])
+            self.assertAlmostEqual(scores[0, 0], 2., places=5)
             calls = source.index.reconstructions
-            again = source_topk_cosine(
+            again = source_topk_inner_product(
                 source, queries, k=2, vector_chunk_size=2, query_batch_size=1,
                 device=torch.device("cpu"), checkpoint_path=checkpoint, contract="test"
             )
@@ -66,8 +66,8 @@ class CosineFourwayTests(unittest.TestCase):
         self.assertEqual([hit[3] for hit in global_hits], [1, 2, 3, 4])
 
     def test_ce_rank_preserves_dense_rank_and_score(self):
-        dense = [{"source": "a", "local_id": 2, "dense_rank": 1, "cosine_score": .9},
-                 {"source": "b", "local_id": 3, "dense_rank": 2, "cosine_score": .8}]
+        dense = [{"source": "a", "local_id": 2, "dense_rank": 1, "inner_product_score": .9},
+                 {"source": "b", "local_id": 3, "dense_rank": 2, "inner_product_score": .8}]
         reranked = _ce_rank(dense, {("a", 2): -.5, ("b", 3): 1.2})
         self.assertEqual([doc["local_id"] for doc in reranked], [3, 2])
         self.assertEqual([doc["dense_rank"] for doc in reranked], [2, 1])

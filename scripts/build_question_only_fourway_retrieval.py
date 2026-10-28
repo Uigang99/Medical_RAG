@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cache four fixed question-only retrieval views for TEST-6545.
 
-One exact cosine scan of each of four corpora supplies both the balanced and
+One exact inner-product scan of each of four corpora supplies both the balanced and
 unrestricted dense pools.  MedCPT CE scores the *union* once per question, so
 overlapping documents are not evaluated twice.  Gold answers are never used.
 """
@@ -25,7 +25,7 @@ sys.path.insert(0, str(PROJECT))
 
 from medrag.benchmark import load_benchmark_samples
 from medrag.query_embeddings import QueryEmbeddingStore
-from medrag.retrieval.cosine_fourway import derive_candidate_ids, load_state, source_topk_cosine
+from medrag.retrieval.inner_product_fourway import derive_candidate_ids, load_state, source_topk_inner_product
 from medrag.retrieval.faiss_retriever import FaissSourceIndex
 from medrag.reranking.medcpt_cross_encoder import MedCPTCrossEncoderReranker
 from medrag.training.graph_input_progress import Progress
@@ -43,7 +43,7 @@ ARMS = ("balanced_dense", "global_dense", "balanced_ce", "global_ce")
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", type=Path, default=PROJECT / "databases" / "run_cache" /
-                        "question_only_cosine_fourway_test6545_v1")
+                        "question_only_ip_fourway_test6545_v1")
     parser.add_argument("--benchmark-root", type=Path, default=PROJECT / "datasets" / "benchmark" /
                         "mcq" / "unified")
     parser.add_argument("--query-cache-root", type=Path, default=PROJECT / "databases" /
@@ -172,16 +172,14 @@ def preflight(args: argparse.Namespace) -> tuple[list, np.ndarray, dict, str]:
     vectors = np.ascontiguousarray(np.concatenate(vector_batches), dtype=np.float32)
     if vectors.shape != (6545, 768) or not np.isfinite(vectors).all():
         raise RuntimeError("Invalid TEST question embedding matrix")
-    if np.any(np.linalg.norm(vectors, axis=1) == 0):
-        raise RuntimeError("Zero-norm question embedding; cosine undefined")
     contract = {
-        "experiment": "question_only_cosine_fourway_test6545_v1",
+        "experiment": "question_only_ip_fourway_test6545_v1",
         "question_input": "benchmark question only; no options, rationale, or gold",
-        "retrieval_metric": "L2-normalized float32 cosine; stored FAISS inner-product vectors are reconstructed",
+        "retrieval_metric": "raw float32 inner product; stored unnormalized FAISS vectors are reconstructed",
         "sources": list(SOURCES), "source_contract": source_contract,
         "dataset_contract": inputs, "question_id_text_sha256": query_digest.hexdigest(),
-        "balanced": "top 8 from each source, then cosine merge of 32",
-        "global": "global cosine top 32 from per-source top 32",
+        "balanced": "top 8 from each source, then inner-product merge of 32",
+        "global": "global inner-product top 32 from per-source top 32",
         "ce": {"model_path": str(args.ce_model.resolve()),
                "config_sha256": sha256_file(args.ce_model / "config.json"),
                "weight_files": [signature(path) for path in ce_weights],
@@ -189,7 +187,7 @@ def preflight(args: argparse.Namespace) -> tuple[list, np.ndarray, dict, str]:
                "batch_size": args.ce_batch_size, "question_batch_size": args.ce_question_batch_size},
         "vector_chunk_size": args.vector_chunk_size, "query_batch_size": args.query_batch_size,
         "code_sha256": {str(path.relative_to(PROJECT)): sha256_file(path) for path in
-                        (Path(__file__), PROJECT / "medrag" / "retrieval" / "cosine_fourway.py")},
+                        (Path(__file__), PROJECT / "medrag" / "retrieval" / "inner_product_fourway.py")},
     }
     contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
     contract["contract_sha256"] = contract_hash
@@ -215,7 +213,7 @@ def checked_manifest(output_root: Path, contract: dict) -> None:
 
 
 def source_checkpoint(output_root: Path, source: str) -> Path:
-    return output_root / "cosine_checkpoints" / f"{source}.npz"
+    return output_root / "inner_product_checkpoints" / f"{source}.npz"
 
 
 def completed_vectors(source_index: FaissSourceIndex, checkpoint_path: Path,
@@ -233,7 +231,7 @@ def _doc_record(source_indexes: dict[str, FaissSourceIndex], hit: tuple,
     if key not in document_cache:
         document_cache[key] = source_indexes[source].get_document(local_id, score)
     record = document_cache[key].to_dict(include_text=True)
-    record.update(cosine_score=score, retrieval_score=score, retrieval_rank=dense_rank,
+    record.update(inner_product_score=score, retrieval_score=score, retrieval_rank=dense_rank,
                   source_rank=source_rank, dense_rank=dense_rank, rank=dense_rank,
                   ce_score=None, ce_rank=None)
     return record
@@ -359,7 +357,7 @@ def merge_outputs(args: argparse.Namespace, samples: list, contract_hash: str,
     for arm, path in output_paths.items():
         os.replace(temporary[arm], path)
     summary = {"questions": len(samples), "documents_per_question_per_arm": 32,
-               "metric": "cosine", "arms": {arm: {"path": str(output_paths[arm]),
+               "metric": "inner_product", "arms": {arm: {"path": str(output_paths[arm]),
                "source_counts": dict(source_counts[arm])} for arm in ARMS}}
     atomic_json(args.output_root / "summary.json", summary)
     progress.complete(f"four 6545-row ranked JSONL files and summary: {args.output_root}")
@@ -369,12 +367,12 @@ def run(args: argparse.Namespace) -> None:
     samples, vectors, contract, contract_hash = preflight(args)
     source_rows = {item["source"]: item["rows"] for item in contract["source_contract"]}
     total = sum(source_rows.values())
-    plan = ("[plan] TEST6545 question-only MedCPT -> four corpus cosine scans "
+    plan = ("[plan] TEST6545 question-only MedCPT -> four corpus inner-product scans "
             "-> balanced/global 32 -> deduplicated MedCPT CE -> four ranked JSONL; "
             f"vectors={total:,}, GPU 1 only, no labels, no generation")
     print(plan, flush=True)
     print("[stages] contract; pubmed; pmc; cpg; textbooks; CE rerank; merge. "
-          "Search/CE ETA calibrates on this new cosine workload.", flush=True)
+          "Search/CE ETA calibrates on this new inner-product workload.", flush=True)
     if args.dry_run:
         print(f"[dry-run OK] N={len(samples)}; query mode=question_only; output={args.output_root}; "
               "no GPU/model/index load and no output writes", flush=True)
@@ -386,7 +384,7 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     if device.type != "cuda":
         raise RuntimeError("This 125M-vector retrieval requires CUDA")
-    progress = Progress(["input contract", *[f"cosine {source}" for source in SOURCES],
+    progress = Progress(["input contract", *[f"inner product {source}" for source in SOURCES],
                          "MedCPT CE union", "merge four outputs"])
     progress.weights[0] = 1.0
     progress.weights[6] = max(10.0, len(samples) * .005)  # small I/O-only stage cost model
@@ -397,13 +395,13 @@ def run(args: argparse.Namespace) -> None:
         progress.complete(f"manifest={args.output_root / 'manifest.json'}; N=6545")
         per_source = {}
         for stage, source in enumerate(SOURCES, start=1):
-            current = f"cosine {source}"
+            current = f"inner product {source}"
             index = FaissSourceIndex(args.vector_db_root / source, cache_index=False,
                                      mmap_index=True, metadata_row_cache_size=50_000)
             indexes[source] = index
             checkpoint = source_checkpoint(args.output_root, source)
             prior = completed_vectors(index, checkpoint, contract_hash, len(samples))
-            progress.stage(stage, index.rows, initial=prior, unit="vector", kind="cosine")
+            progress.stage(stage, index.rows, initial=prior, unit="vector", kind="inner_product")
             stage_start = time.monotonic()
 
             def on_vectors(amount: int) -> None:
@@ -415,7 +413,7 @@ def run(args: argparse.Namespace) -> None:
                         if progress.weights[future_stage] is None:
                             progress.weights[future_stage] = max(1., seconds_per_vector * source_rows[future_source])
 
-            scores, ids = source_topk_cosine(
+            scores, ids = source_topk_inner_product(
                 index, vectors, k=32, vector_chunk_size=args.vector_chunk_size,
                 query_batch_size=args.query_batch_size, device=device,
                 checkpoint_path=checkpoint, contract=contract_hash, on_vectors=on_vectors,
