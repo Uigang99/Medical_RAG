@@ -28,6 +28,7 @@ from medrag.benchmark import load_benchmark_samples
 from medrag.query_embeddings import QueryEmbeddingStore
 from medrag.retrieval.inner_product_fourway import derive_candidate_ids, load_state, source_topk_inner_product
 from medrag.retrieval.faiss_retriever import FaissSourceIndex
+from medrag.retrieval.corpus_filter import load_corpus_filter
 from medrag.reranking.medcpt_cross_encoder import MedCPTCrossEncoderReranker
 from medrag.training.graph_input_progress import Progress
 
@@ -61,6 +62,8 @@ def arguments() -> argparse.Namespace:
                         "query_embeddings" / "medcpt_query_encoder_question_only" / "mcq" / "unified")
     parser.add_argument("--vector-db-root", type=Path, default=PROJECT / "databases" / "vector_db" /
                         "RAG_Square")
+    parser.add_argument("--corpus-filter", type=Path, default=None,
+                        help="Frozen eligibility masks; restrict before exact Top-32 search")
     parser.add_argument("--ce-model", type=Path, default=PROJECT.parent / "models" / "MedCPT-Cross-Encoder")
     parser.add_argument("--vector-chunk-size", type=int, default=100_000)
     parser.add_argument("--query-batch-size", type=int, default=2_048)
@@ -213,6 +216,11 @@ def preflight(args: argparse.Namespace) -> tuple[list, np.ndarray, dict, str]:
         "code_sha256": {str(path.relative_to(PROJECT)): sha256_file(path) for path in
                         (Path(__file__), PROJECT / "medrag" / "retrieval" / "inner_product_fourway.py")},
     }
+    if args.corpus_filter is not None:
+        args.eligibility_masks, filter_contract = load_corpus_filter(args.corpus_filter, source_contract)
+        contract["corpus_filter"] = filter_contract
+        contract["code_sha256"]["medrag/retrieval/corpus_filter.py"] = sha256_file(
+            PROJECT / "medrag/retrieval/corpus_filter.py")
     contract_hash = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
     contract["contract_sha256"] = contract_hash
     contract["output_root"] = str(args.output_root.resolve())
@@ -385,6 +393,9 @@ def merge_outputs(args: argparse.Namespace, samples: list, contract_hash: str,
                "documents_per_question_per_arm": 32,
                "metric": "inner_product", "arms": {arm: {"path": str(output_paths[arm]),
                "source_counts": dict(source_counts[arm])} for arm in ARMS}}
+    summary["contract_sha256"] = contract_hash
+    if args.corpus_filter is not None:
+        summary["corpus_filter"] = str(args.corpus_filter.resolve())
     atomic_json(args.output_root / "summary.json", summary)
     progress.complete(f"four {len(samples)}-row ranked JSONL files and summary: {args.output_root}")
 
@@ -405,6 +416,9 @@ def run(args: argparse.Namespace) -> None:
             "-> balanced/global 32 -> deduplicated MedCPT CE -> four ranked JSONL; "
             f"vectors={total:,}, GPU 1 only, no labels, no generation")
     print(plan, flush=True)
+    if args.corpus_filter is not None:
+        print(f"[filter] {contract['corpus_filter']['eligible_rows']:,} eligible vectors; "
+              "original IDs/text preserved; filter before Top-32, never post-filter old hits", flush=True)
     # Approximate stage durations from the completed, same-GPU TEST-6545 run:
     # search 278 s, CE 312 s, merge 13 s. Recalibrate from fresh work.
     scale = len(samples) / 6545
@@ -463,7 +477,10 @@ def run(args: argparse.Namespace) -> None:
                 checkpoint_path=checkpoint, contract=contract_hash, on_vectors=on_vectors,
                 on_checkpoint=lambda done, count: progress.log(
                     f"[checkpoint] {source} shard {done}/{count}: {checkpoint}"),
+                eligibility=getattr(args, "eligibility_masks", {}).get(source),
             )
+            if args.corpus_filter is not None and not args.eligibility_masks[source][ids].all():
+                raise RuntimeError(f"Ineligible search result in {source}")
             per_source[source] = scores, ids
             progress.complete(f"{index.rows:,} vectors; 32 hits/question; checkpoint={checkpoint}")
         torch.cuda.empty_cache()

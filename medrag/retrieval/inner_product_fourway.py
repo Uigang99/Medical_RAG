@@ -63,6 +63,7 @@ def source_topk_inner_product(
     contract: str,
     on_vectors: Callable[[int], None] | None = None,
     on_checkpoint: Callable[[int, int], None] | None = None,
+    eligibility: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Search each physical FAISS shard once against unnormalized queries.
 
@@ -77,6 +78,11 @@ def source_topk_inner_product(
         raise ValueError("Query vectors must be a non-empty, finite 2-D array")
     if int(source_index.rows) < k:
         raise ValueError(f"Source {source_index.source} has fewer than {k} vectors")
+    if eligibility is not None:
+        if eligibility.shape != (int(source_index.rows),) or eligibility.dtype != np.bool_:
+            raise ValueError("Eligibility must be a boolean mask aligned to source-local IDs")
+        if np.count_nonzero(eligibility) < k:
+            raise ValueError(f"Source {source_index.source} has fewer than {k} eligible vectors")
 
     shards = source_index._shards if source_index._is_sharded else [None]
     cursor, saved_scores, saved_ids = load_state(
@@ -94,22 +100,34 @@ def source_topk_inner_product(
         source_offset = int(shard["start"]) if shard is not None else 0
         for offset in range(0, int(index.ntotal), vector_chunk_size):
             size = min(vector_chunk_size, int(index.ntotal) - offset)
+            keep = (eligibility[source_offset + offset:source_offset + offset + size]
+                    if eligibility is not None else None)
+            if keep is not None and not keep.any():
+                if on_vectors:
+                    on_vectors(size)
+                continue
             raw = np.ascontiguousarray(index.reconstruct_n(offset, size), dtype=np.float32)
+            selected_ids = None
+            if keep is not None:
+                selected_ids = torch.as_tensor(
+                    np.flatnonzero(keep) + source_offset + offset, device=device)
+                raw = np.ascontiguousarray(raw[keep])
             if not np.isfinite(raw).all():
                 raise ValueError(f"Non-finite vector in {source_index.source}:{source_offset + offset}")
             block = torch.as_tensor(raw, device=device)
-            local_k = min(k, size)
+            local_k = min(k, len(raw))
             for query_start in range(0, len(vectors), query_batch_size):
                 query_end = min(query_start + query_batch_size, len(vectors))
                 similarity = queries[query_start:query_end] @ block.T
                 scores, positions = torch.topk(similarity, k=local_k, dim=1)
-                ids = positions.to(torch.int64) + source_offset + offset
+                ids = (selected_ids[positions] if selected_ids is not None else
+                       positions.to(torch.int64) + source_offset + offset)
                 merged = merge_topk(best_scores[query_start:query_end],
                                     best_ids[query_start:query_end], scores, ids, k)
                 best_scores[query_start:query_end] = merged[0]
                 best_ids[query_start:query_end] = merged[1]
                 del similarity, scores, positions, ids, merged
-            del raw, block
+            del raw, block, selected_ids
             if on_vectors:
                 on_vectors(size)
         saved_scores = best_scores.cpu().numpy().copy()

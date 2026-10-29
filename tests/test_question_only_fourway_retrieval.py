@@ -9,6 +9,7 @@ import torch
 
 from medrag.retrieval.inner_product_fourway import derive_candidate_ids, source_topk_inner_product
 from scripts.build_question_only_fourway_retrieval import _ce_rank
+from medrag.retrieval.corpus_filter import select_rows
 
 
 class FakeFlatIndex:
@@ -33,6 +34,30 @@ class FakeSource:
 
 
 class InnerProductFourwayTests(unittest.TestCase):
+    def test_filter_precedes_topk_and_preserves_original_ids(self):
+        source = FakeSource(np.array([[100., 0.], [90., 0.], [3., 0.], [2., 0.], [1., 0.]], dtype=np.float32))
+        keep = np.array([False, False, True, False, True])
+        with tempfile.TemporaryDirectory() as directory:
+            seen = []
+            scores, ids = source_topk_inner_product(
+                source, np.array([[1., 0.]], dtype=np.float32), k=2,
+                vector_chunk_size=2, query_batch_size=1, device=torch.device("cpu"),
+                checkpoint_path=Path(directory) / "filtered.npz", contract="filtered",
+                eligibility=keep, on_vectors=seen.append)
+            self.assertEqual(ids.tolist(), [[2, 4]])
+            self.assertEqual(scores.tolist(), [[3., 1.]])
+            self.assertEqual(sum(seen), 5)
+            self.assertEqual(source.index.reconstructions, 2)
+
+    def test_corpus_selection_uses_pmid_and_pubmed_only_title_rule(self):
+        pmids = np.array([0, 10, 10, 20, 30], dtype=np.uint32)
+        flags = np.array([0, 0, 1, 0, 0], dtype=np.uint8)
+        allowed = np.array([10, 20], dtype=np.uint32)
+        self.assertEqual(select_rows("pubmed", pmids, flags, allowed).tolist(), [False, True, False, True, False])
+        self.assertEqual(select_rows("pmc", pmids, flags, allowed).tolist(), [False, True, True, True, False])
+        self.assertTrue(select_rows("cpg", pmids, flags, allowed).all())
+        self.assertTrue(select_rows("textbooks", pmids, flags, allowed).all())
+
     def test_inner_product_preserves_norms_and_resumes(self):
         # The larger-norm second vector wins by inner product, unlike cosine.
         source = FakeSource(np.array([[1., 0.], [2., 10.], [0., 1.]], dtype=np.float32))
