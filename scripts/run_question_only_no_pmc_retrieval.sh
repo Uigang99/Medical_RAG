@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export CUDA_VISIBLE_DEVICES=1
+export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export HF_HUB_OFFLINE=1
+exec /home/user/Uiheon/.venv_vllm/bin/python -u \
+  /home/user/Uiheon/Medical_RAG/scripts/rebuild_question_only_retrieval_pools.py "$@"

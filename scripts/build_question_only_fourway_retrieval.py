@@ -301,7 +301,8 @@ def valid_part(path: Path, samples: list, start: int, end: int, contract_hash: s
 def rerank_parts(args: argparse.Namespace, samples: list,
                  per_source: dict[str, tuple[np.ndarray, np.ndarray]],
                  source_indexes: dict[str, FaissSourceIndex], contract_hash: str,
-                 progress: Progress) -> None:
+                 progress: Progress, *, stage_index: int = 5,
+                 balanced_quotas: dict[str, int] | None = None) -> None:
     count = (len(samples) + args.ce_question_batch_size - 1) // args.ce_question_batch_size
     part_dir = args.output_root / "parts"
     ranges = [(part * args.ce_question_batch_size,
@@ -309,7 +310,7 @@ def rerank_parts(args: argparse.Namespace, samples: list,
               for part in range(count)]
     complete = [valid_part(part_dir / f"part_{part:05d}.jsonl", samples, start, end, contract_hash)
                 for part, (start, end) in enumerate(ranges)]
-    progress.stage(5, count, initial=sum(complete), unit="batch", kind="ce")
+    progress.stage(stage_index, count, initial=sum(complete), unit="batch", kind="ce")
     if all(complete):
         progress.complete(f"cached {count} CE batches; {part_dir}")
         return
@@ -325,7 +326,8 @@ def rerank_parts(args: argparse.Namespace, samples: list,
             dense_rows = []
             union_lists = []
             for row_index in range(start, end):
-                balanced, global_hits = derive_candidate_ids(per_source, row_index)
+                balanced, global_hits = derive_candidate_ids(per_source, row_index,
+                                                             balanced_quotas=balanced_quotas)
                 cache: dict[tuple[str, int], object] = {}
                 balanced_docs = [_doc_record(source_indexes, hit, rank, cache)
                                  for rank, hit in enumerate(balanced, start=1)]
@@ -356,10 +358,10 @@ def rerank_parts(args: argparse.Namespace, samples: list,
 
 
 def merge_outputs(args: argparse.Namespace, samples: list, contract_hash: str,
-                  progress: Progress) -> None:
+                  progress: Progress, *, stage_index: int = 6) -> None:
     part_dir = args.output_root / "parts"
     count = (len(samples) + args.ce_question_batch_size - 1) // args.ce_question_batch_size
-    progress.stage(6, count, unit="batch", kind="merge")
+    progress.stage(stage_index, count, unit="batch", kind="merge")
     output_paths = {arm: args.output_root / f"{arm}.jsonl" for arm in ARMS}
     temporary = {arm: path.with_suffix(".jsonl.tmp") for arm, path in output_paths.items()}
     handles = {arm: path.open("w", encoding="utf-8") for arm, path in temporary.items()}

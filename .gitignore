@@ -361,3 +361,5 @@ venv/
 !/scripts/run_question_only_fourway_retrieval.sh
 !/tests/test_question_only_fourway_retrieval.py
 !/scripts/build_pmc_pmid_corpus_filter.py
+!/scripts/rebuild_question_only_retrieval_pools.py
+!/scripts/run_question_only_no_pmc_retrieval.sh

@@ -143,20 +143,29 @@ def source_topk_inner_product(
 
 def derive_candidate_ids(per_source: dict[str, tuple[np.ndarray, np.ndarray]],
                          row: int, *, balanced_per_source: int = 8,
+                         balanced_quotas: dict[str, int] | None = None,
                          global_k: int = 32) -> tuple[list[tuple[str, int, float, int]],
                                                            list[tuple[str, int, float, int]]]:
     """Derive both exact sets from per-source Top-32 inner-product hits."""
     balanced: list[tuple[str, int, float, int]] = []
     pool: list[tuple[str, int, float, int]] = []
+    quotas = (balanced_quotas if balanced_quotas is not None else
+              {source: balanced_per_source for source in per_source})
+    if set(quotas) != set(per_source) or any(q < 1 for q in quotas.values()):
+        raise ValueError("Positive balanced quota required for every selected source")
     for source, (scores, ids) in per_source.items():
+        source_hits = 0
         for source_rank, (score, local_id) in enumerate(zip(scores[row], ids[row]), start=1):
             if int(local_id) < 0 or not np.isfinite(score):
                 continue
             hit = (source, int(local_id), float(score), source_rank)
             pool.append(hit)
-            if source_rank <= balanced_per_source:
+            if source_rank <= quotas[source]:
                 balanced.append(hit)
-    if len(balanced) != balanced_per_source * len(per_source):
+                source_hits += 1
+        if source_hits != quotas[source]:
+            raise RuntimeError(f"Incomplete balanced hits for {source} at row {row}")
+    if len(balanced) != sum(quotas.values()):
         raise RuntimeError(f"Incomplete balanced inner-product hits at row {row}")
     if len(pool) < global_k:
         raise RuntimeError(f"Fewer than {global_k} global inner-product hits at row {row}")

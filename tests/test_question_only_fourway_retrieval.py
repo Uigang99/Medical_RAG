@@ -34,6 +34,19 @@ class FakeSource:
 
 
 class InnerProductFourwayTests(unittest.TestCase):
+    def test_three_source_quotas_and_global_refill(self):
+        pools = {s: (np.arange(32, 0, -1, dtype=np.float32)[None] + shift,
+                     np.arange(32, dtype=np.int64)[None])
+                 for s, shift in (("pubmed", 100), ("cpg", 0), ("textbooks", -100))}
+        balanced, global_hits = derive_candidate_ids(
+            pools, 0, balanced_quotas={"pubmed": 11, "cpg": 11, "textbooks": 10})
+        self.assertEqual(len(balanced), 32)
+        self.assertEqual([sum(x[0] == s for x in balanced) for s in pools], [11, 11, 10])
+        self.assertEqual([x[0] for x in global_hits], ["pubmed"] * 32)
+        self.assertEqual([x[1] for x in global_hits], list(range(32)))
+        with self.assertRaises(ValueError):
+            derive_candidate_ids(pools, 0, balanced_quotas={"pubmed": 32})
+
     def test_filter_precedes_topk_and_preserves_original_ids(self):
         source = FakeSource(np.array([[100., 0.], [90., 0.], [3., 0.], [2., 0.], [1., 0.]], dtype=np.float32))
         keep = np.array([False, False, True, False, True])
