@@ -363,3 +363,8 @@ venv/
 !/scripts/build_pmc_pmid_corpus_filter.py
 !/scripts/rebuild_question_only_retrieval_pools.py
 !/scripts/run_question_only_no_pmc_retrieval.sh
+
+# Independent Top-8 chunk usefulness audit; generated predictions stay local.
+!/scripts/evaluate_question_only_single_documents.py
+!/scripts/run_question_only_single_documents.sh
+!/tests/test_question_only_single_documents.py
