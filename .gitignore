@@ -368,3 +368,8 @@ venv/
 !/scripts/evaluate_question_only_single_documents.py
 !/scripts/run_question_only_single_documents.sh
 !/tests/test_question_only_single_documents.py
+
+# Frozen question-only PCED output-mode comparison; predictions stay local.
+!/scripts/evaluate_question_only_pced.py
+!/scripts/run_question_only_pced.sh
+!/tests/test_question_only_pced.py
