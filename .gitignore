@@ -373,3 +373,8 @@ venv/
 !/scripts/evaluate_question_only_pced.py
 !/scripts/run_question_only_pced.sh
 !/tests/test_question_only_pced.py
+
+# Matched CoT baselines; completed PCED outputs remain immutable.
+!/scripts/evaluate_question_only_cot_baselines.py
+!/scripts/run_question_only_cot_baselines.sh
+!/tests/test_question_only_cot_baselines.py
