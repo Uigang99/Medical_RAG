@@ -378,3 +378,8 @@ venv/
 !/scripts/evaluate_question_only_cot_baselines.py
 !/scripts/run_question_only_cot_baselines.sh
 !/tests/test_question_only_cot_baselines.py
+
+# Short task-focused CoT prompt diagnostic; historical results are immutable.
+!/scripts/evaluate_question_focused_cot.py
+!/scripts/run_question_focused_cot.sh
+!/tests/test_question_focused_cot.py
