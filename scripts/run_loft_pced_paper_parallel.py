@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the unchanged per-question PCED pipeline on two independent H200s.
+"""Run two independent dataset workers on physical GPU 1.
 
 Only dataset jobs are concurrent. Each child still executes the original
 prepare/evaluate loop and the official decoder, one question at a time.
@@ -21,7 +21,8 @@ from medrag.training.graph_input_progress import Progress
 from scripts.run_loft_pced_paper import (arguments, atomic_json, preflight,
                                          result_file, sha)
 
-GROUPS = {0: ("musique", "nq"), 1: ("hotpotqa", "quest", "qampari")}
+GPU = 1
+WORKERS = {"A": ("musique", "nq"), "B": ("hotpotqa", "quest", "qampari")}
 DATASETS = ("hotpotqa", "nq", "musique", "qampari", "quest")
 # Observed 5-question pilot, seconds for prepare/5 and generation/question.
 # Used only for scheduling/progress estimates, never to change predictions.
@@ -98,24 +99,22 @@ def verify_pilot_pair(full_root, references, checked_rank, checked_answer):
 
 
 def gpu_preflight():
-    result = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.free",
+    result = subprocess.check_output(["nvidia-smi", "-i", str(GPU), "--query-gpu=memory.free",
                                       "--format=csv,noheader,nounits"], text=True)
-    free = {int(row.split(",")[0]): int(row.split(",")[1])
-            for row in result.splitlines() if row.strip()}
-    for gpu in GROUPS:
-        if free.get(gpu, 0) < 40 * 1024:
-            raise RuntimeError(f"GPU{gpu} has only {free.get(gpu, 0)/1024:.1f} GiB free; require 40 GiB")
+    free = int(result.strip())
+    if free < 80 * 1024:
+        raise RuntimeError(f"GPU{GPU} has only {free/1024:.1f} GiB free; require 80 GiB for two workers")
     return free
 
 
-def launch(root, gpu, dataset):
+def launch(root, worker, dataset):
     log_path = root / "_parallel_logs" / f"{dataset}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log = log_path.open("a", encoding="utf-8")
-    log.write(f"\n[parallel] start dataset={dataset} GPU={gpu} time={time.strftime('%F %T')}\n")
+    log.write(f"\n[parallel] start worker={worker} dataset={dataset} GPU={GPU} time={time.strftime('%F %T')}\n")
     log.flush()
     env = os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES=str(gpu), TOKENIZERS_PARALLELISM="false",
+    env.update(CUDA_VISIBLE_DEVICES=str(GPU), TOKENIZERS_PARALLELISM="false",
                TF_CPP_MIN_LOG_LEVEL="3")
     command = ["bash", str(WRAPPER), "all", dataset, "--output-root", str(root)]
     try:
@@ -143,7 +142,7 @@ def stop_children(active):
 def main(argv=None):
     a = arguments_parallel(argv)
     progress = Progress(["CPU contract", "parallel prepare + PCED 500q", "paired summary"])
-    progress.weights[:] = [1., 2300., 1.]
+    progress.weights[:] = [1., None, 1.]
     active = {}
     try:
         progress.stage(0, 1)
@@ -163,14 +162,14 @@ def main(argv=None):
                         raise FileNotFoundError(f"Missing sequential parity reference: {dataset}/{kind}/{qid}")
         existing = counts(a.output_root)
         progress.complete(f"5 LOFT test sets x 100=500; cached answers={sum(x[2] for x in existing.values())}")
-        progress.log("[plan] GPU0: musique,nq; GPU1: hotpotqa,quest,qampari; original per-question PCED unchanged; first 5 per dataset compared with sequential pilot")
-        progress.log("[ETA] About 30-50 min on two idle H200s from the 5-question pilot; live throughput recalibrates ETA")
+        progress.log("[plan] GPU1 only: worker A musique,nq; worker B hotpotqa,quest,qampari; original per-question PCED unchanged; first 5 per dataset compared with sequential pilot")
+        progress.log("[ETA] Two workers sharing GPU1 have no measured throughput; live progress calibrates ETA. The prior two-GPU 30-50 min estimate does not apply")
         if a.dry_run:
             progress.log(f"[dry-run OK] CPU-only; no manifest or GPU jobs; root={a.output_root}")
             return
         free = gpu_preflight()
-        expected = {"version": "loft_pced_parallel_v1", "dataset": "LOFT-RAG 5x100 test",
-                    "groups": {str(k): list(v) for k, v in GROUPS.items()},
+        expected = {"version": "loft_pced_parallel_gpu1_v1", "dataset": "LOFT-RAG 5x100 test",
+                    "physical_gpu": GPU, "workers": {k: list(v) for k, v in WORKERS.items()},
                     "method": "unchanged official PCED per-question decode; dataset-level data parallelism only",
                     "candidate_mode": "all", "top_k": 90, "score_policy": "paper",
                     "max_new_tokens": 32, "question_order": "original LOFT test order",
@@ -185,38 +184,38 @@ def main(argv=None):
                 raise RuntimeError(f"Incompatible parallel resume contract: {manifest}")
         else:
             atomic_json(manifest, expected)
-        progress.log(f"[GPU] free GiB: GPU0={free[0]/1024:.1f}, GPU1={free[1]/1024:.1f}; manifest={manifest}")
+        progress.log(f"[GPU] free GiB: GPU1={free/1024:.1f}; manifest={manifest}")
         initial = weighted_progress(existing)
         progress.stage(1, 10000, initial=initial, unit="work")
-        next_index = {gpu: 0 for gpu in GROUPS}
+        next_index = {worker: 0 for worker in WORKERS}
         checked_rank, checked_answer = set(), set()
         while True:
-            for gpu, datasets in GROUPS.items():
-                if gpu not in active and next_index[gpu] < len(datasets):
-                    dataset = datasets[next_index[gpu]]
-                    next_index[gpu] += 1
-                    process, log, path = launch(a.output_root, gpu, dataset)
-                    active[gpu] = (process, log, path, dataset)
-                    progress.log(f"[start] GPU{gpu} {dataset}; child log={path}")
+            for worker, datasets in WORKERS.items():
+                if worker not in active and next_index[worker] < len(datasets):
+                    dataset = datasets[next_index[worker]]
+                    next_index[worker] += 1
+                    process, log, path = launch(a.output_root, worker, dataset)
+                    active[worker] = (process, log, path, dataset)
+                    progress.log(f"[start] GPU{GPU} worker {worker} {dataset}; child log={path}")
             time.sleep(3)
             verify_pilot_pair(a.output_root, references, checked_rank, checked_answer)
             current = counts(a.output_root)
             rank = sum(x[0] for x in current.values())
             prior = sum(x[1] for x in current.values())
             answers = sum(x[2] for x in current.values())
-            progress.names[1] = f"GPU0+1 R{rank}/500 P{prior}/500 A{answers}/500"
+            progress.names[1] = f"GPU1 x2 R{rank}/500 P{prior}/500 A{answers}/500"
             done = weighted_progress(current)
             if done > progress.done:
                 progress.update(done - progress.done)
-            for gpu, (process, log, path, dataset) in list(active.items()):
+            for worker, (process, log, path, dataset) in list(active.items()):
                 status = process.poll()
                 if status is not None:
                     log.close()
-                    del active[gpu]
+                    del active[worker]
                     if status:
-                        raise RuntimeError(f"GPU{gpu} {dataset} exited {status}; log={path}; cached rank/prior/answer={current[dataset]}")
-                    progress.log(f"[complete] GPU{gpu} {dataset}; cached={current[dataset]}; log={path}")
-            if not active and all(next_index[gpu] == len(GROUPS[gpu]) for gpu in GROUPS):
+                        raise RuntimeError(f"GPU{GPU} worker {worker} {dataset} exited {status}; log={path}; cached rank/prior/answer={current[dataset]}")
+                    progress.log(f"[complete] GPU{GPU} worker {worker} {dataset}; cached={current[dataset]}; log={path}")
+            if not active and all(next_index[worker] == len(WORKERS[worker]) for worker in WORKERS):
                 break
         if answers != 500 or len(checked_rank) != 25 or len(checked_answer) != 25:
             raise RuntimeError(f"Incomplete or unverified run: answers={answers}, parity={len(checked_rank)}/{len(checked_answer)}")

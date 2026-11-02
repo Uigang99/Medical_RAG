@@ -15,15 +15,35 @@ class ParallelPcedTest(unittest.TestCase):
         self.assertEqual(parallel.weighted_progress(empty), 0)
         self.assertEqual(parallel.weighted_progress(full), 10000)
 
-    def test_single_gpu_gate_accepts_either_h200(self):
+    def test_gpu_gate_requires_physical_gpu1(self):
         with mock.patch("torch.cuda.is_available", return_value=True), \
              mock.patch("torch.cuda.mem_get_info", return_value=(50 * 2**30, 140 * 2**30)):
-            for gpu in ("0", "1"):
+            with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}):
+                core.gpu_gate(40)
+            for gpu in ("0", "0,1"):
                 with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": gpu}):
-                    core.gpu_gate(40)
-            with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1"}):
-                with self.assertRaisesRegex(RuntimeError, "exactly one H200"):
-                    core.gpu_gate(40)
+                    with self.assertRaisesRegex(RuntimeError, "GPU-1 only"):
+                        core.gpu_gate(40)
+
+    def test_workers_launch_on_gpu1_only(self):
+        self.assertEqual(parallel.GPU, 1)
+        self.assertEqual(len(parallel.WORKERS), 2)
+        with tempfile.TemporaryDirectory() as temp, \
+             mock.patch.object(parallel.subprocess, "Popen") as popen:
+            for worker, datasets in parallel.WORKERS.items():
+                _, log, _ = parallel.launch(Path(temp), worker, datasets[0])
+                log.close()
+            for call in popen.call_args_list:
+                self.assertEqual(call.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "1")
+                self.assertEqual(call.args[0][2], "all")
+
+    def test_gpu_preflight_checks_gpu1_only(self):
+        with mock.patch.object(parallel.subprocess, "check_output", return_value="100000\n") as check:
+            self.assertEqual(parallel.gpu_preflight(), 100000)
+            self.assertEqual(check.call_args.args[0][1:3], ["-i", "1"])
+        with mock.patch.object(parallel.subprocess, "check_output", return_value="50000\n"):
+            with self.assertRaisesRegex(RuntimeError, "GPU1"):
+                parallel.gpu_preflight()
 
     def test_pilot_parity_rejects_changed_token(self):
         with tempfile.TemporaryDirectory() as temp:
