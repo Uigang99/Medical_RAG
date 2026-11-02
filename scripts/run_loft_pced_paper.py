@@ -150,6 +150,7 @@ def contract(a, cp, qp, n):
             "llama": str(a.llama), "bge": str(a.bge), "reranker": str(a.reranker),
             "bge_revision": MODEL_BGE, "reranker_revision": MODEL_RERANK,
             "retriever_sdpa_backend": "math",
+            "llama_cudnn_sdpa_enabled": False,
             "official_pced_commit": OFFICIAL_SHA, "attention_impl": a.attention_impl,
             "seed": 42, "script_sha256": sha(Path(__file__)),
             "paper_difference": ("FAISS first-stage shortlist; not the published LOFT selection"
@@ -182,8 +183,14 @@ def preflight(a, *, write_manifest):
             # fix may safely refresh its hash before any result is committed.
             changed_keys = {k for k in set(previous) | set(expected)
                             if previous.get(k) != expected.get(k)}
-            if (changed_keys <= {"script_sha256", "retriever_sdpa_backend"}
-                    and set(manifest.parent.iterdir()) == {manifest}):
+            empty_start = set(manifest.parent.iterdir()) == {manifest}
+            prepared_before_generation = (previous.get("script_sha256") ==
+                "22a425ee238d5ffbd8d032d0b2ab2036688a037a93260640d7577a27c77100be"
+                and (manifest.parent / "cache_summary.json").is_file()
+                and not any((manifest.parent / "predictions").glob("*.json")))
+            if (changed_keys <= {"script_sha256", "retriever_sdpa_backend",
+                                 "llama_cudnn_sdpa_enabled"}
+                    and (empty_start or prepared_before_generation)):
                 if write_manifest:
                     atomic_json(manifest, expected)
             else:
@@ -468,6 +475,11 @@ def evaluate(a):
         progress.stage(1, 1)
         if pending:
             gpu_gate(a.min_free_gib)
+            # On the local H200 runtime cuDNN SDPA cannot plan this Llama
+            # prefill. Keep HF SDPA and let PyTorch choose Flash/Math instead.
+            torch.backends.cuda.enable_cudnn_sdp(False)
+            if torch.backends.cuda.cudnn_sdp_enabled():
+                raise RuntimeError("Failed to disable cuDNN SDPA for Llama")
             sys.path.insert(0, str(a.official_code))
             from src.methods.pced import prefill, decode_from_cache
             tokenizer = AutoTokenizer.from_pretrained(str(a.llama), local_files_only=True, padding_side="left")
