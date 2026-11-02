@@ -383,3 +383,8 @@ venv/
 !/scripts/evaluate_question_focused_cot.py
 !/scripts/run_question_focused_cot.sh
 !/tests/test_question_focused_cot.py
+
+# Output-instruction ablation; historical experiment contracts remain immutable.
+!/scripts/pilot_restored_cot_instruction.py
+!/scripts/run_restored_cot_instruction.sh
+!/tests/test_restored_cot_instruction.py
