@@ -149,6 +149,7 @@ def contract(a, cp, qp, n):
             "top_k": 90, "score_policy": a.score_policy, "max_new_tokens": 32,
             "llama": str(a.llama), "bge": str(a.bge), "reranker": str(a.reranker),
             "bge_revision": MODEL_BGE, "reranker_revision": MODEL_RERANK,
+            "retriever_sdpa_backend": "math",
             "official_pced_commit": OFFICIAL_SHA, "attention_impl": a.attention_impl,
             "seed": 42, "script_sha256": sha(Path(__file__)),
             "paper_difference": ("FAISS first-stage shortlist; not the published LOFT selection"
@@ -175,8 +176,18 @@ def preflight(a, *, write_manifest):
     expected = contract(a, cp, qp, len(queries))
     manifest = a.output_root / a.dataset / "manifest.json"
     if manifest.exists():
-        if json.loads(manifest.read_text()) != expected:
-            raise RuntimeError(f"Incompatible completed/partial experiment: {manifest}")
+        previous = json.loads(manifest.read_text())
+        if previous != expected:
+            # A failed first embedding call leaves only this manifest. A code
+            # fix may safely refresh its hash before any result is committed.
+            changed_keys = {k for k in set(previous) | set(expected)
+                            if previous.get(k) != expected.get(k)}
+            if (changed_keys <= {"script_sha256", "retriever_sdpa_backend"}
+                    and set(manifest.parent.iterdir()) == {manifest}):
+                if write_manifest:
+                    atomic_json(manifest, expected)
+            else:
+                raise RuntimeError(f"Incompatible completed/partial experiment: {manifest}")
     elif write_manifest:
         atomic_json(manifest, expected)
     return corpus, queries, manifest
@@ -220,6 +231,52 @@ def length_safe_scores(question, texts, score_fn):
     return result
 
 
+def encode_dense_checked(model, texts, batch_size, max_length=8192):
+    """BGE-M3 dense path with visible errors and OOM-only batch backoff.
+
+    FlagEmbedding 1.3.5 catches *every* RuntimeError during its batch probe,
+    reducing batch_size until zero and then raising tokenizer IndexError.
+    This uses the same tokenizer and inference model, without that probe.
+    """
+    import numpy as np
+    import torch
+    if not texts:
+        raise ValueError("Cannot embed an empty text collection")
+    device = next(model.model.parameters()).device
+    model.model.eval()
+    output = []
+    start = 0
+    current_batch = batch_size
+    while start < len(texts):
+        take = min(current_batch, len(texts) - start)
+        try:
+            tokens = model.tokenizer(texts[start:start + take], padding=True,
+                                     truncation=True, max_length=max_length,
+                                     return_tensors="pt").to(device)
+            with torch.inference_mode():
+                vectors = math_sdpa_call(model.model, tokens, return_dense=True,
+                                         return_sparse=False, return_colbert_vecs=False)["dense_vecs"]
+            output.append(vectors.float().cpu().numpy())
+            start += take
+        except torch.cuda.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            if take == 1:
+                raise RuntimeError(f"BGE-M3 embedding OOM even at batch=1, item={start}") from exc
+            current_batch = max(1, take // 2)
+        except RuntimeError as exc:
+            raise RuntimeError(f"BGE-M3 embedding failed at item={start}, batch={take}; "
+                               f"underlying error: {exc}") from exc
+    return np.concatenate(output, axis=0)
+
+
+def math_sdpa_call(fn, *args, **kwargs):
+    # XLM-R attention has a non-null mask: Flash is ineligible, and cuDNN
+    # currently fails to build an execution plan on the local H200 runtime.
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    with sdpa_kernel(SDPBackend.MATH):
+        return fn(*args, **kwargs)
+
+
 def _vectors(a, corpus, queries, folder, progress):
     import faiss
     import numpy as np
@@ -234,12 +291,10 @@ def _vectors(a, corpus, queries, folder, progress):
     model = BGEM3FlagModel(str(a.bge), use_fp16=True, devices=["cuda:0"])
     texts = [format_doc(doc) for doc in corpus]
     qtexts = [q["query_text"] for q in queries]
-    docs = np.asarray(model.encode(texts, batch_size=a.embedding_batch, max_length=8192,
-                                   return_dense=True, return_sparse=False,
-                                   return_colbert_vecs=False)["dense_vecs"], dtype=np.float32)
-    qs = np.asarray(model.encode(qtexts, batch_size=a.embedding_batch, max_length=8192,
-                                 return_dense=True, return_sparse=False,
-                                 return_colbert_vecs=False)["dense_vecs"], dtype=np.float32)
+    model.model.half()
+    model.model.to("cuda:0")
+    docs = encode_dense_checked(model, texts, a.embedding_batch)
+    qs = encode_dense_checked(model, qtexts, a.embedding_batch)
     if not np.isfinite(docs).all() or not np.isfinite(qs).all():
         raise RuntimeError("Non-finite BGE-M3 embedding")
     index = faiss.IndexFlatIP(docs.shape[1])
@@ -294,7 +349,7 @@ def prepare(a):
                     candidates = [int(x) for x in found[0] if x >= 0]
                 texts = [format_doc(corpus[i]) for i in candidates]
                 ce = length_safe_scores(q["query_text"], texts,
-                                        lambda batch: reranker.compute_score(batch, normalize=True))
+                                        lambda batch: math_sdpa_call(reranker.compute_score, batch, normalize=True))
                 if not all(np.isfinite(ce)):
                     raise RuntimeError(f"Non-finite reranker scores: {qid}")
                 ce_half = torch.as_tensor(ce, dtype=torch.float16)
@@ -326,7 +381,8 @@ def prepare(a):
                 selected = ranking["top90"]
                 texts = [format_doc(corpus[item["corpus_index"]]) for item in selected]
                 dense = length_safe_scores(q["query_text"], texts,
-                    lambda batch: model.compute_score(batch, weights_for_different_modes=[0.4, 0.2, 0.4])["dense"])
+                    lambda batch: math_sdpa_call(model.compute_score, batch,
+                        weights_for_different_modes=[0.4, 0.2, 0.4])["dense"])
                 if len(dense) != 90 or not all(np.isfinite(dense)):
                     raise RuntimeError(f"Bad BGE expert scores: {qid}")
                 atomic_json(result_file(priordir, qid), {"qid": qid, "pids": [x["pid"] for x in selected],
