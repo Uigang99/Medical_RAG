@@ -388,3 +388,6 @@ venv/
 !/scripts/pilot_restored_cot_instruction.py
 !/scripts/run_restored_cot_instruction.sh
 !/tests/test_restored_cot_instruction.py
+!/scripts/run_loft_pced_paper.py
+!/scripts/run_loft_pced_paper.sh
+!/tests/test_loft_pced_paper.py
