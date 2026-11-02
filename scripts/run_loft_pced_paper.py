@@ -202,10 +202,10 @@ def preflight(a, *, write_manifest):
 
 def gpu_gate(min_free_gib):
     import torch
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != "1":
-        raise RuntimeError("This experiment is GPU-1 only: set CUDA_VISIBLE_DEVICES=1")
+    if os.environ.get("CUDA_VISIBLE_DEVICES") not in {"0", "1"}:
+        raise RuntimeError("Use exactly one H200: CUDA_VISIBLE_DEVICES=0 or 1")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA unavailable. Set CUDA_VISIBLE_DEVICES=1 on the GPU server.")
+        raise RuntimeError("CUDA unavailable on the selected GPU")
     free, _ = torch.cuda.mem_get_info()
     if free < min_free_gib * 2**30:
         raise RuntimeError(f"GPU has only {free / 2**30:.1f} GiB free; require {min_free_gib:g} GiB before loading models")

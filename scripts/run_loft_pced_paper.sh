@@ -12,7 +12,7 @@ case "$dataset" in
   *) echo "Invalid LOFT dataset: $dataset" >&2; exit 2;;
 esac
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 export TOKENIZERS_PARALLELISM=false
 export TF_CPP_MIN_LOG_LEVEL=3
 export MPLCONFIGDIR=/home/user/Uiheon/Medical_RAG/cache/matplotlib
