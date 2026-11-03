@@ -399,3 +399,6 @@ venv/
 !/scripts/run_medical_pced_100_baselines.sh
 !/tests/test_medical_pced_100.py
 !/scripts/summarize_medical_pced_100.py
+!/scripts/sweep_medical_pced_gamma.py
+!/scripts/run_medical_pced_gamma_sweep.sh
+!/tests/test_medical_pced_gamma_sweep.py
