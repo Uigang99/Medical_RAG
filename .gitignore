@@ -391,3 +391,11 @@ venv/
 !/scripts/run_loft_pced_paper.py
 !/scripts/run_loft_pced_paper.sh
 !/tests/test_loft_pced_paper.py
+
+# Seeded medical PCED pilot; dataset/vector/result artifacts remain local.
+!/scripts/run_medical_pced_100.py
+!/scripts/run_medical_pced_100.sh
+!/scripts/evaluate_medical_pced_100_baselines.py
+!/scripts/run_medical_pced_100_baselines.sh
+!/tests/test_medical_pced_100.py
+!/scripts/summarize_medical_pced_100.py
