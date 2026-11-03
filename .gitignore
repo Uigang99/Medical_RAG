@@ -402,3 +402,6 @@ venv/
 !/scripts/sweep_medical_pced_gamma.py
 !/scripts/run_medical_pced_gamma_sweep.sh
 !/tests/test_medical_pced_gamma_sweep.py
+!/scripts/run_medical_pced_qwen35.py
+!/scripts/run_medical_pced_qwen35.sh
+!/tests/test_medical_pced_qwen35.py
