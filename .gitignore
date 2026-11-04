@@ -420,3 +420,8 @@ venv/
 !/scripts/evaluate_loft_pced_joint.py
 !/scripts/run_loft_pced_joint.sh
 !/tests/test_pced_joint.py
+
+# Per-token bounded PASS pilot; development predictions remain local.
+!/scripts/evaluate_loft_pced_pass_bounded.py
+!/scripts/run_loft_pced_pass_bounded.sh
+!/tests/test_pced_pass_bounded.py
