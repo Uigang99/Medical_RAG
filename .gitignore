@@ -415,3 +415,8 @@ venv/
 !/scripts/evaluate_loft_pced_pass_cot.py
 !/scripts/run_loft_pced_pass_cot.sh
 !/tests/test_pced_pass_cot.py
+
+# Temporary joint-document PCED; outputs remain local.
+!/scripts/evaluate_loft_pced_joint.py
+!/scripts/run_loft_pced_joint.sh
+!/tests/test_pced_joint.py
