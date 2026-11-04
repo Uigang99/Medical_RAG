@@ -405,3 +405,8 @@ venv/
 !/scripts/run_medical_pced_qwen35.py
 !/scripts/run_medical_pced_qwen35.sh
 !/tests/test_medical_pced_qwen35.py
+
+# Same-forward dynamic PASS PCED; outputs remain local.
+!/scripts/evaluate_loft_pced_pass.py
+!/scripts/run_loft_pced_pass.sh
+!/tests/test_pced_pass.py
