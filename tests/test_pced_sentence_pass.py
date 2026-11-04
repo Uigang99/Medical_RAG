@@ -123,6 +123,95 @@ class SentencePassTests(unittest.TestCase):
         self.assertEqual([e[1] for e in s.events], ["reasoning", "answer"])
         self.assertTrue(result["empty_answer"])
 
+    def test_v2_cap_preserves_unfinished_text_without_answer_or_repair(self):
+        class Tokens:
+            def decode(self, ids, **kwargs): return "A fact.\nAn unfinished connection"
+            def encode(self, text, **kwargs): raise AssertionError("No synthetic header allowed")
+        class Scripted:
+            def __init__(self): self.traces, self.events = [], []
+            def begin_segment(self, text, phase, trigger): self.events.append((text, phase))
+            def step(self, phase, local, *, allow_eos):
+                assert phase == "reasoning" and not allow_eos
+                return 1, False
+            def force(self, ids): raise AssertionError("Must not force Answer at budget")
+        s = Scripted()
+        result = m.generate(s, Tokens(), reasoning_tokens=2, answer_tokens=8, force_answer_at_budget=False)
+        self.assertEqual(result["reasoning"], "A fact.\nAn unfinished connection")
+        self.assertEqual(result["reasoning_token_ids"], [1, 1])
+        self.assertEqual(result["answer_status"], "skipped_incomplete_reasoning")
+        self.assertFalse(result["natural_answer_transition"])
+        self.assertEqual(result["prediction"], "")
+        self.assertEqual(result["forced_controls"], [])
+        self.assertEqual(result["answer_token_ids"], [])
+        self.assertTrue(all(e[1] == "reasoning" for e in s.events))
+        from scripts.evaluate_loft_pced_sentence_pass import score_prediction
+        self.assertEqual(score_prediction(result, ["A"]), 0)
+        self.assertEqual(score_prediction(result, ["A fact"]), 0)
+
+    def test_v2_natural_marker_at_last_budget_token_keeps_same_answer_stream(self):
+        class Tokens:
+            def decode(self, ids, **kwargs):
+                return "".join({0: "A concrete fact.", 1: "\nAnswer:", 2: " Paris", 3: ""}[i] for i in ids)
+        class Scripted:
+            def __init__(self):
+                self.traces, self.events, self.phases = [], [], []
+                self.tokens = iter([(0, False), (1, False), (2, False), (3, True)])
+            def begin_segment(self, text, phase, trigger): self.events.append((text, phase))
+            def step(self, phase, local, *, allow_eos):
+                self.phases.append((phase, allow_eos))
+                return next(self.tokens)
+            def force(self, ids): raise AssertionError("No forced text")
+        s = Scripted()
+        result = m.generate(s, Tokens(), reasoning_tokens=2, force_answer_at_budget=False)
+        self.assertEqual(result["prediction"], "Paris")
+        self.assertEqual(result["reasoning_stop"], "answer_marker")
+        self.assertTrue(result["natural_answer_transition"])
+        self.assertEqual(result["answer_status"], "eos")
+        self.assertEqual(s.phases, [("reasoning", False), ("reasoning", False), ("answer", False), ("answer", True)])
+        self.assertEqual(s.events[-1], ("A concrete fact.", "answer"))
+
+    def test_v2_does_not_accept_inline_or_unfinished_answer_header(self):
+        class Tokens:
+            def __init__(self, text): self.text = text
+            def decode(self, ids, **kwargs): return self.text
+        class Scripted:
+            traces, events = [], []
+            def begin_segment(self, *args): pass
+            def step(self, phase, local, *, allow_eos): return 1, False
+            def force(self, ids): raise AssertionError("No forced text")
+        for text in ("A comment about Answer: not a header.", "A fact.\nAns", "A fact.\nAnswer"):
+            result = m.generate(Scripted(), Tokens(text), reasoning_tokens=1, force_answer_at_budget=False)
+            self.assertEqual(result["answer_status"], "skipped_incomplete_reasoning")
+
+    def test_v2_prompts_preserve_private_document_layout_and_shared_question(self):
+        class Tokens:
+            def apply_chat_template(self, messages, **kwargs):
+                return messages[0]["content"]+"\nUSER:\n"+messages[1]["content"]+"\nASSISTANT:\n"
+        prefixes, suffix = m.generation_prompts(Tokens(), "QUERY_SECRET", ["DOC_ALPHA", "DOC_BETA"])
+        self.assertEqual(len(prefixes), 3)
+        self.assertTrue(all(m.EVIDENCE_SYSTEM in p for p in prefixes))
+        self.assertTrue(all("QUERY_SECRET" not in p for p in prefixes))
+        self.assertIn("QUERY_SECRET", suffix)
+        self.assertTrue(suffix.endswith(old.PREFIX))
+        self.assertNotIn("DOC_ALPHA", prefixes[0]+prefixes[2]+suffix)
+        self.assertNotIn("DOC_BETA", prefixes[0]+prefixes[1]+suffix)
+        self.assertIn(old.AMATEUR_RULES, prefixes[0])
+        self.assertNotIn(old.AMATEUR_RULES, prefixes[1])
+        self.assertTrue(all(m.JUDGE_SYSTEM not in p for p in prefixes))
+        with self.assertRaises(ValueError):
+            m.generation_prompts(Tokens(), "<PCED_BOUNDARY_42>", ["text"])
+
+    def test_v2_cli_has_separate_output_and_explicit_budget_override(self):
+        from scripts.evaluate_loft_pced_sentence_pass import arguments
+        legacy = arguments([])
+        current = arguments(["--reasoning-style", "evidence_v2"])
+        controlled = arguments(["--reasoning-style", "evidence_v2", "--reasoning-tokens", "128"])
+        self.assertEqual(legacy.reasoning_tokens, 128)
+        self.assertEqual(current.reasoning_tokens, 192)
+        self.assertEqual(controlled.reasoning_tokens, 128)
+        self.assertNotEqual(current.output_root, legacy.output_root)
+        self.assertEqual(current.arms, list(m.ARMS))
+
     def test_real_cpu_llama_judge_cache_crop_matches_full_recompute(self):
         from transformers import LlamaConfig, LlamaForCausalLM
         torch.manual_seed(42)

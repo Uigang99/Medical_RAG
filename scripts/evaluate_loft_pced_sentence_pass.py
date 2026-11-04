@@ -34,10 +34,12 @@ def arguments(argv=None):
     p.add_argument("--limit-per-dataset", type=int, default=10)
     p.add_argument("--judge-batch-size", type=int, default=16)
     p.add_argument("--contribution-weight", type=float, default=4.)
-    p.add_argument("--reasoning-tokens", type=int, default=128)
+    p.add_argument("--reasoning-style", choices=method.REASONING_STYLES, default="legacy")
+    p.add_argument("--reasoning-tokens", type=int)
     p.add_argument("--answer-tokens", type=int, default=32)
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args(argv)
+    a.reasoning_tokens = a.reasoning_tokens if a.reasoning_tokens is not None else (192 if a.reasoning_style == "evidence_v2" else 128)
     if not 1 <= a.limit_per_dataset <= 10 or not 1 <= a.judge_batch_size <= 90:
         p.error("limit-per-dataset=1..10, judge-batch-size=1..90")
     if not math.isfinite(a.contribution_weight) or not 0 <= a.contribution_weight <= 20:
@@ -45,7 +47,8 @@ def arguments(argv=None):
     if not 8 <= a.reasoning_tokens <= 256 or not 8 <= a.answer_tokens <= 128:
         p.error("reasoning-tokens=8..256, answer-tokens=8..128")
     a.retrieval_root, a.model = a.retrieval_root.resolve(), a.model.resolve()
-    a.output_root = (a.output_root or ROOT/"results"/f"loft_llama_sentence_pass_dev_v1_n{5*a.limit_per_dataset}").resolve()
+    name = "loft_llama_sentence_pass_reasoning_v2" if a.reasoning_style == "evidence_v2" else "loft_llama_sentence_pass_dev_v1"
+    a.output_root = (a.output_root or ROOT/"results"/f"{name}_n{5*a.limit_per_dataset}").resolve()
     for source in (a.retrieval_root, a.model, ROOT/"datasets"):
         if a.output_root == source or source in a.output_root.parents or a.output_root in source.parents:
             p.error("Output must be separate from immutable sources")
@@ -75,7 +78,10 @@ def preflight(a, progress):
     per_token = 2*cfg["num_hidden_layers"]*cfg["num_key_value_heads"]*(cfg["hidden_size"]//cfg["num_attention_heads"])*2
     for row in rows:
         # Exactly the no-PASS generation prompt in every arm. Decisions never enter it.
-        prefixes, suffix = previous.prompts(tokenizer, row["question"], row["texts"], pass_prompt=False)
+        if a.reasoning_style == "evidence_v2":
+            prefixes, suffix = method.generation_prompts(tokenizer, row["question"], row["texts"])
+        else:
+            prefixes, suffix = previous.prompts(tokenizer, row["question"], row["texts"], pass_prompt=False)
         row["layout"] = {"context_ids": tokenizer(prefixes, add_special_tokens=False)["input_ids"],
                          "suffix_ids": tokenizer.encode(suffix, add_special_tokens=False)}
         jp, tail = method.judge_prompts(tokenizer, row["question"], row["texts"])
@@ -100,8 +106,13 @@ def preflight(a, progress):
              Path(common.__file__), Path(paper.__file__), ROOT/"medrag/generation/pced_pass.py",
              ROOT/"scripts/evaluate_loft_pced_pass_cot.py", ROOT/"medrag/training/graph_input_progress.py",
              official/"src/methods/pced.py", ROOT/"scripts/run_loft_pced_sentence_pass.sh"]
+    if a.reasoning_style == "evidence_v2":
+        paths.append(ROOT/"scripts/run_loft_pced_sentence_pass_reasoning_v2.sh")
+    natural = a.reasoning_style == "evidence_v2"
     contract = {
-        "version": VERSION, "hypothesis": "Separate sentence-boundary evidence decisions improve dynamic participation over PCED without a decision gate",
+        "version": "loft_sentence_pass_reasoning_v2" if natural else VERSION,
+        "reasoning_style": a.reasoning_style,
+        "hypothesis": "Sentence-boundary participation improves PCED under a shared reasoning protocol; no Joint or separate final-answer model",
         "split": "official LOFT DEV50, previously inspected; not untouched test", "n": len(rows), "seed": a.seed,
         "cohort": [{"dataset": r["dataset"], "qid": r["qid"], "sources": r["source_sha256"],
                     "question_sha256": common.digest(r["question"]), "labels_sha256": common.digest([r["answers"], r["qrels"]])} for r in rows],
@@ -110,7 +121,7 @@ def preflight(a, progress):
         "model": str(a.model), "model_files": {name: paper.sha(a.model/name) for name in
             ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json")},
         "weight_shards": {s: {"bytes": (a.model/s).stat().st_size, "mtime_ns": (a.model/s).stat().st_mtime_ns} for s in sorted(shards)},
-        "prompts": {"generation_system": method.base.SYSTEM, "amateur": method.base.AMATEUR_RULES,
+        "prompts": {"generation_system": method.EVIDENCE_SYSTEM if natural else method.base.SYSTEM, "amateur": method.base.AMATEUR_RULES,
                     "assistant_prefix": method.base.PREFIX, "judge_system": method.JUDGE_SYSTEM,
                     "judge_phase": method.JUDGE_PHASE, "judge_template": "Question:\\n{q}\\n\\nPassage:\\n{d}\\n\\nShared reasoning so far:\\n{cot}\\n\\n{phase}\\n<chat assistant>Decision:"},
         "arms": a.arms, "decision_label_ids_C_P": labels, "reserved_generation_pass_ids": pass_ids,
@@ -124,8 +135,11 @@ def preflight(a, progress):
         "generation": {"reasoning_tokens": a.reasoning_tokens, "answer_tokens": a.answer_tokens,
                        "dtype": "bfloat16", "attention": "sdpa", "greedy": True, "gpu": 1, "streams": 91,
                        "judge_batch_size": a.judge_batch_size, "cache": "separate retained judge prefixes, append shared CoT/phase then crop; generation KV never modified by judge"},
-        "format": "same no-PASS generation prompt for all arms; other specials/PASS aliases masked; EOS after alphanumeric Answer only; force Answer at reasoning cap",
+        "format": "same no-PASS generation prompt for all arms; other specials/PASS aliases masked; EOS after alphanumeric Answer only; "+
+                  ("natural Answer marker required; budget stop -> incomplete, empty prediction, no forced header or repair" if natural else "force Answer at reasoning cap"),
         "parser_metric": "unchanged stripped Answer-only Subspan EM; no reasoning credit or answer repair",
+        "answer_decoder": "same PCED expert/amateur streams and document KV; fresh answer gate; NOT Joint, NOT a separate Llama answer call",
+        "comparison_scope": "Within this run only gate policy varies. Versus v1, prompt, reasoning budget and cap handling change together; not an isolated prompt or PASS effect. Incomplete cases remain in the full-cohort denominator.",
         "primary": "sentence_weighted vs pced; sentence_exclude isolates hard exclusion; weighted vs exclude isolates log-c score",
         "pilot_gate": "at N=50: weighted >= pced+3 correct, <=1 empty answer; qualitative evidence of grounded reentry/selection needed; no automatic expansion",
         "official_commit": revision, "code_sha256": {str(p.relative_to(ROOT)): paper.sha(p) for p in paths},
@@ -141,6 +155,14 @@ def preflight(a, progress):
     if not path.exists() and any(a.output_root.glob("*/predictions/*/*.json")):
         raise RuntimeError("Predictions without manifest")
     return rows, tokenizer, labels, pass_ids, manifest
+
+
+def score_prediction(result, answers):
+    # An unfinished response is always wrong, even for a degenerate gold alias
+    # that normalizes to an empty string under the inherited Subspan scorer.
+    if result["answer_status"] == "skipped_incomplete_reasoning":
+        return 0
+    return paper.subspan_em(result["prediction"], answers)
 
 
 def summarize(a, rows, h):
@@ -184,6 +206,10 @@ def summarize(a, rows, h):
             "micro": sum(r["subspan_em"] for r in rs)/len(rs), "macro5": sum(g["subspan_em"] for g in groups.values())/5,
             "datasets": groups, "empty_answer": sum(r["empty_answer"] for r in rs),
             "reasoning_budget": sum(r["reasoning_stop"] == "token_budget" for r in rs),
+            "natural_answer_transitions": sum(r["reasoning_stop"] == "answer_marker" for r in rs),
+            "empty_reasoning": sum(r["empty_reasoning"] for r in rs),
+            "mean_reasoning_tokens": sum(len(r["reasoning_token_ids"]) for r in rs)/len(rs),
+            "answer_skipped_incomplete_reasoning": sum(r["answer_status"] == "skipped_incomplete_reasoning" for r in rs),
             "answer_budget": sum(r["answer_status"] == "token_budget" for r in rs),
             "seconds": sum(r["seconds"] for r in rs), "judge_seconds": sum(r["judge_seconds"] for r in rs),
             "phase_diagnostics": phases, "expert_reentries": reentries, "expert_exits": exits,
@@ -239,7 +265,9 @@ def main(argv=None):
         progress.complete(f"DEV={len(rows)}; cached={sum(counts.values())}/{len(rows)*len(a.arms)}; max generation={manifest['max_generation_tokens']}, judge={manifest['max_judge_tokens_estimate']}; {a.output_root}")
         progress.log(f"[plan] contract -> one frozen Llama -> {','.join(a.arms)} -> summary; remaining={len(rows)*len(a.arms)-sum(counts.values())}; GPU1 only; no retrieval/training/TEST")
         progress.log(f"[scope] same generation prompt/Top90; C/P decision at sentence boundaries; c>0.5 active; score+= {a.contribution_weight}*log(c); fresh Answer decision; all-PASS -> amateur for segment")
-        progress.log("[ETA] Previous per-token pilot: 200 question-arms in 45min. New 150-arm-question pilot adds cached sentence judge calls; 45-120min is a provisional cost allowance, NOT matched throughput. First 5 fresh questions per policy calibrate; no cross-policy measured rate substitution.")
+        progress.log(f"[reasoning] style={a.reasoning_style}; cap={a.reasoning_tokens}; same PCED final decoder; no Joint/separate answer model; cap without Answer="+
+                     ("incomplete/empty prediction counted in full-cohort accuracy" if a.reasoning_style == "evidence_v2" else "forced Answer header"))
+        progress.log("[ETA] Prior sentence DEV50 x3 arms: 25m49s at reasoning cap128. At cap192 allow roughly 30-60min on idle H200 GPU1; prompt-dependent, not matched throughput. First 5 fresh questions per policy recalibrate; resumed time excludes cached work.")
         if a.dry_run:
             progress.log(f"[dry-run OK] sources, DEV/TEST disjoint IDs/text, local tokenizer C/P={labels}, contexts and resume checked; estimated combined KV={manifest['estimated_peak_kv_gib']:.1f}GiB; required free before load={manifest['min_free_gib_before_model']:.1f}GiB; no weights/GPU/result writes")
             return
@@ -276,10 +304,11 @@ def main(argv=None):
                          row["judge_tail"], labels, a.judge_batch_size))
                 stream = method.Stream(model, cache, context, suffix, prior, pass_ids, get_jsd, arm,
                                        judge, weight=a.contribution_weight, special_ids=tokenizer.all_special_ids)
-                result = method.generate(stream, tokenizer, reasoning_tokens=a.reasoning_tokens, answer_tokens=a.answer_tokens)
+                result = method.generate(stream, tokenizer, reasoning_tokens=a.reasoning_tokens, answer_tokens=a.answer_tokens,
+                                         force_answer_at_budget=a.reasoning_style == "legacy")
                 result.update(contract_hash=h, arm=arm, dataset=ds, qid=row["qid"], question=row["question"],
                     answers=row["answers"], qrels_for_analysis_only=row["qrels"],
-                    subspan_em=paper.subspan_em(result["prediction"], row["answers"]),
+                    subspan_em=score_prediction(result, row["answers"]),
                     top90_pids=row["scores"]["pids"], retrieval_prior=prior.float().cpu().tolist(),
                     judge_seconds=(judge.prefill_seconds if judge else 0)+sum(e["seconds"] for e in result["decisions"]),
                     seconds=time.monotonic()-started)

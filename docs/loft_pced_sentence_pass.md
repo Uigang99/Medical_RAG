@@ -1,5 +1,49 @@
 # 문장별 참여 판정 PCED 파일럿
 
+## Reasoning v2: Joint 없이 생성 지시·종료만 변경
+
+최신 실행은 아래 명령이다. **Joint decoder, 별도 최종 답변 Llama, reasoning-only 답변 호출은
+추가하지 않는다.** reasoning부터 최종 Answer까지 기존 PCED 스트림과 문서 KV를 사용한다.
+
+```bash
+bash /home/user/Uiheon/Medical_RAG/scripts/run_loft_pced_sentence_pass_reasoning_v2.sh
+```
+
+- 입력: 동일한 공식 LOFT DEV 50문항, 동일 Top90/순서/prior, Llama-3.1-8B, GPU1.
+- 변경: generation system prompt를 `pced_sentence_pass.py`의 `EVIDENCE_SYSTEM`으로 변경한다.
+  필요한 대상·관계·중간 사실을 짧은 완결 문장으로 쓰고, 답에 이르는 연결을 설명한다.
+  불필요한 단계 수를 강제하지 않으며, 문서 유무 논평·반복·가상의 새 Passage 생성을 피하도록 한다.
+  이는 프롬프트 지시이지 사실성 또는 형식 준수 보장은 아니다.
+- 변경: reasoning 상한 128→192. 실제 생성 길이를 192로 강제하지 않는다.
+- 변경: 모델이 새 줄 `Answer:`를 생성할 때만 기존 Answer 단계로 전환한다.
+  한도까지 구분자가 없으면 `skipped_incomplete_reasoning`, 빈 예측으로 저장하고
+  **50문항 전체 정확도에서 오답으로 계산**한다. 마지막 허용 토큰에서 구분자가 완성되면 정상 전환한다.
+  인위적 구분자 삽입, 자동 이어쓰기, 정답으로부터 복구는 하지 않는다.
+- 유지: C/P 판정 프롬프트, 문장 경계, c>0.5 제외, 4*log(c) 가중치, gamma=2.5,
+  최초 위치 beta, amateur fallback, 문장별 재판정, Answer 시작 재판정, Answer 최대32토큰,
+  EOS 허용 규칙, Answer-only Subspan EM, judge prefix 캐시/배치.
+- 세 조건 `pced` / `sentence_exclude` / `sentence_weighted` 모두 새 generation prompt와
+  동일한 종료 규칙을 사용한다. **이번 세 조건끼리는 PASS 정책만 달라진다.** v1 대비는
+  프롬프트·상한·미완성 처리 변경의 묶음 효과이며 순수 PASS 효과로 부르지 않는다.
+
+출력은 `/home/user/Uiheon/Medical_RAG/results/loft_llama_sentence_pass_reasoning_v2_n50/`이며,
+기존 v1 결과를 덮어쓰지 않는다. 코드 변경 후 기존 v1의 계약으로 재개하려 하면 안전상 거절한다.
+새 명령은 새 계약의 완료 문항을 재사용한다. `--dry-run`은 가중치/GPU 없이 실제 50문항을 검사한다.
+
+`summary.json`에는 정확도·C→W/W→C 이외에 자연 Answer 전환 수, reasoning cap 수,
+평균 reasoning 토큰 수, 빈 reasoning, 미완성으로 답변을 생략한 수를 추가한다.
+**자연 구분자 생성은 형식상 종료이지 추론의 의미적 완성이나 근거 충실도 판정이 아니다.**
+원문 문서·공유 텍스트·expert/token trace는 기존처럼 추적 가능하다. 필요한 사실의 보존,
+가상의 문서 생성 여부, 최종 답과 reasoning의 일관성은 실제 결과를 원문과 대조해야 한다.
+
+직전 문장별 v1의 동일 DEV50×3조건은 H200 한 장에서 25분49초였다. v2는 늘어난 토큰 예산과
+재판정 횟수에 따라 **약 30–60분을 계획 범위**로 잡되 실제 보장은 아니다. 첫 조건별 fresh
+5문항으로 ETA를 다시 계산한다. 이 dev 표본은 이미 분석한 표본이며 최종 일반화 검증이 아니다.
+
+아래는 v1 프로토콜 기록이다.
+
+## 기존 v1
+
 현재 가능한 범위는 제한된 개발 파일럿이다. 기존 per-token PASS가 문법적 이어 쓰기와
 Answer 경계에 민감했던 문제를 검사한다. 품질 개선을 이미 확인한 방법은 아니다.
 학습, 신규 검색, 다른 모델 다운로드, TEST 평가를 하지 않는다.

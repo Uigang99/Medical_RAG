@@ -429,4 +429,5 @@ venv/
 # Separate sentence-boundary participation pilot; generated artifacts stay local.
 !/scripts/evaluate_loft_pced_sentence_pass.py
 !/scripts/run_loft_pced_sentence_pass.sh
+!/scripts/run_loft_pced_sentence_pass_reasoning_v2.sh
 !/tests/test_pced_sentence_pass.py
