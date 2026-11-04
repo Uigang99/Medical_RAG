@@ -410,3 +410,8 @@ venv/
 !/scripts/evaluate_loft_pced_pass.py
 !/scripts/run_loft_pced_pass.sh
 !/tests/test_pced_pass.py
+
+# PASS-relative shared CoT diagnostic; generated artifacts stay local.
+!/scripts/evaluate_loft_pced_pass_cot.py
+!/scripts/run_loft_pced_pass_cot.sh
+!/tests/test_pced_pass_cot.py
