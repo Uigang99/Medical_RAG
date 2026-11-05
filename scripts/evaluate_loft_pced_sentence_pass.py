@@ -56,9 +56,9 @@ def arguments(argv=None):
     return a
 
 
-def preflight(a, progress):
+def preflight(a, progress, *, prepared=None, contract_extra=None, extra_paths=()):
     from transformers import AutoTokenizer, DynamicCache
-    rows, sources = previous.load_rows(a)
+    rows, sources = previous.load_rows(a) if prepared is None else prepared
     official = ROOT/"cache/pced_official"
     revision = subprocess.check_output(["git", "-C", str(official), "rev-parse", "HEAD"], text=True).strip()
     if revision != paper.OFFICIAL_SHA:
@@ -98,7 +98,8 @@ def preflight(a, progress):
         judge_cache_tokens = sum(len(lengths[k:k+a.judge_batch_size])*max(lengths[k:k+a.judge_batch_size])
                                  for k in range(0, len(lengths), a.judge_batch_size))
         # Simultaneous main 91-stream KV + all decision prefixes + one decision suffix batch.
-        live_tokens = 91*gen+judge_cache_tokens+a.judge_batch_size*judge_suffix_bound
+        copies = 2 if getattr(a, "reuse_arm_prefixes", False) else 1
+        live_tokens = copies*91*gen+judge_cache_tokens+a.judge_batch_size*judge_suffix_bound
         peak_kv = max(peak_kv, per_token*live_tokens/2**30)
         max_gen, max_judge = max(max_gen, gen), max(max_judge, judge)
         progress.update()
@@ -108,6 +109,7 @@ def preflight(a, progress):
              official/"src/methods/pced.py", ROOT/"scripts/run_loft_pced_sentence_pass.sh"]
     if a.reasoning_style == "evidence_v2":
         paths.append(ROOT/"scripts/run_loft_pced_sentence_pass_reasoning_v2.sh")
+    paths.extend(extra_paths)
     natural = a.reasoning_style == "evidence_v2"
     contract = {
         "version": "loft_sentence_pass_reasoning_v2" if natural else VERSION,
@@ -145,6 +147,7 @@ def preflight(a, progress):
         "official_commit": revision, "code_sha256": {str(p.relative_to(ROOT)): paper.sha(p) for p in paths},
         "environment": {k: importlib.metadata.version(k) for k in ("torch", "transformers")},
     }
+    contract.update(contract_extra or {})
     manifest = {"contract": contract, "contract_hash": common.digest(contract),
                 "code_commit": subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip(),
                 "max_generation_tokens": max_gen, "max_judge_tokens_estimate": max_judge,

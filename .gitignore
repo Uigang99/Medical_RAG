@@ -431,3 +431,6 @@ venv/
 !/scripts/run_loft_pced_sentence_pass.sh
 !/scripts/run_loft_pced_sentence_pass_reasoning_v2.sh
 !/tests/test_pced_sentence_pass.py
+!/scripts/evaluate_pced_sentence_pass_800.py
+!/scripts/run_pced_sentence_pass_800.sh
+!/tests/test_pced_sentence_reuse.py
