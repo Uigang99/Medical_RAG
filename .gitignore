@@ -434,3 +434,9 @@ venv/
 !/scripts/evaluate_pced_sentence_pass_800.py
 !/scripts/run_pced_sentence_pass_800.sh
 !/tests/test_pced_sentence_reuse.py
+
+# Learned PASS QA evaluation; weights, traces and outputs remain local.
+!/scripts/evaluate_pass_lora_qa800.py
+!/scripts/run_pass_lora_qa800.sh
+!/scripts/inspect_pass_lora_qa_trace.py
+!/tests/test_pced_trained_pass.py
