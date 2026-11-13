@@ -440,3 +440,4 @@ venv/
 !/scripts/run_pass_lora_qa800.sh
 !/scripts/inspect_pass_lora_qa_trace.py
 !/tests/test_pced_trained_pass.py
+!/scripts/run_pass_lora_qa800_live.py
