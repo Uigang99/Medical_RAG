@@ -76,6 +76,20 @@ Ctrl+C는 표시 화면만 닫으며 평가를 중단하지 않는다. 오류로
 `tail -f`를 별도로 붙이지 않는다. 전체 실행시간은 원래 평가와 동일하며 조건별 최초
 2문항 실행 후 ETA가 나온다.
 
+전원 기권 시 frozen amateur를 따르는 조건만 추가하려면:
+
+```bash
+/home/user/Uiheon/.venv_vllm/bin/python /home/user/Uiheon/Medical_RAG/scripts/run_pass_lora_qa800_live.py \
+  --arms pass_pced --fallback amateur \
+  --output-root /home/user/Uiheon/Medical_RAG/results/pass_pced_chain_v5_800_pass07_amateur_v1
+```
+
+기존 800문항, Top-16, PASS 기준 0.7과 나머지 설정은 유지하며 **0개 참여 시 선택만**
+바꾼다. Amateur는 문서 없이 질문과 지금까지의 공유 reasoning을 읽는 동결 base model이다.
+한 토큰을 선택한 뒤에는 모든 expert가 다시 참여 여부를 판단한다. 기준선 5개를 재실행하지
+않으며, 기존 주 실험 `pass_pced` 결과와 비교한다. 기존 PASS 조건은 약 1시간 8분이었고,
+새 생성 경로의 길이에 따라 달라지므로 실행 초기에 다시 ETA를 보정한다.
+
 전체 데이터 CPU 계약 검사 (GPU 모델 로드 없음):
 
 ```bash

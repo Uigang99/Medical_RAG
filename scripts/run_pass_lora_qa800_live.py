@@ -76,11 +76,25 @@ def supervise(folder, command):
     return code
 
 
-def connect(folder):
+def runner_command(folder, extra_args=()):
+    return ["bash", str(RUNNER), "--phase", "run", "--output-root", str(folder), *extra_args]
+
+
+def connect(folder, extra_args=()):
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / "live_launch.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read_json(folder / "live_job.json")
+        if state.get("command") and state["command"] != runner_command(folder, extra_args):
+            raise RuntimeError("이 폴더의 기존 실행 옵션과 다릅니다. 별도의 --output-root를 지정하세요.")
+        contract = read_json(folder / "manifest.json").get("contract", {})
+        if extra_args and contract:
+            if "--fallback" in extra_args and contract.get("decoder", {}).get("all_pass") != extra_args[extra_args.index("--fallback")+1]:
+                raise RuntimeError("기존 결과의 fallback과 다릅니다. 새 출력 폴더를 사용하세요.")
+            if "--arms" in extra_args:
+                end = extra_args.index("--fallback") if "--fallback" in extra_args else len(extra_args)
+                if contract.get("arms") != list(extra_args[extra_args.index("--arms")+1:end]):
+                    raise RuntimeError("기존 결과의 비교 조건과 다릅니다. 새 출력 폴더를 사용하세요.")
         if alive(state):
             return "기존 작업에 다시 연결했습니다."
         if busy(folder / ".run.lock"):
@@ -90,7 +104,7 @@ def connect(folder):
         # A new viewer may read stale status during the CPU preflight; never remove it.
         with (folder / "live_supervisor.log").open("ab", buffering=0) as log:
             proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
-                "--output-root", str(folder), "--worker"], stdin=subprocess.DEVNULL,
+                "--output-root", str(folder), "--worker", *extra_args], stdin=subprocess.DEVNULL,
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         for _ in range(100):
             current = read_json(folder / "live_job.json")
@@ -175,15 +189,25 @@ def display(folder, message):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT)
+    parser.add_argument("--output-root", type=Path)
+    arms = ("no_rag", "all", "pced", "pced_lora", "pass_pced", "pass_pced_safe")
+    parser.add_argument("--arms", nargs="+", choices=arms)
+    parser.add_argument("--fallback", choices=("pced", "amateur"))
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    folder = args.output_root.resolve()
+    if (args.arms is not None or args.fallback is not None) and args.output_root is None:
+        parser.error("비교 조건을 변경할 때에는 별도의 --output-root를 지정하세요.")
+    folder = (args.output_root or DEFAULT).resolve()
+    extra_args = []
+    if args.arms is not None:
+        extra_args += ["--arms", *[arm for arm in arms if arm in args.arms]]
+    if args.fallback is not None:
+        extra_args += ["--fallback", args.fallback]
     if not RUNNER.is_file():
         parser.error(f"실행 파일 없음: {RUNNER}")
     if args.worker:
-        return supervise(folder, ["bash", str(RUNNER), "--phase", "run", "--output-root", str(folder)])
-    return display(folder, connect(folder))
+        return supervise(folder, runner_command(folder, extra_args))
+    return display(folder, connect(folder, extra_args))
 
 
 if __name__ == "__main__":
